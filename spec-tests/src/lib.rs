@@ -51,6 +51,11 @@ impl Sandbox {
         self.dir.path()
     }
 
+    /// Where the CLI logs during this test, never the user's real log dir.
+    pub fn log_dir(&self) -> PathBuf {
+        self.path().join("logs")
+    }
+
     /// Runs `dhow <args>` in the sandbox to completion, killing it after
     /// [`CLI_TIMEOUT`].
     pub fn dhow<I, S>(&self, args: I) -> CliOutput
@@ -61,6 +66,7 @@ impl Sandbox {
         let mut child = Command::new(cli_path())
             .args(args)
             .current_dir(self.path())
+            .env("DHOW_LOG_DIR", self.log_dir())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
