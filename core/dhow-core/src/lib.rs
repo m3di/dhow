@@ -2,6 +2,7 @@
 
 pub mod complete;
 pub mod download;
+pub mod engine;
 pub mod http;
 pub mod journal;
 pub mod logging;

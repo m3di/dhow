@@ -41,7 +41,13 @@ async fn fetch_and_finalize(server: &TestServer, path: &str) -> Outcome {
     let client = http::client().unwrap();
     let done = tokio::time::timeout(
         Duration::from_secs(30),
-        download(&req, &client, &DownloadConfig::default(), &|_| {}),
+        download(
+            &req,
+            &client,
+            &DownloadConfig::default(),
+            &|_| {},
+            &tokio::sync::watch::channel(false).1,
+        ),
     )
     .await
     .unwrap()

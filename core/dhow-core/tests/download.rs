@@ -13,6 +13,7 @@ use dhow_core::transfer::{ConnEvent, OVERLAP, RetryPolicy, TransferConfig, Trans
 use dhow_core::writer::WriterConfig;
 use dhow_testserver::{TestServer, blob};
 use reqwest::Url;
+use tokio::sync::watch;
 
 const SIZE: u64 = 1_000_000;
 const CUT: u64 = 300_000;
@@ -60,13 +61,22 @@ impl Env {
         &self,
         config: &DownloadConfig,
     ) -> (Result<Downloaded, DownloadError>, Vec<DownloadEvent>) {
+        let (_keep, stop) = watch::channel(false);
+        self.run_until(config, stop).await
+    }
+
+    async fn run_until(
+        &self,
+        config: &DownloadConfig,
+        stop: watch::Receiver<bool>,
+    ) -> (Result<Downloaded, DownloadError>, Vec<DownloadEvent>) {
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = events.clone();
         let on_event = move |e: DownloadEvent| sink.lock().unwrap().push(e);
         let client = http::client().unwrap();
         let result = tokio::time::timeout(
             Duration::from_secs(30),
-            download(&self.req, &client, config, &on_event),
+            download(&self.req, &client, config, &on_event, &stop),
         )
         .await
         .expect("download hung");
@@ -371,4 +381,37 @@ async fn rerun_of_complete_download_fetches_nothing() {
     assert!(result.unwrap().committed.is_exactly(100_000));
     assert_eq!(resumed(&events), Some(100_000));
     assert_eq!(ranges_from(&server, gets_before).len(), 0);
+}
+
+/// Pause: the stop signal ends the run after a final commit; resuming
+/// continues from there.
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_commits_and_resume_continues() {
+    let server = TestServer::start().unwrap();
+    let env = Env::new(&server, "/blob/1000000?throttle=2000000");
+    let (tx, rx) = watch::channel(false);
+    let pause = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tx.send(true).unwrap();
+    });
+    let (result, _) = env.run_until(&config(10), rx).await;
+    pause.await.unwrap();
+    assert!(matches!(result, Err(DownloadError::Stopped)), "{result:?}");
+    let saved = env.committed_on_disk();
+    assert!(saved > 0 && saved < SIZE, "{saved}");
+    let (result, events) = env.run(&config(10)).await;
+    result.unwrap();
+    assert_eq!(resumed(&events), Some(saved));
+    assert_eq!(env.part_hash(), blob::digest(0, SIZE));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_before_start_does_nothing() {
+    let server = TestServer::start().unwrap();
+    let env = Env::new(&server, "/blob/1000");
+    let (_tx, rx) = watch::channel(true);
+    let (result, events) = env.run_until(&config(10), rx).await;
+    assert!(matches!(result, Err(DownloadError::Stopped)));
+    assert!(events.is_empty());
+    assert!(server.requests().is_empty());
 }

@@ -23,6 +23,7 @@
 //! | `cut_first=<n>` | only the first `GET` of this URL is cut after `n` bytes |
 //! | `change_after=<n>` | after `n` `GET`s of this URL it is a different file: new content and `ETag` |
 //! | `lie_after=<n>` | after `n` `GET`s the content changes but the `ETag` doesn't (a lying server) |
+//! | `throttle=<bytes/s>` | send the body at about this rate (in 10 ms slices) |
 //! | `validators=none\|weak` | no `ETag`/`Last-Modified` at all, or only a weak `ETag` |
 //! | `change_each=1` | every `GET` serves a different file (`HEAD` shows the next one) |
 //! | `ignore_range_after=<n>` | honor `Range` on the first `n` `GET`s of this URL, then ignore it |
@@ -223,6 +224,7 @@ struct Knobs {
     lie_after: Option<u32>,
     change_each: bool,
     validators: Validators,
+    throttle: Option<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -254,6 +256,7 @@ fn knobs(query: &[(String, String)]) -> Option<Knobs> {
         lie_after: None,
         change_each: false,
         validators: Validators::Strong,
+        throttle: None,
     };
     for (name, value) in query {
         match (name.as_str(), value.as_str()) {
@@ -287,6 +290,7 @@ fn knobs(query: &[(String, String)]) -> Option<Knobs> {
             ("change_each", "1") => k.change_each = true,
             ("validators", "weak") => k.validators = Validators::Weak,
             ("validators", "none") => k.validators = Validators::None,
+            ("throttle", v) => k.throttle = Some(v.parse().ok().filter(|&r: &u64| r > 0)?),
             _ => return None,
         }
     }
@@ -455,11 +459,19 @@ async fn respond(stream: &mut TcpStream, req: &Request, counts: &Counts) -> io::
     let stop = cut.map_or(body.end, |n| body.end.min(body.start + n));
     let mut buf = vec![0; BODY_BUF];
     let mut pos = body.start;
+    // Throttled: one slice per 10 ms.
+    let slice = k
+        .throttle
+        .map_or(BODY_BUF as u64, |r| (r / 100).clamp(1, BODY_BUF as u64));
     while pos < stop {
-        let n = (stop - pos).min(BODY_BUF as u64) as usize;
+        let n = (stop - pos).min(slice) as usize;
         blob::fill(content_seed, pos, &mut buf[..n]);
         stream.write_all(&buf[..n]).await?;
         pos += n as u64;
+        if k.throttle.is_some() {
+            stream.flush().await?;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
     if stop < body.end {
         stream.flush().await?;

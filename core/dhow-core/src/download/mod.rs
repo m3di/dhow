@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use reqwest::{Client, Url};
+use tokio::sync::watch;
 
 use crate::http::Header;
 use crate::journal::{Header as JournalHeader, Journal, JournalError, format};
@@ -91,6 +92,10 @@ pub enum DownloadError {
     Io(#[from] io::Error),
     #[error("the file on the server kept changing ({0} restarts)")]
     TooManyResets(u32),
+    /// The stop signal fired (pause, cancel, shutdown). Everything that
+    /// arrived was committed first.
+    #[error("stopped")]
+    Stopped,
 }
 
 enum Stop {
@@ -104,21 +109,35 @@ impl<E: Into<DownloadError>> From<E> for Stop {
     }
 }
 
+/// Resolves once `stop` holds `true`; never if its sender is gone.
+async fn stopped(mut stop: watch::Receiver<bool>) {
+    if stop.wait_for(|s| *s).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Runs the download until every byte is committed, or until `stop` turns
+/// `true` (then [`DownloadError::Stopped`], after a final commit).
 pub async fn download(
     req: &Request,
     client: &Client,
     config: &DownloadConfig,
     on_event: &(dyn Fn(DownloadEvent) + Send + Sync),
+    stop: &watch::Receiver<bool>,
 ) -> Result<Downloaded, DownloadError> {
     let mut resets = 0;
     let mut force = None;
     loop {
         // Re-probe every start: redirects re-resolve, and the identity to
         // resume against is checked against the server's current one.
-        let info = probe::probe(client, &req.url, &req.headers, config.probe).await?;
+        let info = tokio::select! {
+            biased;
+            _ = stopped(stop.clone()) => return Err(DownloadError::Stopped),
+            info = probe::probe(client, &req.url, &req.headers, config.probe) => info?,
+        };
         on_event(DownloadEvent::Probed(Box::new(info.clone())));
         let (file, journal) = prepare(req, &info, force.take(), on_event)?;
-        match fetch(req, client, config, &info, file, journal, on_event).await {
+        match fetch(req, client, config, &info, file, journal, on_event, stop).await {
             Ok(done) => return Ok(done),
             Err(Stop::Failed(e)) => return Err(e),
             Err(Stop::Reset(reason)) => {
@@ -232,6 +251,7 @@ fn same_identity(h: &JournalHeader, req: &Request, info: &ProbeInfo) -> bool {
         }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch(
     req: &Request,
     client: &Client,
@@ -240,6 +260,7 @@ async fn fetch(
     file: File,
     journal: Journal,
     on_event: &(dyn Fn(DownloadEvent) + Send + Sync),
+    stop: &watch::Receiver<bool>,
 ) -> Result<Downloaded, Stop> {
     let total = info.total_size;
     let committed = journal.committed().clone();
@@ -280,16 +301,19 @@ async fn fetch(
         if handle.define(id, range.clone()).await.is_err() {
             return Err(writer_failure(done).await.into());
         }
-        let result = transfer::run_connection(
-            &src,
-            id,
-            range,
-            overlap,
-            &handle,
-            &config.transfer,
-            &conn_event,
-        )
-        .await;
+        let result = tokio::select! {
+            biased;
+            _ = stopped(stop.clone()) => Err(None),
+            r = transfer::run_connection(
+                &src,
+                id,
+                range,
+                overlap,
+                &handle,
+                &config.transfer,
+                &conn_event,
+            ) => r.map_err(Some),
+        };
         match result {
             Ok(finished) => content_length_seen = finished.content_length_seen,
             Err(e) => {
@@ -299,12 +323,15 @@ async fn fetch(
                 let writer_result = done.await;
                 return Err(match (e, writer_result) {
                     (_, Ok(Err(we))) => Stop::Failed(we.into()),
-                    (TransferError::IdentityChanged(change), _) => {
+                    (None, _) => Stop::Failed(DownloadError::Stopped),
+                    (Some(TransferError::IdentityChanged(change)), _) => {
                         tracing::warn!(?change, "download: identity changed");
                         Stop::Reset(ResetReason::ServerFileChanged)
                     }
-                    (TransferError::NeedsRestart, _) => Stop::Reset(ResetReason::CannotResume),
-                    (e, _) => Stop::Failed(e.into()),
+                    (Some(TransferError::NeedsRestart), _) => {
+                        Stop::Reset(ResetReason::CannotResume)
+                    }
+                    (Some(e), _) => Stop::Failed(e.into()),
                 });
             }
         }

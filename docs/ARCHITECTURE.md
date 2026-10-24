@@ -31,10 +31,12 @@ The core is a library, not a daemon. Each shell instantiates one `Dhow` object i
 |---|---|---|
 | `dhow-core` | Everything that is not UI or FFI | `tokio` (multi-thread runtime, but see §7), `reqwest` (rustls), `rusqlite` (bundled), `serde`, `thiserror`, `tracing` |
 | `dhow-ffi` | Generates Swift/Kotlin bindings via `uniffi`; exposes a flat C ABI for C# via `csbindgen` | `uniffi` |
-| `dhow-cli` | `dhow add <url>`, `dhow ls`, `dhow pause/resume`, `dhow watch` (TUI-less, prints events). Reference client for conformance tests. | `clap` |
+| `dhow-cli` | `dhow add <url>`, `dhow ls`, `dhow pause/resume/cancel`, `dhow watch` (TUI-less, prints events as JSON lines). Reference client for conformance tests. No daemon: the process that runs a download is the engine for it (see below). | `clap` |
 | `dhow-testserver` | Local HTTP/1.1 server (HTTP/2 later) with knobs: drop connection after N bytes, lie about `Content-Length`, change ETag mid-download, ignore `Range`, return 200 to `If-Range`, throttle, inject garbage into a range response, slow headers. Knobs are added as the tests needing them land. | `tokio`; HTTP/1.1 hand-rolled so it can break the protocol on purpose; HTTP/2 when a test needs it |
 
 The core must build for: `aarch64/x86_64-apple-darwin`, `aarch64-apple-ios` (+sim), `x86_64/aarch64-unknown-linux-gnu`, `x86_64/aarch64-pc-windows-msvc`, `aarch64/armv7/x86_64-linux-android`. Per-PR CI runs tests on Linux only; other targets are built locally and in the (later) release workflow.
+
+**CLI process model.** `dhow add` probes, records the download in the database and runs it in the foreground; `--queue`/`--paused` only record it. `dhow resume <id>` runs one in the foreground, `dhow watch` runs every queued download in turn and exits. A process running a download holds an exclusive lock on `<data>/locks/<id>.lock` holding its PID, so two processes never run the same download and a `kill -9` never leaves a stale lock. `dhow pause`/`cancel` on a running download send it `SIGTERM` (Unix); it commits and exits as Paused, like Ctrl-C. Everything printed to stdout is one JSON object per line. The CLI uses `dhow_core::engine`, the M1 slice of the `Dhow` object: database-backed state, probe → download → completion gate, no scheduler yet.
 
 ## 3. Command / event API
 

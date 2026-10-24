@@ -22,7 +22,7 @@ Exit: `cargo test --workspace` green on Linux CI and locally on macOS; `dhow --v
 - M1.7 Completion gate with digest check and atomic rename (`§8, I7, I8`).
 - M1.8 CLI: `add`, `ls`, `pause`, `resume`, `cancel`, `watch`.
 
-Exit: T-I1 through T-I10, T-9a, T-blind, T-3 pass. A `kill -9` at any random point during 100 runs never yields a bad final file.
+Exit: T-I1 through T-I10 (except T-I6, which needs a chunk that ends before the file and so moves to M2), T-9a, T-blind, T-3 pass. A `kill -9` at any random point during 100 runs never yields a bad final file. T-I2 is covered by those runs and by the writer's commit-order tests.
 
 ## M2 — Multi-connection & scheduling
 
@@ -34,7 +34,7 @@ Exit: T-I1 through T-I10, T-9a, T-blind, T-3 pass. A `kill -9` at any random poi
 - M2.6 Speed sampling, EMA, ETA (`§14`).
 - M2.7 Idle guarantee test (T-idle).
 
-Exit: T-4.3, T-9b, T-10, T-11, T-12, T-idle pass. 10 parallel downloads from `dhow-testserver` complete bit-exact with the ramp behaviour visible in CLI output.
+Exit: T-I6, T-4.3, T-9b, T-10, T-11, T-12, T-idle pass. 10 parallel downloads from `dhow-testserver` complete bit-exact with the ramp behaviour visible in CLI output.
 
 ## M3 — Organisation & platform adapter
 

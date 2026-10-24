@@ -2,9 +2,10 @@
 
 use std::time::Duration;
 
+pub use reqwest::Url;
 use reqwest::header::{ACCEPT_ENCODING, HeaderName, HeaderValue, IF_RANGE, RANGE};
 use reqwest::redirect::Policy;
-use reqwest::{Client, RequestBuilder, Url};
+use reqwest::{Client, RequestBuilder};
 
 pub const MAX_REDIRECTS: usize = 10;
 
