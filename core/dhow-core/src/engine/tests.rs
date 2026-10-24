@@ -993,3 +993,111 @@ mod speed_tests {
         );
     }
 }
+
+mod category_tests {
+    use super::*;
+    use crate::engine::categories::CategoryUsage;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn category_from_name_then_type_with_user_extras() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let add = |path: String, name: Option<&str>| {
+            let mut req = fx.request(&server, &path);
+            req.filename = name.map(Into::into);
+            fx.engine.add(req)
+        };
+        let named = add(format!("/blob/10?{}", disposition("Clip.MKV")), None);
+        assert_eq!(named.await.unwrap().category, Category::Video);
+        let typed = add(
+            "/blob/10?header=Content-Type%3A%20audio%2Fmpeg".into(),
+            Some("song"),
+        );
+        assert_eq!(typed.await.unwrap().category, Category::Audio);
+        // The user's name beats the server's type.
+        let renamed = add(
+            "/blob/10?header=Content-Type%3A%20audio%2Fmpeg".into(),
+            Some("notes.txt"),
+        );
+        assert_eq!(renamed.await.unwrap().category, Category::Document);
+        let unknown = add("/blob/10".into(), Some("thing.qqq"));
+        assert_eq!(unknown.await.unwrap().category, Category::Other);
+
+        let extra = fx
+            .engine
+            .set_extra_extensions(Category::Data, &[".QQQ".into(), "mkv".into()])
+            .unwrap();
+        assert_eq!(extra[&Category::Data], ["mkv", "qqq"]);
+        let qqq = add("/blob/10".into(), Some("thing2.qqq"));
+        assert_eq!(qqq.await.unwrap().category, Category::Data);
+        let mkv = add("/blob/10".into(), Some("b.mkv"));
+        assert_eq!(mkv.await.unwrap().category, Category::Data, "extras win");
+        // Already-added downloads keep theirs.
+        assert_eq!(fx.engine.list().unwrap()[0].category, Category::Video);
+
+        // Moving an extension takes it out of its old category.
+        let extra = fx
+            .engine
+            .set_extra_extensions(Category::Code, &["qqq".into()])
+            .unwrap();
+        assert_eq!(extra[&Category::Data], ["mkv"]);
+        assert_eq!(extra[&Category::Code], ["qqq"]);
+        let extra = fx.engine.set_extra_extensions(Category::Data, &[]).unwrap();
+        assert!(!extra.contains_key(&Category::Data));
+        assert_eq!(fx.engine.extra_extensions().unwrap(), extra);
+        assert!(matches!(
+            fx.engine
+                .set_extra_extensions(Category::Video, &["a/b".into()]),
+            Err(EngineError::InvalidSetting(_))
+        ));
+        assert!(matches!(
+            fx.engine
+                .set_extra_extensions(Category::Other, &["x".into()]),
+            Err(EngineError::InvalidSetting(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn storage_breakdown_sums_completed_and_reports_missing_files() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let mut ids = vec![];
+        for (name, size) in [
+            ("a.mp4", 1000),
+            ("b.mp4", 2000),
+            ("c.zip", 300),
+            ("d.zip", 40),
+        ] {
+            let path = format!("/blob/{size}?{}", disposition(name));
+            let added = fx.engine.add(fx.request(&server, &path)).await.unwrap();
+            ids.push(added.id);
+        }
+        // Not completed: not counted.
+        fx.engine
+            .add(fx.request(&server, &format!("/blob/5?{}", disposition("e.pdf"))))
+            .await
+            .unwrap();
+        for id in &ids {
+            assert_eq!(fx.run(id).await.state, State::Completed);
+        }
+        std::fs::remove_file(fx.downloads.join("d.zip")).unwrap();
+
+        assert_eq!(
+            fx.engine.storage_breakdown().unwrap(),
+            [
+                CategoryUsage {
+                    category: Category::Video,
+                    bytes: 3000,
+                    files: 2,
+                    missing: vec![],
+                },
+                CategoryUsage {
+                    category: Category::Archive,
+                    bytes: 300,
+                    files: 1,
+                    missing: vec![ids[3].clone()],
+                },
+            ]
+        );
+    }
+}

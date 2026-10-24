@@ -7,6 +7,7 @@
 //! decision (the CLI runs one in the foreground); the caller also makes
 //! sure no two processes run the same download.
 
+pub mod categories;
 pub mod limits;
 pub mod queues;
 pub mod speed;
@@ -29,7 +30,7 @@ use crate::download::{
 };
 use crate::http::{self, Header};
 use crate::journal::format;
-use crate::naming::{self, TargetFs};
+use crate::naming::{self, Category, TargetFs};
 use crate::probe::{self, ProbeError, Resumable};
 use crate::speed::{Ema, rollup_cutoff};
 use crate::storage::{DEFAULT_QUEUE_ID, Db, StorageError};
@@ -236,6 +237,8 @@ pub struct Snapshot {
     pub position: i64,
     /// Bytes/s; `Some(0)`: paused by limit (§12).
     pub speed_limit: Option<u64>,
+    /// From the final name, set at `Add` (§13.1).
+    pub category: Category,
 }
 
 impl Snapshot {
@@ -341,6 +344,13 @@ impl Engine {
             .collect();
         taken.extend(self.reserved_names(&req.directory)?);
         let name = naming::deduplicate(&base, &taken);
+        // Completion only ever adds ` (n)` before the extension, so this
+        // holds for the name the file finally gets.
+        let category = naming::categorize(
+            &name,
+            info.content_type.as_deref(),
+            &self.extra_extensions()?,
+        );
         let final_path = req.directory.join(&name);
         let part_path = req.directory.join(format!("{name}.part"));
 
@@ -371,8 +381,8 @@ impl Engine {
             "INSERT INTO downloads (id, url, headers, final_path, part_path, state, fail_reason,
                  queue_id, position, category, created_at, total_size, etag, last_modified,
                  digest, resumable, connections, speed_limit)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'other', ?10, ?11, ?12, ?13, ?14, ?15,
-                 ?16, ?17)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                 ?17, ?18)",
             params![
                 id,
                 req.url.as_str(),
@@ -383,6 +393,7 @@ impl Engine {
                 reason.as_ref().map(FailReason::as_db),
                 queue_id,
                 position,
+                category.as_str(),
                 now_ms(),
                 info.total_size.map(|t| t as i64),
                 info.etag,
@@ -901,8 +912,8 @@ fn fail_reason(e: &DownloadError) -> FailReason {
 }
 
 const SELECT: &str = "SELECT id, url, final_path, part_path, state, fail_reason, total_size,
-    resumable, size_unverified, identity_weak, created_at, queue_id, position, speed_limit
-    FROM downloads";
+    resumable, size_unverified, identity_weak, created_at, queue_id, position, speed_limit,
+    category FROM downloads";
 
 fn snapshot(r: &Row) -> rusqlite::Result<Snapshot> {
     let state: String = r.get(4)?;
@@ -942,6 +953,7 @@ fn snapshot(r: &Row) -> rusqlite::Result<Snapshot> {
         queue_id: r.get(11)?,
         position: r.get(12)?,
         speed_limit: r.get::<_, Option<i64>>(13)?.map(|v| v as u64),
+        category: Category::parse(&r.get::<_, String>(14)?).unwrap_or(Category::Other),
     })
 }
 

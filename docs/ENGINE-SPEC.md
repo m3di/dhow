@@ -370,6 +370,11 @@ Changing a limit takes effect within 200 ms: waiting connections are woken at on
 Derived at probe time from extension first, `Content-Type` second:
 `Video | Audio | Image | Document | Archive | Software | Code | Data | Other`. The mapping table lives in `dhow-core/src/naming/categories.toml`, user-extensible via settings (`extra_extensions: {Category: [ext]}`). `storage_breakdown()` sums `total_size` of `Completed` downloads by category and reports whether the file still exists (via path or token).
 
+- The download's category is fixed at `Add`, from its final name (a user `filename` included). Completion only adds ` (n)` before the extension, so it never changes it.
+- Extensions match case-insensitively, longest suffix first (`a.tar.gz`: `tar.gz`, then `gz`); at each length the user's extras beat the built-in table. An extension is in at most one category; adding it to one removes it from the others.
+- No known extension: the `Content-Type`'s usual extension (§3's table) is looked up the same way, then its top-level type (`video/*`, `audio/*`, `image/*`); otherwise `Other`.
+- Per category, `storage_breakdown()` gives the bytes and count of completed downloads whose file still exists, and the ids of those whose file is gone (not counted in the bytes). Categories with neither are omitted.
+
 ### 13.2 Automatic grouping
 
 Goal: `Movie.Part1.rar`, `Movie.Part2.rar`, `Movie.Part3.rar` appear as one group.

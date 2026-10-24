@@ -1,0 +1,40 @@
+# Built-in extension → category table (ENGINE-SPEC §13.1). Lowercase, no
+# leading dot; each extension in one category. Anything not listed is
+# `other` unless its Content-Type says more. Users extend it with the
+# `extra_extensions` setting, which wins over this table.
+
+video = [
+    "3g2", "3gp", "asf", "avi", "f4v", "flv", "m2ts", "m4v", "mkv", "mov", "mp4", "mpeg",
+    "mpg", "mts", "ogv", "rm", "rmvb", "ts", "vob", "webm", "wmv",
+]
+audio = [
+    "aac", "aif", "aiff", "alac", "amr", "ape", "au", "flac", "m4a", "m4b", "mid", "midi",
+    "mka", "mp3", "oga", "ogg", "opus", "ra", "wav", "weba", "wma",
+]
+image = [
+    "avif", "bmp", "cr2", "dng", "gif", "heic", "heif", "ico", "jfif", "jpeg", "jpg", "jxl",
+    "nef", "png", "psd", "raw", "svg", "tif", "tiff", "webp",
+]
+document = [
+    "azw3", "djvu", "doc", "docx", "epub", "htm", "html", "key", "md", "mobi", "numbers",
+    "odp", "ods", "odt", "pages", "pdf", "ppt", "pptx", "rtf", "tex", "txt", "xls", "xlsx",
+    "xps",
+]
+archive = [
+    "7z", "arj", "br", "bz2", "cab", "gz", "lz", "lz4", "lzh", "lzma", "rar", "tar", "tbz2",
+    "tgz", "txz", "xz", "z", "zip", "zst",
+]
+software = [
+    "aab", "apk", "appimage", "appx", "bin", "deb", "dmg", "exe", "flatpak", "img", "ipa",
+    "iso", "jar", "msi", "msix", "pkg", "rpm", "run", "snap", "xapk",
+]
+code = [
+    "bat", "c", "cc", "cpp", "cs", "css", "go", "h", "hpp", "java", "js", "kt", "lua", "m",
+    "php", "pl", "ps1", "py", "r", "rb", "rs", "scala", "sh", "swift", "tsx",
+    "vue", "wasm",
+]
+data = [
+    "arrow", "avro", "csv", "db", "geojson", "gpx", "h5", "ics", "json", "jsonl", "kml",
+    "ndjson", "parquet", "sql", "sqlite", "toml", "torrent", "tsv", "vcf", "xml", "yaml",
+    "yml",
+]

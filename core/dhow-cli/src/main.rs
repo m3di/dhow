@@ -13,7 +13,7 @@ use dhow_core::engine::queues::{OnComplete, QueueSpec};
 use dhow_core::engine::{AddRequest, Engine, EngineError, EngineEvent, Snapshot, State};
 use dhow_core::http::{Header, Url};
 use dhow_core::logging;
-use dhow_core::naming::TargetFs;
+use dhow_core::naming::{Category, TargetFs};
 use dhow_core::schedule::{Action, Schedule, Window};
 use dhow_core::storage::Db;
 use futures_util::StreamExt;
@@ -144,7 +144,11 @@ enum Command {
     /// Speed samples of a download, or of all together: hourly rows, then
     /// the last minutes second by second
     History { id: Option<String> },
-    /// Show or change the global speed limit and headroom
+    /// Completed downloads by category: bytes and files still on disk,
+    /// ids of those whose file is gone
+    Storage,
+    /// Show or change the global speed limit, headroom and extra
+    /// category extensions
     Settings {
         /// Limit for all downloads together (see `dhow limit`)
         #[arg(long)]
@@ -153,6 +157,10 @@ enum Command {
         /// on the link (0–99)
         #[arg(long)]
         headroom: Option<u8>,
+        /// `CATEGORY=ext,ext`: extensions to put in a category, replacing
+        /// its earlier extras (`CATEGORY=` clears them); repeatable
+        #[arg(long = "extensions", value_name = "CATEGORY=EXTS")]
+        extensions: Vec<String>,
     },
 }
 
@@ -459,17 +467,31 @@ async fn run(
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Storage => {
+            for u in engine.storage_breakdown()? {
+                output::emit(output::storage(&u));
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Settings {
             global_limit,
             headroom,
+            extensions,
         } => {
+            for v in extensions {
+                let (category, exts) = parse_extensions(&v)?;
+                engine.set_extra_extensions(category, &exts)?;
+            }
             if let Some(v) = global_limit {
                 engine.set_global_limit(parse_rate(&v)?)?;
             }
             if let Some(p) = headroom {
                 engine.set_headroom(p)?;
             }
-            output::emit(output::settings(&engine.limit_settings()?));
+            output::emit(output::settings(
+                &engine.limit_settings()?,
+                &engine.extra_extensions()?,
+            ));
             lock::poke_runners(&data_dir);
             Ok(ExitCode::SUCCESS)
         }
@@ -511,6 +533,22 @@ fn parse_rate(v: &str) -> Res<Option<u64>> {
         return Err(format!("{v:?} is not a rate (e.g. 500K, 2M, none)").into());
     }
     Ok(Some((n * unit as f64).round() as u64))
+}
+
+/// `video=mkv,webm` → `(Video, ["mkv", "webm"])`; `video=` clears.
+fn parse_extensions(v: &str) -> Res<(Category, Vec<String>)> {
+    let (category, exts) = v
+        .split_once('=')
+        .ok_or_else(|| format!("{v:?}: expected CATEGORY=ext,ext"))?;
+    let category =
+        Category::parse(category.trim()).ok_or_else(|| format!("unknown category {category:?}"))?;
+    let exts = exts
+        .split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(str::to_owned)
+        .collect();
+    Ok((category, exts))
 }
 
 fn parse_action(v: &str) -> Res<Action> {
