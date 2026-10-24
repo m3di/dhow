@@ -60,6 +60,11 @@ struct State {
 }
 
 impl State {
+    /// §10.1: held and reserved slots never exceed the budget.
+    fn check(&self, config: &BudgetConfig) {
+        debug_assert!(self.used() <= config.global, "over the budget: {self:?}");
+    }
+
     fn used(&self) -> u32 {
         self.entries.values().map(|e| e.held + e.reserved).sum()
     }
@@ -257,13 +262,16 @@ impl Ticket {
         self.budget.state().entries[&self.key].shed
     }
 
-    /// A connection ended. `shed`: it ended because it was asked to; the
-    /// slot goes to the download it was given up for.
-    pub fn release(&self, shed: bool) {
+    /// A connection ended. While this download owes slots to newcomers
+    /// (§10.3), the slot goes to the first of them however the connection
+    /// ended: freed to everyone it could be taken, and the newcomer's
+    /// reservation would come on top of a full budget.
+    pub fn release(&self) {
+        let config = self.budget.config;
         let mut s = self.budget.state();
         let e = s.entries.get_mut(&self.key).expect("registered");
         e.held = e.held.saturating_sub(1);
-        let target = if shed && e.shed > 0 {
+        let target = if e.shed > 0 {
             e.shed -= 1;
             e.shed_for.pop_front()
         } else {
@@ -272,6 +280,7 @@ impl Ticket {
         if let Some(t) = target.and_then(|t| s.entries.get_mut(&t)) {
             t.reserved += 1;
         }
+        s.check(&config);
         drop(s);
         self.budget.changed.notify_waiters();
     }
@@ -286,7 +295,7 @@ impl Ticket {
     /// Returns every slot still held (end of a run, or before a reset).
     pub fn release_all(&self) {
         while self.held() > 0 {
-            self.release(false);
+            self.release();
         }
     }
 
@@ -300,7 +309,9 @@ impl Drop for Ticket {
         let mut s = self.budget.state();
         if let Some(e) = s.entries.remove(&self.key) {
             // Slots promised away by this download, never handed over:
-            // hand them over now.
+            // hand them over now. A release pays these first, so each
+            // comes out of a slot still held.
+            debug_assert!(e.shed_for.len() as u32 <= e.held, "{e:?}");
             for t in e.shed_for {
                 if let Some(t) = s.entries.get_mut(&t) {
                     t.reserved += 1;
@@ -308,6 +319,7 @@ impl Drop for Ticket {
             }
         }
         // Reservations made for it are simply free again.
+        s.check(&self.budget.config);
         drop(s);
         self.budget.changed.notify_waiters();
     }
@@ -401,7 +413,7 @@ mod tests {
             "youngest gives"
         );
         // c drops a connection; it is reserved for n, nobody else gets it.
-        c.release(true);
+        c.release();
         assert!(!a.try_grow());
         assert!(n.try_first());
         assert_eq!(b.usage("n:80"), (4, 1));
@@ -446,6 +458,30 @@ mod tests {
         drop(a); // finished before giving the slot up
         assert!(n.try_first());
         assert!(n.try_grow(), "the rest of a's slots are free too");
+    }
+
+    /// A download asked to give a slot up that finishes normally first
+    /// pays it with its first release: no one else can take it, and its
+    /// drop has nothing left to hand over (it used to, on top of a full
+    /// budget: 17 of 16 on CI).
+    #[test]
+    fn an_ordinary_release_pays_a_pending_shed() {
+        let b = budget(3, 4);
+        let x = ticket(&b, 1, "x:80", 4);
+        let g = ticket(&b, 2, "g:80", 4);
+        assert!(x.try_first());
+        x.stop_wanting();
+        assert!(g.try_first() && g.try_grow());
+        let n = ticket(&b, 3, "n:80", 4);
+        assert!(!n.try_first());
+        assert_eq!(g.shed_requested(), 1);
+        g.release_all();
+        assert_eq!(g.shed_requested(), 0);
+        assert!(x.try_grow(), "the other slot is free");
+        assert!(!x.try_grow(), "the first is n's");
+        drop(g);
+        assert!(n.try_first());
+        assert_eq!(b.usage("").0, 3);
     }
 
     #[tokio::test]
