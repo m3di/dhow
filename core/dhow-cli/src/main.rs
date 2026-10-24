@@ -144,6 +144,11 @@ enum Command {
     /// Speed samples of a download, or of all together: hourly rows, then
     /// the last minutes second by second
     History { id: Option<String> },
+    /// Manage groups
+    Group {
+        #[command(subcommand)]
+        command: GroupCommand,
+    },
     /// Completed downloads by category: bytes and files still on disk,
     /// ids of those whose file is gone
     Storage,
@@ -162,6 +167,17 @@ enum Command {
         #[arg(long = "extensions", value_name = "CATEGORY=EXTS")]
         extensions: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum GroupCommand {
+    /// List groups with their members' progress, speed and ETA together
+    Ls,
+    /// Put a download in a group (name or id), or take it out with `none`;
+    /// auto-grouping leaves it alone from then on
+    Set { id: String, group: String },
+    /// Rename a group
+    Rename { group: String, name: String },
 }
 
 #[derive(Subcommand)]
@@ -309,8 +325,15 @@ async fn run(
                 speed_limit: limit.as_deref().map(parse_rate).transpose()?.flatten(),
                 target_fs: TargetFs::host(),
             };
-            let added = engine.add(req).await?;
+            // `added` first, then what adding it changed for others.
+            let changed = std::sync::Mutex::new(Vec::new());
+            let added = engine
+                .add(req, &|e| changed.lock().unwrap().push(e))
+                .await?;
             output::emit(output::snapshot("added", &added));
+            for e in changed.into_inner().unwrap() {
+                print(&e);
+            }
             if queue || added.state != State::Queued {
                 lock::poke_runners(&data_dir);
                 return Ok(exit_for(added.state));
@@ -464,6 +487,31 @@ async fn run(
             let id = id.map(|i| engine.resolve(&i)).transpose()?;
             for s in engine.speed_history(id.as_deref())? {
                 output::emit(output::sample(id.as_deref(), &s));
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Group { command } => {
+            match command {
+                GroupCommand::Ls => {
+                    for g in engine.list_groups()? {
+                        output::emit(output::group(&g));
+                    }
+                }
+                GroupCommand::Set { id, group } => {
+                    let id = engine.resolve(&id)?;
+                    let group = match group.as_str() {
+                        "none" => None,
+                        g => Some(engine.resolve_group(g)?),
+                    };
+                    let snap = engine.set_group(&id, group.as_deref(), &on_event)?;
+                    output::emit(output::snapshot("download", &snap));
+                }
+                GroupCommand::Rename { group, name } => {
+                    let group = engine.resolve_group(&group)?;
+                    output::emit(output::group(
+                        &engine.rename_group(&group, &name, &on_event)?,
+                    ));
+                }
             }
             Ok(ExitCode::SUCCESS)
         }

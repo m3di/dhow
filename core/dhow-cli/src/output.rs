@@ -3,6 +3,7 @@
 
 use dhow_core::download::ResetReason;
 use dhow_core::engine::categories::CategoryUsage;
+use dhow_core::engine::groups::GroupSnapshot;
 use dhow_core::engine::limits::LimitSettings;
 use dhow_core::engine::queues::QueueSnapshot;
 use dhow_core::engine::speed::SpeedSample;
@@ -62,6 +63,9 @@ pub fn event(e: &EngineEvent) -> Value {
                 WarningKind::ServerIgnoredRange => "server_ignored_range",
             },
         }),
+        EngineEvent::GroupChanged { id, group } => json!({
+            "event": "group_changed", "id": id, "group": group.as_ref().map(group_fields),
+        }),
     }
 }
 
@@ -86,6 +90,21 @@ pub fn snapshot(event: &str, s: &Snapshot) -> Value {
         "position": s.position,
         "speed_limit": s.speed_limit,
         "category": s.category.as_str(),
+        "group": s.group,
+    })
+}
+
+pub fn group(g: &GroupSnapshot) -> Value {
+    let mut v = group_fields(g);
+    v["event"] = "group".into();
+    v
+}
+
+fn group_fields(g: &GroupSnapshot) -> Value {
+    json!({
+        "id": g.id, "name": g.name, "auto": g.auto, "members": g.members,
+        "downloaded": g.downloaded, "total": g.total, "speed_bps": g.speed_bps,
+        "eta_secs": g.eta_secs,
     })
 }
 

@@ -44,6 +44,17 @@ impl Ema {
         }
         Some((remaining as f64 / self.value).ceil() as u64)
     }
+
+    /// Several downloads together: speeds add up; the ETA needs
+    /// [`MIN_SAMPLES`] from each.
+    pub fn combined(emas: impl IntoIterator<Item = Ema>) -> Ema {
+        emas.into_iter()
+            .reduce(|a, b| Ema {
+                value: a.value + b.value,
+                samples: a.samples.min(b.samples),
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// 1 s samples taken before this (unix ms) are rolled up: their hour ended

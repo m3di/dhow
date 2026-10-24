@@ -79,7 +79,7 @@ fn t_idle_nothing_runs_after_the_last_download() {
                 speed_limit: (seed == 3).then_some(2 << 20),
                 target_fs: TargetFs::host(),
             };
-            ids.push(engine.add(req).await.unwrap().id);
+            ids.push(engine.add(req, &|_| {}).await.unwrap().id);
         }
         let (_keep, stop) = watch::channel(false);
         let sink = events.clone();
