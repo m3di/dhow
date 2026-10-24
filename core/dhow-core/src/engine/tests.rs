@@ -25,10 +25,14 @@ fn fast() -> DownloadConfig {
 
 impl Fx {
     fn new() -> Self {
+        Self::with(fast())
+    }
+
+    fn with(config: DownloadConfig) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let downloads = dir.path().join("dl");
         std::fs::create_dir(&downloads).unwrap();
-        let engine = Engine::open(&dir.path().join("data"), fast()).unwrap();
+        let engine = Engine::open(&dir.path().join("data"), config).unwrap();
         Self {
             _dir: dir,
             downloads,
@@ -314,4 +318,44 @@ fn fail_reasons_round_trip() {
     ] {
         assert_eq!(FailReason::parse(&r.as_db()), r);
     }
+}
+
+/// Two downloads, one slot for their host: the second is `waiting` (in the
+/// database and the events) until the first finishes.
+#[tokio::test(flavor = "multi_thread")]
+async fn budget_wait_is_a_visible_state() {
+    let server = TestServer::start().unwrap();
+    let mut config = fast();
+    config.budget.per_host = 1;
+    let fx = Fx::with(config);
+    let a = fx
+        .engine
+        .add(fx.request(&server, "/blob/400000?seed=1&throttle=1000000"))
+        .await
+        .unwrap();
+    let b = fx
+        .engine
+        .add(fx.request(&server, "/blob/400000?seed=2&throttle=1000000"))
+        .await
+        .unwrap();
+    let seen_waiting = Arc::new(StdMutex::new(false));
+    let engine = &fx.engine;
+    let (_keep, stop) = watch::channel(false);
+    let first = engine.run(&a.id, &|_| {}, &stop);
+    let second = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let flag = seen_waiting.clone();
+        let b_id = b.id.clone();
+        let on_event = move |e: EngineEvent| {
+            if matches!(&e, EngineEvent::StateChanged { id, to: State::Waiting, .. } if *id == b_id)
+            {
+                *flag.lock().unwrap() = true;
+            }
+        };
+        engine.run(&b.id, &on_event, &stop).await
+    };
+    let (ra, rb) = tokio::join!(first, second);
+    assert_eq!(ra.unwrap().state, State::Completed);
+    assert_eq!(rb.unwrap().state, State::Completed);
+    assert!(*seen_waiting.lock().unwrap(), "b waited for the budget");
 }

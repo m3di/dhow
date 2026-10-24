@@ -21,8 +21,9 @@ use rusqlite::{OptionalExtension, Row, params};
 use tokio::sync::watch;
 
 use crate::complete::{self, CompleteError, Target};
-use crate::download::ramp::LinkState;
-use crate::download::{self, DownloadConfig, DownloadError, DownloadEvent, Request, ResetReason};
+use crate::download::{
+    self, DownloadConfig, DownloadError, DownloadEvent, Request, ResetReason, Shared,
+};
 use crate::http::{self, Header};
 use crate::journal::format;
 use crate::naming::{self, TargetFs};
@@ -39,6 +40,8 @@ pub type DownloadId = String;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     Queued,
+    /// Waiting for the connection budget (§10.3).
+    Waiting,
     Active,
     Paused,
     Completing,
@@ -51,6 +54,7 @@ impl State {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
+            Self::Waiting => "waiting",
             Self::Active => "active",
             Self::Paused => "paused",
             Self::Completing => "completing",
@@ -63,6 +67,7 @@ impl State {
     fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "queued" => Self::Queued,
+            "waiting" => Self::Waiting,
             "active" => Self::Active,
             "paused" => Self::Paused,
             "completing" => Self::Completing,
@@ -246,8 +251,9 @@ pub struct Engine {
     db: Arc<Mutex<Db>>,
     client: Client,
     config: DownloadConfig,
-    /// What this process knows about the user's link (§10.A).
-    link: LinkState,
+    /// The connection budget and link knowledge all downloads in this
+    /// process share (§10).
+    shared: Shared,
 }
 
 impl Engine {
@@ -259,7 +265,7 @@ impl Engine {
             db: Arc::new(Mutex::new(db)),
             client,
             config,
-            link: LinkState::default(),
+            shared: Shared::new(config.budget),
         })
     }
 
@@ -461,6 +467,7 @@ impl Engine {
             part: part.clone(),
             sidecar: sidecar.clone(),
             connections: self.connections(id)?,
+            started_at: self.started_at(id)?,
         };
         let progress = Mutex::new(Progress::new(snap.total_size));
         let dl_event = |e: DownloadEvent| self.on_download_event(id, e, &progress, on_event);
@@ -468,7 +475,7 @@ impl Engine {
             &req,
             &self.client,
             &self.config,
-            &self.link,
+            &self.shared,
             &dl_event,
             stop,
         )
@@ -604,6 +611,17 @@ impl Engine {
                     delay,
                 });
             }
+            DownloadEvent::Waiting(waiting) => {
+                drop(p);
+                let to = if waiting {
+                    State::Waiting
+                } else {
+                    State::Active
+                };
+                if let Err(e) = self.transition(id, to, None, on_event) {
+                    tracing::warn!(id, error = %e, "could not record budget wait");
+                }
+            }
             DownloadEvent::Connections(n) => {
                 p.connections = n;
                 p.flush(id, on_event);
@@ -621,6 +639,15 @@ impl Engine {
                 });
             }
         }
+    }
+
+    fn started_at(&self, id: &str) -> Result<Option<i64>, EngineError> {
+        let db = self.db();
+        Ok(db.conn().query_row(
+            "SELECT started_at FROM downloads WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )?)
     }
 
     fn connections(&self, id: &str) -> Result<Option<u8>, EngineError> {

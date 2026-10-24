@@ -422,7 +422,7 @@ fn split_refuses_points_outside_the_unwritten_part() {
     let (_fx, mut w) = Fixture::new(Some(1000), NO_AUTO);
     w.define(0, 0..1000).unwrap();
     w.write(0, 0, &data(300, 1)).unwrap();
-    assert_eq!(w.split(0, 1, 300).unwrap(), None, "already written");
+    assert_eq!(w.split(0, 1, 299).unwrap(), None, "already written");
     assert_eq!(w.split(0, 1, 1000).unwrap(), None, "nothing left to take");
     assert!(matches!(
         w.split(9, 1, 500),

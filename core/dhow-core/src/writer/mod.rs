@@ -279,7 +279,8 @@ impl Writer {
     /// Work stealing (§4.3): chunk `owner` keeps `[.., at)`, new chunk `new`
     /// gets `[at, end)`. Recorded in the journal before this returns, i.e.
     /// before the new connection can send a request. `None` if `at` is no
-    /// longer inside the owner's unwritten part.
+    /// longer inside the owner's unwritten part (`at == written` is: the
+    /// owner keeps exactly what it wrote, e.g. when it is shed).
     pub fn split(
         &mut self,
         owner: ChunkId,
@@ -296,7 +297,7 @@ impl Writer {
                 range: at..chunk.end,
             });
         }
-        if at <= chunk.written || at >= chunk.end {
+        if at < chunk.written || at >= chunk.end {
             return Ok(None);
         }
         let tail = at..chunk.end;

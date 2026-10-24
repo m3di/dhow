@@ -283,17 +283,18 @@ The scheduler decides which downloads are `Active` and how many connections each
 
 #### 10.1 Global connection budget
 
-`settings.global_connections` (default 16). The sum of all active connections across all downloads never exceeds it.
+`settings.global_connections` (default 16). The sum of all active connections across all downloads never exceeds it. The budget belongs to one engine instance (one process); every download in it holds a ticket and asks it for each connection.
 
 #### 10.3 Allocation rule: oldest first, newcomers ramp
 
-Every time budget changes (download added/finished/paused, connection closed, setting changed):
+Every download has a connection limit `n` (§4.1) and grows toward it through ramp-up (§4.4), one connection at a time. The budget decides whether it may:
 
-1. Order all downloads that are `Active` or `Waiting(ConnectionBudget)` by `started_at` ascending (oldest first).
-2. Walk the list. Each download is granted `min(its n, per-host remaining, global remaining, 1 + its current connections)` — i.e. it can grow by at most one connection per allocation round. Rounds happen on every budget change and every `settings.rampup_interval` (default 3 s) while anyone is waiting.
-3. Downloads reached after budget hits zero get **one** connection if `settings.min_connections_for_new` is 1 (default), taken from the youngest over-allocated download, so a new download always makes visible progress. If that setting is 0, they wait.
+1. Downloads are ordered by `started_at` (oldest first; kept across restarts).
+2. **A first connection** needs only the caps: global and per-host room.
+3. **One more connection** for a running download needs the caps *and* room beyond the **claims** of every older download. A download that is still ramping claims the connections it may yet open (`n − held`), counted only up to what its host has room for, so a host-capped elder does not hold up other hosts (§10.5). A download stops claiming when its ramp-up ends: saturated, nothing left worth splitting, downgraded, or at `n`.
+4. **Newcomers always make progress** if `settings.min_connections_for_new` is 1 (default): a download that can't get its first connection because the budget is spent asks the youngest download holding more than one connection to give one up (on the same host, if it's the host that is full). That download stops its newest connection where it is; the rest of that chunk goes back to its pending work (never a connection still verifying an I5 overlap). The freed slot is reserved for the newcomer. If nobody has a connection to spare (e.g. the per-host cap is reached by downloads holding one each), the newcomer is `Waiting(ConnectionBudget)` until a slot frees. With the setting 0, it waits whenever the budget is spent.
 
-Effect: start 10 downloads on a 16-connection budget → the first one ramps to 8, the next to 4–8 as space allows, the rest crawl at 1 connection each, and as the oldest finish the rest ramp up in order. This is the behaviour requested in the brief.
+Effect: start 10 downloads on a 16-connection budget → the first one ramps to its limit, the next ones grow only into what the older ones don't claim, the rest crawl at 1 connection each, and as the oldest finish (or stop ramping) the rest ramp up in order. This is the behaviour requested in the brief. (The rule is evaluated whenever a download asks; it replaces the periodic "rounds" of earlier drafts with the same outcome, growth still being one connection per ramp-up window.)
 
 #### 10.6 Adaptive ramp-up and headroom
 
@@ -305,7 +306,7 @@ Ramp-up is throughput-aware (§4.4): a download stops adding connections where t
 
 #### 10.2 Per-host cap
 
-`settings.per_host_connections` (default 4). Keyed by `effective_url` host (eTLD+1 is *not* used; `cdn1.x.com` and `cdn2.x.com` are different hosts, which is usually what the server operator intends).
+`settings.per_host_connections` (default 4). Keyed by `effective_url` host **and port** (`host:port`, the scheme's default port if none is given; eTLD+1 is *not* used: `cdn1.x.com` and `cdn2.x.com` are different hosts, which is usually what the server operator intends, and so are two servers on different ports). The cap is absolute: it also bounds the newcomer guarantee below.
 
 `429` and `503` with `Retry-After` are honored per connection (§9).
 
