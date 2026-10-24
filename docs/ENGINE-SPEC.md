@@ -165,7 +165,7 @@ When the sidecar exceeds 64 KiB, rewrite it to `<final>.dhow.tmp` with the heade
 
 ### 5.4 Recovery with no sidecar
 
-A `.part` without a `.dhow` is **not** resumable. Start over. (Never trust bytes you cannot account for.)
+A `.part` without a `.dhow` is **not** resumable. Start over. (Never trust bytes you cannot account for.) The same applies to a `.dhow` without its `.part`, a sidecar whose header fails its checks, a part file whose length isn't the `total_size` it was created with, and committed bytes on a server that can no longer resume (non-resumable or blind).
 
 ---
 
@@ -185,14 +185,16 @@ After any crash, the engine resumes from the committed set in the sidecar and no
 **I4 — Identity is bound.**
 Every range request carries `If-Range: <etag>` (or `If-Range: <last-modified>` if no ETag). If the server answers `200` instead of `206`, or the `Content-Range` total differs from `total_size`, the response is discarded, the download is reset (`.part` truncated, sidecar recreated) and the user is informed ("The file on the server changed; starting over"). Strong ETags are required for `If-Range`; a weak ETag (`W/`) falls back to `Last-Modified`; if neither exists, resume uses the overlap check (I5) alone and the download is flagged `IdentityWeak`.
 
+Identity is also checked before any request on resume: every start re-probes, and the sidecar's URL hash, `total_size` and ETag (else Last-Modified) must match the fresh probe, or the download resets without fetching a byte. **Reset** means: delete the sidecar, then the part file, then create both afresh from the new probe (a crash in between leaves a part without sidecar, which §5.4 discards). At most `max_resets` (default 3) resets happen in one run; then the download fails, so a server whose file changes on every request cannot loop forever.
+
 **I5 — Overlap verification on resume.**
-When resuming a chunk whose committed end is `c > start`, the request begins at `max(start, c − OVERLAP)` where `OVERLAP = 64 KiB`. The first `min(OVERLAP, c − start)` bytes received MUST be byte-equal to what is already on disk. On mismatch → treat as I4 violation (reset).
+When resuming a chunk whose committed end is `c > start`, the request begins at `max(start, c − OVERLAP)` where `OVERLAP = 64 KiB`. The first `min(OVERLAP, c − start)` bytes received MUST be byte-equal to what is already on disk, and are compared before any new byte is written. On mismatch → treat as I4 violation (reset). The expected bytes are read from the part file before the writer starts (reading is not writing; I9 holds). If the connection drops inside the overlap window, the next request starts at the first unverified byte. A `200` to a resumed request that started at offset 0 is the whole file and is verified the same way.
 
 **I6 — Every write is bounded.**
 A connection writes only within its chunk's current `[pos, end)`. Bytes beyond `end` are dropped and the connection is closed. Bytes beyond `total_size` are an error (`ServerSentExtraData`) and the download fails rather than completing.
 
 **I7 — Size is exact.**
-Completion requires the committed set to be exactly `[0, total_size)` with no gaps and no overlaps. For `total_size = None` (blind mode), completion requires the single connection to see EOF and the server not to have sent `Content-Length`; the file is additionally flagged `SizeUnverified` in metadata.
+Completion requires the committed set to be exactly `[0, total_size)` with no gaps and no overlaps. For `total_size = None` (blind mode), completion requires the single connection to see EOF. If the server sent no `Content-Length`, the file is additionally flagged `SizeUnverified` in metadata; if it did, the HTTP layer already enforced that length (a short body is an error, not EOF), so the size is verified and no flag is set.
 
 **I8 — Digest when offered.**
 If the server sent `Digest`, `Content-Digest` (RFC 9530) or `Content-MD5`, the engine computes the hash over the full part file *in order* after I7 and before rename. Mismatch → `Failed(DigestMismatch)`, part file kept for inspection, not renamed. Supported: sha-256, sha-512, sha-1 (verify only), md5 (verify only).

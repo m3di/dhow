@@ -12,6 +12,7 @@ pub mod retry;
 use std::ops::Range;
 use std::time::{Duration, SystemTime};
 
+use bytes::Bytes;
 use reqwest::header::{CONTENT_LENGTH, ETAG, IF_RANGE, LAST_MODIFIED, RANGE, RETRY_AFTER};
 use reqwest::{Client, Response, Url};
 
@@ -63,6 +64,18 @@ impl Default for TransferConfig {
     }
 }
 
+/// How far back a resumed request starts (I5).
+pub const OVERLAP: u64 = 64 * 1024;
+
+/// Committed bytes `[start, start + expected.len())` that end exactly where
+/// a resumed chunk begins. The server must send them again, byte-equal,
+/// before anything new is written (I5).
+#[derive(Clone, Debug)]
+pub struct Overlap {
+    pub start: u64,
+    pub expected: Bytes,
+}
+
 /// Why an attempt failed in a way worth retrying.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Cause {
@@ -102,6 +115,8 @@ pub enum IdentityChange {
     BadContentRange,
     /// `416` to a range inside the probed size.
     Unsatisfiable,
+    /// The re-sent overlap differs from what is on disk (I5).
+    OverlapMismatch,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -167,6 +182,7 @@ pub async fn run_connection(
     src: &Source,
     chunk: ChunkId,
     range: Range<u64>,
+    overlap: Option<Overlap>,
     writer: &WriterHandle,
     config: &TransferConfig,
     on_event: &(dyn Fn(ConnEvent) + Send + Sync),
@@ -174,13 +190,16 @@ pub async fn run_connection(
     let mut pos = range.start;
     let mut resumable = src.resumable;
     let mut failures = 0u32;
+    let mut verify = overlap.filter(|o| !o.expected.is_empty());
+    let verified = |v: &Option<Overlap>| v.as_ref().map_or(u64::MAX, |o| o.start);
     loop {
-        let before = pos;
+        let before = (pos, verified(&verify));
         let fail = match attempt(
             src,
             &mut resumable,
             chunk,
             &mut pos,
+            &mut verify,
             &range,
             writer,
             config,
@@ -200,7 +219,7 @@ pub async fn run_connection(
         if pos > range.start && !can_resume {
             return Err(TransferError::NeedsRestart);
         }
-        if pos > before {
+        if pos > before.0 || verified(&verify) > before.1 {
             failures = 0;
         }
         failures += 1;
@@ -230,16 +249,18 @@ async fn attempt(
     resumable: &mut Resumable,
     chunk: ChunkId,
     pos: &mut u64,
+    verify: &mut Option<Overlap>,
     range: &Range<u64>,
     writer: &WriterHandle,
     config: &TransferConfig,
     on_event: &(dyn Fn(ConnEvent) + Send + Sync),
 ) -> Result<Finished, Fail> {
     let ranged = *resumable != Resumable::No && src.total.is_some();
+    let req_start = verify.as_ref().map_or(*pos, |v| v.start);
     let mut req = http::with_headers(src.client.get(src.url.clone()), &src.headers)
         .map_err(TransferError::InvalidHeader)?;
     if ranged {
-        req = req.header(RANGE, format!("bytes={}-{}", *pos, range.end - 1));
+        req = req.header(RANGE, format!("bytes={req_start}-{}", range.end - 1));
         if let Some(v) = &src.validator {
             req = req.header(IF_RANGE, v.as_str());
         }
@@ -249,7 +270,7 @@ async fn attempt(
         Ok(Err(e)) => return Err(classify(&e)),
         Ok(Ok(r)) => r,
     };
-    let resp_end = accept(src, resumable, *pos, range, &resp, ranged, on_event)?;
+    let resp_end = accept(src, resumable, req_start, range, &resp, ranged, on_event)?;
     let content_length_seen = resp.headers().contains_key(CONTENT_LENGTH);
     // Read to EOF when the chunk ends the file, so bytes past total_size are
     // seen (I6); otherwise stop at the chunk's end.
@@ -261,7 +282,22 @@ async fn attempt(
             Ok(Err(e)) => return Err(classify(&e)),
             Ok(Ok(next)) => next,
         };
-        let Some(bytes) = next else { break };
+        let Some(mut bytes) = next else { break };
+        if let Some(v) = verify.as_mut() {
+            let n = v.expected.len().min(bytes.len());
+            if bytes[..n] != v.expected[..n] {
+                return Err(identity(IdentityChange::OverlapMismatch));
+            }
+            v.expected = v.expected.slice(n..);
+            v.start += n as u64;
+            bytes = bytes.slice(n..);
+            if v.expected.is_empty() {
+                *verify = None;
+            }
+            if bytes.is_empty() {
+                continue;
+            }
+        }
         let (keep, overflow) = writer::bound(*pos, range.end, src.total, bytes.len());
         if keep > 0 {
             writer
@@ -295,7 +331,9 @@ async fn attempt(
         Some(_) if *pos == range.end => Ok(Finished {
             content_length_seen,
         }),
-        Some(_) if *pos < resp_end => Err(retry(Cause::Truncated)),
+        Some(_) if verify.as_ref().map_or(*pos, |v| v.start) < resp_end => {
+            Err(retry(Cause::Truncated))
+        }
         Some(_) => Err(Fail::Again),
     }
 }
@@ -305,7 +343,7 @@ async fn attempt(
 fn accept(
     src: &Source,
     resumable: &mut Resumable,
-    pos: u64,
+    req_start: u64,
     range: &Range<u64>,
     resp: &Response,
     ranged: bool,
@@ -326,14 +364,15 @@ fn accept(
                 }));
             }
             // A server may cap a range; a prefix of what we asked is fine.
-            if first != pos || last < first || last >= range.end {
+            if first != req_start || last < first || last >= range.end {
                 return Err(identity(IdentityChange::BadContentRange));
             }
             Ok(last + 1)
         }
         200 => {
-            // A full body is usable only where it starts: offset 0.
-            if range.start != 0 || pos != 0 {
+            // A full body is usable only if the request started at offset
+            // 0 (then any overlap is verified against it as usual).
+            if req_start != 0 {
                 return Err(identity(IdentityChange::RangeIgnored));
             }
             if let (Some(expected), Some(got)) = (src.total, content_length(headers)) {

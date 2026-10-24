@@ -99,7 +99,7 @@ async fn download(server: &TestServer, spec: Spec<'_>) -> Run {
     let started = Instant::now();
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        run_connection(&src, 0, range, &handle, &FAST, &on_event),
+        run_connection(&src, 0, range, None, &handle, &FAST, &on_event),
     )
     .await
     .expect("transfer hung");
