@@ -1,0 +1,16 @@
+# Decisions
+
+Append-only. Newest at the bottom. Format: date · decision · why · rejected.
+
+- **2026-10-24 · Shared Rust core + fully native shells.** The correctness-critical engine is written once; the UI is where nativeness lives, so it is never shared. Rejected: spec-only with five engines (five sets of integrity bugs); cross-platform UI toolkits (not native).
+- **2026-10-24 · Name: Dhow.** Cargo vessel between any shores; fits the expansion to device-to-device transfer. Checked crates.io, npm, GitHub, App Store, general web: only an unrelated small npm SSG. Rejected: Ferry (RustFerry/cargo-ferry, FileFerry, `ferry` crate), Portage (Gentoo), Peyk (UK courier company), Chapar (API testing tool), Tug (too close to "Tur", an existing Rust download manager), Caravan, Hauler (Rancher).
+- **2026-10-24 · License: GPL-3.0-or-later for everything, including the core.** Keeps the open-source promise and blocks proprietary forks. Rejected: MIT/Apache core (would let the engine be lifted into closed products).
+- **2026-10-24 · SQLite for index + per-download binary sidecar journal as the integrity authority.** DB gives cheap cross-download queries; the sidecar keeps fsync discipline local and makes every download self-describing. Rejected: DB-only (fsync coupling, download not recoverable if DB lost); sidecar-only (slow list queries).
+- **2026-10-24 · Oldest-first connection allocation with one-connection minimum for newcomers.** Matches the requested politeness ("new downloads wait for old ones") while keeping every download visibly alive. Rejected: strict FIFO (new downloads appear dead); round-robin fairness (defeats the point).
+- **2026-10-24 · Single main window with a detail pane; speed chart only in the detail pane.** Matches every platform's current conventions. Rejected: window per download (IDM-era), chart in the main list (clutter).
+- **2026-10-24 · Moved-file tracking only where the OS provides it for free (macOS/iOS bookmarks, Windows file IDs).** Rejected: Linux/Android scanning or fanotify watchers (cost, permissions, idle violation).
+- **2026-10-24 · Proxy/VPN: detect and display, optionally use system proxy or custom; never modify OS settings.** Rejected: anything requiring elevated privileges.
+- **2026-10-24 · Platform order: macOS → Linux → Windows → Android → iOS.** Maintainer is on macOS; Linux shell is pure Rust and validates the core API without an FFI layer; Windows needs the C ABI; mobile last because background constraints are hardest.
+- **2026-10-24 · JSON over the C ABI for the Windows shell.** Stability over micro-performance for a UI boundary that moves a few events per second. Revisit only with profiling evidence.
+- **2026-10-24 · Browser extension and clipboard watching deferred to M9.** Glue, not core. Rejected: v1 inclusion (delays the engine).
+- **2026-10-24 · Prior art noted, not copied.** aria2's per-host limits and `tur-rs`'s range-stealing scheduler informed §4.3 and §10.2 of the engine spec. No code was read from either while writing the spec; none may be copied while implementing it.
