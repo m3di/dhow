@@ -1345,6 +1345,41 @@ mod group_tests {
         assert!(fx.engine.auto_group(&a1.id).unwrap().is_empty());
     }
 
+    /// Another process commits while grouping waits for the write lock:
+    /// a deferred read-then-write would fail with `SQLITE_BUSY`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grouping_waits_for_another_writer() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let a1 = fx.add_named(&server, "Movie.Part1.rar").await;
+        let a2 = fx.add_named(&server, "Movie.Part2.rar").await;
+        fx.engine.set_group(&a1.id, None, &|_| {}).unwrap();
+        fx.engine
+            .db()
+            .conn()
+            .execute("UPDATE downloads SET group_pinned = 0", [])
+            .unwrap();
+        assert_eq!(fx.engine.get(&a2.id).unwrap().group, None);
+
+        let other = rusqlite::Connection::open(fx._dir.path().join("data/dhow.sqlite")).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        other
+            .execute("INSERT INTO settings (key, value) VALUES ('x', '1')", [])
+            .unwrap();
+        let (locked, wait) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            locked.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            other.execute_batch("COMMIT").unwrap();
+        });
+        wait.recv().unwrap();
+        assert_eq!(
+            fx.engine.auto_group(&a2.id).unwrap(),
+            [a1.id.clone(), a2.id.clone()]
+        );
+        writer.join().unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn groups_aggregate_progress_speed_and_eta() {
         let server = TestServer::start().unwrap();
@@ -1352,7 +1387,13 @@ mod group_tests {
         let a1 = fx.add_named(&server, "Set.01.bin").await;
         let a2 = fx.add_named(&server, "Set.02.bin").await;
         let g = a2.group.clone().unwrap();
+        // A cancelled member stays a member but doesn't count.
+        let mut req = fx.request(&server, "/blob/5000");
+        req.filename = Some("Set.03.bin".into());
+        let a3 = fx.engine.add(req, &|_| {}).await.unwrap();
+        fx.engine.cancel(&a3.id, false, &|_| {}).unwrap();
         let snap = fx.engine.group(&g).unwrap();
+        assert_eq!(snap.members.len(), 3);
         assert_eq!((snap.downloaded, snap.total), (0, Some(2000)));
         assert_eq!((snap.speed_bps, snap.eta_secs), (0, None));
 

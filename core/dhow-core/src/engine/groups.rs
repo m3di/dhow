@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::{
     DownloadId, Engine, EngineError, EngineEvent, SELECT, Snapshot, State, now_ms, snapshot,
@@ -133,10 +133,15 @@ impl Engine {
         group: Option<&str>,
         on_event: &(dyn Fn(EngineEvent) + Send + Sync),
     ) -> Result<Snapshot, EngineError> {
-        let before = self.get(id)?.group;
         let changed = {
             let db = self.db();
-            let tx = db.conn().unchecked_transaction()?;
+            let tx = write_tx(db.conn())?;
+            let before: Option<GroupId> = tx
+                .query_row("SELECT group_id FROM downloads WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })
+                .optional()?
+                .ok_or_else(|| EngineError::NotFound(id.to_owned()))?;
             if let Some(g) = group
                 && tx.execute("UPDATE groups SET auto = 0 WHERE id = ?1", [g])? == 0
             {
@@ -192,7 +197,7 @@ impl Engine {
     /// leaves it first. Returns the downloads whose group changed.
     pub(super) fn auto_group(&self, id: &str) -> Result<Vec<DownloadId>, EngineError> {
         let db = self.db();
-        let tx = db.conn().unchecked_transaction()?;
+        let tx = write_tx(db.conn())?;
         let all = members(&tx)?;
         let me_at = all
             .iter()
@@ -288,6 +293,13 @@ impl Engine {
     }
 }
 
+/// Takes the write lock up front: a deferred transaction that reads, then
+/// writes after another process committed, fails with `SQLITE_BUSY` without
+/// waiting.
+fn write_tx(conn: &Connection) -> rusqlite::Result<Transaction<'_>> {
+    Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+}
+
 /// Every download with what grouping needs, oldest first.
 fn members(conn: &Connection) -> Result<Vec<Member>, EngineError> {
     let mut stmt = conn.prepare(
@@ -316,6 +328,7 @@ fn members(conn: &Connection) -> Result<Vec<Member>, EngineError> {
 
 /// After a member left `group`: deletes it if empty, dissolves it if
 /// automatic with one member left. Returns the downloads that left too.
+/// `Remove` must call it for the removed download's group.
 fn tidy(conn: &Connection, group: &str) -> Result<Vec<DownloadId>, EngineError> {
     let auto: bool = conn.query_row("SELECT auto FROM groups WHERE id = ?1", [group], |r| {
         r.get(0)

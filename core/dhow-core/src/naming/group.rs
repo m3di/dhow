@@ -13,11 +13,17 @@ const SEQUENCE_WORDS: &[&str] = &[
 /// auto-groups. The key is the normalized stem, lowercased, plus the
 /// lowercased extension; the display name is the stem in its own casing.
 pub fn group_key(name: &str) -> Option<(String, String)> {
-    let (mut stem, mut ext) = split(name);
-    // `x.7z.001`: a numeric extension is the sequence, not the type.
+    let (stem, ext) = split(name);
+    // `x.7z.001`: a numeric extension is the sequence, not the type. A
+    // collision mark goes before it (`x.7z (2).001`).
     if ext.len() > 1 && ext[1..].bytes().all(|b| b.is_ascii_digit()) {
-        (stem, ext) = (name, "");
+        let unmarked = strip_bracketed(stem.trim_end());
+        return finish(&format!("{unmarked}{ext}"), "");
     }
+    finish(stem, ext)
+}
+
+fn finish(stem: &str, ext: &str) -> Option<(String, String)> {
     let display = normalize(stem);
     if display.is_empty() {
         return None;
@@ -27,7 +33,7 @@ pub fn group_key(name: &str) -> Option<(String, String)> {
 }
 
 /// Separators collapsed to one space, then a trailing collision mark
-/// (`(2)`, `[02]`), `of N` and sequence token stripped, in that order.
+/// (`(2)`, `[02]`, up to 3 digits), `of N` and sequence token stripped, in that order.
 fn normalize(stem: &str) -> String {
     let mut s = String::with_capacity(stem.len());
     for c in stem.chars() {
@@ -63,7 +69,8 @@ fn strip_bracketed(s: &str) -> &str {
     for (open, close) in [('(', ')'), ('[', ']')] {
         if let Some(inner) = s.strip_suffix(close) {
             let (rest, n) = trailing_digits(inner);
-            if let (true, Some(rest)) = (n > 0, rest.strip_suffix(open)) {
+            // Not 4 digits: `Film (1999)` is a year.
+            if let (true, Some(rest)) = ((1..=3).contains(&n), rest.strip_suffix(open)) {
                 return rest.trim_end();
             }
         }
