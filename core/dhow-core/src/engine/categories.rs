@@ -1,11 +1,9 @@
 //! Categories (ENGINE-SPEC §13.1): the user's extra extensions and the
 //! storage breakdown of completed downloads.
 
-use std::path::{Path, PathBuf};
-
 use rusqlite::{OptionalExtension, params};
 
-use super::{DownloadId, Engine, EngineError};
+use super::{DownloadId, Engine, EngineError, EngineEvent};
 use crate::naming::{Category, ExtraExtensions, normalize_extension};
 
 const EXTRA_KEY: &str = "extra_extensions";
@@ -71,15 +69,18 @@ impl Engine {
     }
 
     /// `total_size` of `Completed` downloads by category, in
-    /// [`Category::ALL`] order; categories without any are left out.
-    pub fn storage_breakdown(&self) -> Result<Vec<CategoryUsage>, EngineError> {
-        let rows: Vec<(DownloadId, String, Option<i64>, String)> = {
+    /// [`Category::ALL`] order; categories without any are left out. Moved
+    /// files are found as in [`Engine::get`].
+    pub fn storage_breakdown(
+        &self,
+        on_event: &(dyn Fn(EngineEvent) + Send + Sync),
+    ) -> Result<Vec<CategoryUsage>, EngineError> {
+        let ids: Vec<DownloadId> = {
             let db = self.db();
             let mut stmt = db.conn().prepare(
-                "SELECT id, final_path, total_size, category FROM downloads
-                 WHERE state = 'completed' ORDER BY completed_at, id",
+                "SELECT id FROM downloads WHERE state = 'completed' ORDER BY completed_at, id",
             )?;
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            stmt.query_map([], |r| r.get(0))?
                 .collect::<Result<_, _>>()?
         };
         let mut usage: Vec<CategoryUsage> = Category::ALL
@@ -91,25 +92,18 @@ impl Engine {
                 missing: Vec::new(),
             })
             .collect();
-        for (id, final_path, total_size, category) in rows {
-            let category = Category::parse(&category).unwrap_or(Category::Other);
-            let u = &mut usage[category as usize];
-            match locate(Path::new(&final_path)).and_then(|p| std::fs::metadata(p).ok()) {
-                Some(meta) => {
-                    u.bytes += total_size.map_or(meta.len(), |t| t as u64);
+        for id in ids {
+            let snap = self.get(&id, on_event)?;
+            let u = &mut usage[snap.category as usize];
+            match std::fs::metadata(&snap.final_path) {
+                Ok(meta) if meta.is_file() => {
+                    u.bytes += snap.total_size.unwrap_or(meta.len());
                     u.files += 1;
                 }
-                None => u.missing.push(id),
+                _ => u.missing.push(id),
             }
         }
         usage.retain(|u| u.files > 0 || !u.missing.is_empty());
         Ok(usage)
     }
-}
-
-/// Where a completed file is now. M3.5: resolve the download's
-/// `file_token` through the platform adapter first, so a moved file is
-/// still found.
-fn locate(final_path: &Path) -> Option<PathBuf> {
-    final_path.is_file().then(|| final_path.to_owned())
 }

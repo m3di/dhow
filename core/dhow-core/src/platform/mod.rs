@@ -14,6 +14,14 @@ use reqwest::Url;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileToken(pub Vec<u8>);
 
+/// Where a [`FileToken`] points now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resolved {
+    pub path: PathBuf,
+    /// Replaces the stored token (a stale macOS bookmark, re-created).
+    pub token: Option<FileToken>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AdapterError {
     #[error("not supported on this platform")]
@@ -112,8 +120,10 @@ pub trait PlatformAdapter: Send + Sync {
         Err(AdapterError::Unsupported)
     }
 
-    /// `Ok(None)`: the file is gone.
-    fn file_token_resolve(&self, _token: &FileToken) -> Result<Option<PathBuf>, AdapterError> {
+    /// `Ok(None)`: the file is gone for good (deleted, or in the Trash or
+    /// Recycle Bin), and the token is dropped. `Err`: can't tell now (an
+    /// unmounted volume); asked again on a later query.
+    fn file_token_resolve(&self, _token: &FileToken) -> Result<Option<Resolved>, AdapterError> {
         Err(AdapterError::Unsupported)
     }
 

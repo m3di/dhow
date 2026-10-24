@@ -78,27 +78,13 @@ static BUILT_IN: LazyLock<HashMap<String, Category>> = LazyLock::new(|| {
 /// Without a known extension, the `Content-Type`'s usual extension decides,
 /// then its top-level type (`video/*`, `audio/*`, `image/*`).
 pub fn categorize(name: &str, content_type: Option<&str>, extra: &ExtraExtensions) -> Category {
-    let lookup = |ext: &str| {
-        extra
-            .iter()
-            .find(|(_, exts)| exts.iter().any(|e| e == ext))
-            .map(|(c, _)| *c)
-            .or_else(|| BUILT_IN.get(ext).copied())
-    };
-    let lower = name.to_lowercase();
-    let by_name = lower
-        .match_indices('.')
-        .filter(|&(i, _)| i > 0)
-        .map(|(i, _)| &lower[i + 1..])
-        .filter(|ext| !ext.is_empty())
-        .find_map(lookup);
-    if let Some(c) = by_name {
+    if let Some(c) = categorize_name(name, extra) {
         return c;
     }
     let Some(ct) = content_type else {
         return Category::Other;
     };
-    if let Some(c) = mime::extension(ct).and_then(lookup) {
+    if let Some(c) = mime::extension(ct).and_then(|ext| lookup(ext, extra)) {
         return c;
     }
     let essence = ct.trim_start().to_ascii_lowercase();
@@ -108,6 +94,25 @@ pub fn categorize(name: &str, content_type: Option<&str>, extra: &ExtraExtension
         Some("image") => Category::Image,
         _ => Category::Other,
     }
+}
+
+/// The category `name`'s extension gives, if it is a known one.
+pub fn categorize_name(name: &str, extra: &ExtraExtensions) -> Option<Category> {
+    let lower = name.to_lowercase();
+    lower
+        .match_indices('.')
+        .filter(|&(i, _)| i > 0)
+        .map(|(i, _)| &lower[i + 1..])
+        .filter(|ext| !ext.is_empty())
+        .find_map(|ext| lookup(ext, extra))
+}
+
+fn lookup(ext: &str, extra: &ExtraExtensions) -> Option<Category> {
+    extra
+        .iter()
+        .find(|(_, exts)| exts.iter().any(|e| e == ext))
+        .map(|(c, _)| *c)
+        .or_else(|| BUILT_IN.get(ext).copied())
 }
 
 /// `".MKV"` → `"mkv"`; `None` if nothing usable is left. Inner dots are

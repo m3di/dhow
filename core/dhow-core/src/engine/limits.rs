@@ -66,7 +66,7 @@ impl Engine {
             return Err(EngineError::NotFound(id.to_owned()));
         }
         self.refresh_limits()?;
-        self.get(id)
+        self.stored(id)
     }
 
     /// Applies the stored limits to what runs in this process: after a

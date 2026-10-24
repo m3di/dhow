@@ -159,7 +159,7 @@ impl Engine {
             changed
         };
         self.announce_groups(&changed, on_event)?;
-        self.get(id)
+        self.stored(id)
     }
 
     /// Renames a group, which makes it manual.
@@ -260,7 +260,7 @@ impl Engine {
         on_event: &(dyn Fn(EngineEvent) + Send + Sync),
     ) -> Result<(), EngineError> {
         for id in ids {
-            let group = self.get(id)?.group.map(|g| self.group(&g)).transpose()?;
+            let group = self.stored(id)?.group.map(|g| self.group(&g)).transpose()?;
             on_event(EngineEvent::GroupChanged {
                 id: id.clone(),
                 group,

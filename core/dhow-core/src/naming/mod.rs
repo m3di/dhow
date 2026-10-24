@@ -14,7 +14,7 @@ use reqwest::Url;
 
 use crate::probe::ProbeInfo;
 
-pub use category::{Category, ExtraExtensions, categorize, normalize_extension};
+pub use category::{Category, ExtraExtensions, categorize, categorize_name, normalize_extension};
 pub use group::group_key;
 
 /// Longest final name in bytes: 255 minus the longest suffix the engine adds
