@@ -43,9 +43,15 @@ fn exchange(conn: &mut TcpStream, head: &str) -> Response {
         body: Vec::new(),
     };
     if !head.starts_with("HEAD") {
-        let len: usize = resp.header("content-length").unwrap().parse().unwrap();
-        resp.body = vec![0; len];
-        conn.read_exact(&mut resp.body).unwrap();
+        match resp.header("content-length") {
+            Some(len) => {
+                resp.body = vec![0; len.parse().unwrap()];
+                conn.read_exact(&mut resp.body).unwrap();
+            }
+            None => {
+                conn.read_to_end(&mut resp.body).unwrap();
+            }
+        }
     }
     resp
 }
@@ -152,4 +158,99 @@ fn unknown_knob_is_rejected() {
 fn unknown_path_is_404() {
     let server = TestServer::start().unwrap();
     assert_eq!(get(&server, "/nope", "").status, 404);
+}
+
+fn head(server: &TestServer, target: &str) -> Response {
+    let mut conn = TcpStream::connect(server.addr()).unwrap();
+    exchange(
+        &mut conn,
+        &format!("HEAD {target} HTTP/1.1\r\nHost: t\r\n\r\n"),
+    )
+}
+
+#[test]
+fn head_knob_sets_head_status_only() {
+    let server = TestServer::start().unwrap();
+    assert_eq!(head(&server, "/blob/10?head=405").status, 405);
+    assert_eq!(get(&server, "/blob/10?head=405", "").status, 200);
+}
+
+#[test]
+fn ranges_knob() {
+    let server = TestServer::start().unwrap();
+    let range = "Range: bytes=0-0\r\n";
+    let r = get(&server, "/blob/10?ranges=none", range);
+    assert_eq!((r.status, r.header("accept-ranges")), (200, Some("none")));
+    let r = get(&server, "/blob/10?ranges=hidden", range);
+    assert_eq!((r.status, r.header("accept-ranges")), (206, None));
+    let r = get(&server, "/blob/10?ranges=ignore", range);
+    assert_eq!((r.status, r.header("accept-ranges")), (200, None));
+}
+
+#[test]
+fn length_omit_delimits_body_by_close() {
+    let server = TestServer::start().unwrap();
+    let r = get(&server, "/blob/100000?length=omit&seed=5", "");
+    assert_eq!(r.header("content-length"), None);
+    assert_eq!(r.header("connection"), Some("close"));
+    assert_eq!(r.body, blob::bytes(5, 0..100_000));
+    assert_eq!(
+        head(&server, "/blob/10?length=omit").header("content-length"),
+        None
+    );
+}
+
+#[test]
+fn head_length_omit_affects_head_only() {
+    let server = TestServer::start().unwrap();
+    assert_eq!(
+        head(&server, "/blob/10?head_length=omit").header("content-length"),
+        None
+    );
+    let r = get(&server, "/blob/10?head_length=omit", "");
+    assert_eq!(r.header("content-length"), Some("10"));
+}
+
+#[test]
+fn redirect_counts_down() {
+    let server = TestServer::start().unwrap();
+    let r = get(&server, "/blob/10?redirect=2&seed=3", "");
+    assert_eq!(r.status, 302);
+    assert_eq!(r.header("location"), Some("/blob/10?redirect=1&seed=3"));
+    let r = get(&server, "/blob/10?redirect=0&seed=3", "");
+    assert_eq!(r.body, blob::bytes(3, 0..10));
+}
+
+#[test]
+fn header_knob_adds_and_replaces() {
+    let server = TestServer::start().unwrap();
+    let r = get(
+        &server,
+        "/blob/10?header=Content-Type%3A%20text%2Fplain&header=X-Extra%3A%20a%2Cb",
+        "",
+    );
+    assert_eq!(r.header("content-type"), Some("text/plain"));
+    assert_eq!(r.header("x-extra"), Some("a,b"));
+    assert_eq!(
+        r.headers
+            .iter()
+            .filter(|(k, _)| k == "Content-Type")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn requests_are_logged_in_order() {
+    let server = TestServer::start().unwrap();
+    head(&server, "/blob/1");
+    get(&server, "/blob/2?seed=1", "X-Probe: yes\r\n");
+    let seen = server.requests();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(
+        (seen[0].method.as_str(), seen[0].target.as_str()),
+        ("HEAD", "/blob/1")
+    );
+    assert_eq!(seen[1].target, "/blob/2?seed=1");
+    assert_eq!(seen[1].header("x-probe"), Some("yes"));
 }

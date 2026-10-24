@@ -25,8 +25,9 @@ Before any bytes are written, the engine learns what it is dealing with.
 ### 2.1 Request
 
 1. `HEAD <url>` with the user's headers.
-2. If `HEAD` fails with 405/501 or returns no `Content-Length`, send `GET` with `Range: bytes=0-0`. Read headers only; abort the body.
+2. If `HEAD` fails (any non-2xx or network error: servers reject `HEAD` with more than 405/501, e.g. 403 from URLs signed only for `GET`) or does not settle both size and resumability (no `Content-Length`, or no `Accept-Ranges`), send `GET` with `Range: bytes=0-0`, unless `settings.probe_range_get` is off (for links that count every `GET`; then no `GET` is ever sent). Read headers only; abort the body.
 3. Follow up to 10 redirects. Record the final URL as `effective_url`. Each `Add` re-resolves from the original URL (redirect targets may be signed and expire).
+4. Every request carries `Accept-Encoding: identity` (a compressed response makes byte ranges meaningless). `Range`, `If-Range` and `Accept-Encoding` belong to the engine; user-supplied values for them are dropped.
 
 ### 2.2 Result
 
@@ -38,7 +39,8 @@ ProbeInfo {
   etag: Option<String>, last_modified: Option<String>,
   content_type: Option<String>,
   content_disposition: Option<String>,
-  digest: Option<Digest>,          // from Digest / Content-MD5 / Content-Digest headers, if any
+  digest: Option<Digest>,          // strongest of Repr-Digest, Digest, Content-Digest, Content-MD5; the last two only
+                                   // from HEAD or 200 responses, since on a 206 they describe the part, not the file
   suggested_name: String,          // §3
   category: Category,              // §13
 }

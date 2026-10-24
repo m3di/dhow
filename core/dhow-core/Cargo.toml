@@ -7,7 +7,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+base64.workspace = true
 dirs.workspace = true
+reqwest.workspace = true
 rusqlite.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -15,5 +17,7 @@ tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+dhow-testserver.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+tokio.workspace = true
