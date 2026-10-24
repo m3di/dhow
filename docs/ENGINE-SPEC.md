@@ -116,7 +116,7 @@ When a connection needs work and nothing is pending:
 
 ### 4.4 Connection ramp-up
 
-A download never opens all `n` connections at once. It opens one; then, after each new connection, it lets it settle for a third of `settings.rampup_window` (default 3 s) and measures aggregate throughput for one window. It opens connection `k + 1` only if data flowed in that window and throughput with `k` connections beat the measurement with `k − 1` by at least `settings.rampup_min_gain` (default 10 %). Otherwise ramp-up stops at `k`, and "the link saturates at `k`" is recorded process-wide for `settings.saturation_ttl` (60 s) so other downloads start from that ceiling (§4.1). On any connection error, ramp-up pauses for the retry backoff period. This is what keeps a download from crowding the user's own link (§10.A) and makes politeness smooth rather than bursty.
+A download never opens all `n` connections at once. It opens one; then, after each new connection, it lets it settle for a third of `settings.rampup_window` (default 3 s) and measures aggregate throughput for one window. It opens connection `k + 1` only if data flowed in that window and throughput with `k` connections beat the measurement with `k − 1` by at least `settings.rampup_min_gain` (default 10 %). Otherwise ramp-up stops at `k`, and "the link saturates at `k`" is recorded process-wide for `settings.saturation_ttl` (60 s) so other downloads start from that ceiling (§4.1). A window in which a speed limit (§12) made any of the download's connections wait measured the limit, not the link: it counts as neither gain nor saturation, and is measured again. On any connection error, ramp-up pauses for the retry backoff period. This is what keeps a download from crowding the user's own link (§10.A) and makes politeness smooth rather than bursty.
 
 ---
 
@@ -300,7 +300,9 @@ Effect: start 10 downloads on a 16-connection budget → the first one ramps to 
 
 Ramp-up is throughput-aware (§4.4): a download stops adding connections where the link stops getting faster, and that ceiling is shared for a minute.
 
-`settings.headroom_percent` (default 0) keeps part of the link free for everything else on it: the global speed limit (§12) becomes `(1 − headroom) × observed peak throughput`, recomputed whenever the observed peak rises. With 0 there is no implicit limit. (Implemented with the global limiter, M2.5.)
+`settings.headroom_percent` (default 0, at most 99) keeps part of the link free for everything else on it: the global speed limit (§12) becomes `min(user limit, (1 − headroom) × peak)`. The **peak** is the highest aggregate throughput (all downloads together) over a ramp-up measurement window (§4.4: settled, unlimited). The cap is **lifted while any download is ramping up** (settling or measuring; not while the budget holds its ramp back), and applies in between. Each ramp-up period, i.e. from the first download starting to ramp while none was, measures the peak afresh, so a link that got slower is noticed; one that got faster is noticed at the next ramp-up. Without a measured peak there is no cap. With 0 there is no implicit limit.
+
+Why not the plain "observed peak": throughput under the cap can never exceed the cap, so a peak taken from all traffic would freeze at whatever was seen before the cap first applied (often a single connection's speed), and ramp-up under the cap would see no gain and stop.
 
 ### 10.B Remote server
 
@@ -351,7 +353,13 @@ Schedule {
 
 Token-bucket limiters at three levels: global, queue, download. A connection must acquire tokens from all applicable buckets before reading the next buffer from the socket (`limiter.consume` in §7 is a blocking acquire across the chain). Bucket refill: 100 ms granularity, burst = 2× the per-interval allotment. Reads are 64 KiB; at limits below 64 KiB/s the read size shrinks to the limit so that small limits are accurate.
 
-Changing a limit takes effect within 200 ms. Setting `0` means "paused by limit", shown as such.
+Precisely: bytes are debited from every bucket in the chain as they arrive, which may put a bucket in debt; the connection reads again only once no bucket is in debt, sleeping exactly until the refill covers it (no polling). The HTTP library decides the socket's read sizes, so "read size" means what the connection hands to the writer before the next acquire: buffers are split into pieces of at most `min(64 KiB, lowest limit in the chain)`. All bytes received count, including any dropped past a chunk's end (I6). A bucket starts with its burst; when a limit is lowered the bucket keeps its debt and at most the new burst.
+
+- **Global:** `settings.global_speed_limit`, one bucket per engine instance (process), like the connection budget (§10.1), lowered by headroom (§10.6).
+- **Queue:** `QueueSpec.speed_limit`, one bucket shared by every download of the queue running in the process.
+- **Download:** `AddRequest.speed_limit` / `SetSpeedLimit`.
+
+Changing a limit takes effect within 200 ms: waiting connections are woken at once and pay off at most one tick of debt at the new rate. Setting `0` means "paused by limit", shown as such: the download stays `Active`, its connections stay open and read nothing until the limit changes (a server that drops an idle connection meanwhile is reconnected to, as in §9). Shells show it from the snapshots: the download's, its queue's or the global limit is `0`.
 
 ---
 

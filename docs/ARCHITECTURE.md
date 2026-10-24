@@ -36,7 +36,7 @@ The core is a library, not a daemon. Each shell instantiates one `Dhow` object i
 
 The core must build for: `aarch64/x86_64-apple-darwin`, `aarch64-apple-ios` (+sim), `x86_64/aarch64-unknown-linux-gnu`, `x86_64/aarch64-pc-windows-msvc`, `aarch64/armv7/x86_64-linux-android`. Per-PR CI runs tests on Linux only; other targets are built locally and in the (later) release workflow.
 
-**CLI process model.** `dhow add` probes, records the download in the database and runs it in the foreground; `--queue`/`--paused` only record it. `dhow resume <id>` runs one in the foreground, `dhow watch` runs queued downloads concurrently, as many per queue as its `max_concurrent` allows (re-checked whenever one finishes), and exits when none are left. Downloads `watch` runs share one connection budget (ENGINE-SPEC §10). `dhow queue add|ls|set|rm`, `dhow move` and `dhow reorder` manage queues. A process running a download holds an exclusive lock on `<data>/locks/<id>.lock` holding its PID, so two processes never run the same download and a `kill -9` never leaves a stale lock. `dhow pause`/`cancel` on a running download record the request in the database and send the process running it `SIGUSR1` ("re-check"); that process stops just that download (others it runs continue). Runners also register in `<data>/runners/`, and commands that change queues (`queue add|set|rm|start|stop`, `add --queue`, `move`, `reorder`) poke them the same way, so an idle `watch` reacts at once instead of at its next schedule edge. Every runner installs the `SIGUSR1` handler before taking any lock. `watch` stays alive while queued work waits for a future schedule edge, and exits otherwise. Ctrl-C/`SIGTERM` stop a runner: `add`/`resume` leave their download Paused, `watch` puts its downloads back in their queues. Everything printed to stdout is one JSON object per line. The CLI uses `dhow_core::engine`, the M1 slice of the `Dhow` object: database-backed state, probe → download → completion gate, no scheduler yet.
+**CLI process model.** `dhow add` probes, records the download in the database and runs it in the foreground; `--queue`/`--paused` only record it. `dhow resume <id>` runs one in the foreground, `dhow watch` runs queued downloads concurrently, as many per queue as its `max_concurrent` allows (re-checked whenever one finishes), and exits when none are left. Downloads `watch` runs share one connection budget (ENGINE-SPEC §10). `dhow queue add|ls|set|rm`, `dhow move` and `dhow reorder` manage queues. A process running a download holds an exclusive lock on `<data>/locks/<id>.lock` holding its PID, so two processes never run the same download and a `kill -9` never leaves a stale lock. `dhow pause`/`cancel` on a running download record the request in the database and send the process running it `SIGUSR1` ("re-check"); that process stops just that download (others it runs continue). Runners also register in `<data>/runners/`, and commands that change queues (`queue add|set|rm|start|stop`, `add --queue`, `move`, `reorder`) or limits (`limit`, `settings`, `queue add|set --limit`) poke them the same way, so an idle `watch` reacts at once instead of at its next schedule edge and a running download gets its new speed limit at once (a runner re-reads the stored limits on every wake). Every runner installs the `SIGUSR1` handler before taking any lock. `watch` stays alive while queued work waits for a future schedule edge, and exits otherwise. Ctrl-C/`SIGTERM` stop a runner: `add`/`resume` leave their download Paused, `watch` puts its downloads back in their queues. Everything printed to stdout is one JSON object per line. The CLI uses `dhow_core::engine`, the M1 slice of the `Dhow` object: database-backed state, probe → download → completion gate, no scheduler yet.
 
 ## 3. Command / event API
 
@@ -54,6 +54,7 @@ pub enum Command {
     Cancel { id: DownloadId, delete_partial: bool },
     Remove { id: DownloadId, delete_file: bool },         // only for Completed/Cancelled/Failed
     Retry  { id: DownloadId },                            // Failed → Queued, keeps journal
+    SetSpeedLimit { id: DownloadId, limit: Option<u64> }, // bytes/s; Some(0) = paused by limit (ENGINE-SPEC §12)
 
     // Organisation
     MoveToQueue { id: DownloadId, queue: QueueId },
@@ -69,7 +70,7 @@ pub enum Command {
     StopQueue   { id: QueueId },
 
     // Settings
-    SetSettings { patch: SettingsPatch },
+    SetSettings { patch: SettingsPatch },                 // incl. global_speed_limit, headroom_percent
 
     // Queries (synchronous, not events)
     // get_download(id) -> DownloadSnapshot
@@ -162,7 +163,7 @@ Tables (abridged, the migrations are the truth):
 - `queues` — id, name, max_concurrent, schedule (json), speed_limit, on_complete, is_default. The default queue is created by migration 1 with a fixed id and a NULL name (the shell localizes it); a trigger prevents deleting it.
 - `groups` — id, name, auto (bool)
 - `speed_samples` — download_id (NULL = global aggregate), period_secs, at, bytes_per_sec — ring-buffered, 10-minute retention at 1 s, hourly rollups beyond
-- `settings` — key, value (json)
+- `settings` — key, value (json). Keys so far: `global_speed_limit` (bytes/s or null), `headroom_percent`.
 
 ### 5.2 Sidecar journal (`<name>.ext.dhow`)
 

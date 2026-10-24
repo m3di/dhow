@@ -10,6 +10,7 @@
 pub mod retry;
 
 use std::ops::Range;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -20,6 +21,7 @@ use reqwest::{Client, Response, Url};
 pub use retry::RetryPolicy;
 
 use crate::http::{self, Header};
+use crate::limit::Limiter;
 use crate::probe::{Resumable, content_length, content_range};
 use crate::writer::actor::{WriterGone, WriterHandle};
 use crate::writer::{self, ChunkId, Overflow};
@@ -36,6 +38,8 @@ pub struct Source {
     pub resumable: Resumable,
     /// `If-Range` value, see [`validator`].
     pub validator: Option<String>,
+    /// Speed limits every connection of the download acquires from (§12).
+    pub limiter: Arc<Limiter>,
 }
 
 /// `If-Range` value (I4): a strong ETag, else `Last-Modified`, else none
@@ -357,41 +361,14 @@ async fn attempt(
                 continue;
             }
         }
-        // Re-read every buffer: a split may have taken the rest (§4.3).
-        let end = cursor.end();
-        // Read to EOF when the chunk ends the file, so bytes past total_size
-        // are seen (I6); otherwise stop at the chunk's end.
-        let ends_file = src.total == Some(end);
-        if *pos >= end && !ends_file {
-            return Ok(Finished {
-                content_length_seen,
-            });
-        }
-        let (keep, overflow) = writer::bound(*pos, end, src.total, bytes.len());
-        if keep > 0 {
-            writer
-                .write(chunk, *pos, bytes.slice(..keep))
-                .await
-                .map_err(TransferError::from)?;
-            *pos += keep as u64;
-            cursor.pos.store(*pos, Ordering::Release);
-            cursor.received.fetch_add(keep as u64, Ordering::Relaxed);
-            on_event(ConnEvent::Received(keep as u64));
-        }
-        match overflow {
-            Overflow::None => {}
-            // Dropping the response closes the connection (I6).
-            Overflow::PastChunk => {
+        // Handed on in pieces no bigger than the lowest limit allows (§12).
+        while !bytes.is_empty() {
+            let piece = bytes.split_to(bytes.len().min(src.limiter.piece()));
+            if take(src, chunk, pos, &piece, cursor, writer, on_event).await? {
                 return Ok(Finished {
                     content_length_seen,
                 });
             }
-            Overflow::PastTotal => return Err(TransferError::ServerSentExtraData.into()),
-        }
-        if *pos == end && !ends_file {
-            return Ok(Finished {
-                content_length_seen,
-            });
         }
     }
 
@@ -407,6 +384,44 @@ async fn attempt(
         }
         Some(_) => Err(Fail::Again),
     }
+}
+
+/// Writes what of `bytes` belongs to the chunk, then waits for the
+/// limiter. `true`: the chunk is done (the response is dropped, I6).
+async fn take(
+    src: &Source,
+    chunk: ChunkId,
+    pos: &mut u64,
+    bytes: &Bytes,
+    cursor: &Cursor,
+    writer: &WriterHandle,
+    on_event: &(dyn Fn(ConnEvent) + Send + Sync),
+) -> Result<bool, Fail> {
+    // Re-read every piece: a split may have taken the rest (§4.3).
+    let end = cursor.end();
+    // Read to EOF when the chunk ends the file, so bytes past total_size
+    // are seen (I6); otherwise stop at the chunk's end.
+    let ends_file = src.total == Some(end);
+    if *pos >= end && !ends_file {
+        return Ok(true);
+    }
+    let (keep, overflow) = writer::bound(*pos, end, src.total, bytes.len());
+    if keep > 0 {
+        writer
+            .write(chunk, *pos, bytes.slice(..keep))
+            .await
+            .map_err(TransferError::from)?;
+        *pos += keep as u64;
+        cursor.pos.store(*pos, Ordering::Release);
+        cursor.received.fetch_add(keep as u64, Ordering::Relaxed);
+        on_event(ConnEvent::Received(keep as u64));
+    }
+    if overflow == Overflow::PastTotal {
+        return Err(TransferError::ServerSentExtraData.into());
+    }
+    // Everything that arrived counts, kept or not.
+    src.limiter.consume(bytes.len() as u64).await;
+    Ok(overflow == Overflow::PastChunk || (*pos == end && !ends_file))
 }
 
 /// Validates the response status and range (I4). Returns where this

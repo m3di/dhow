@@ -56,6 +56,7 @@ impl Env {
             sidecar: dir.path().join("f.dhow"),
             connections: None,
             started_at: None,
+            limits: vec![],
         };
         Self { _dir: dir, req }
     }

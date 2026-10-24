@@ -50,6 +50,7 @@ impl Fx {
             paused: false,
             connections: None,
             queue: None,
+            speed_limit: None,
             target_fs: TargetFs::Posix,
         }
     }
@@ -784,6 +785,109 @@ mod schedule_tests {
                 .len(),
             1,
             "round-trips"
+        );
+    }
+}
+
+mod limit_tests {
+    use super::*;
+    use crate::engine::limits::LimitSettings;
+    use crate::engine::queues::QueueSpec;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn limits_are_stored() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        assert_eq!(
+            fx.engine.limit_settings().unwrap(),
+            LimitSettings::default()
+        );
+        fx.engine.set_global_limit(Some(1_000_000)).unwrap();
+        let s = fx.engine.set_headroom(20).unwrap();
+        assert_eq!(
+            s,
+            LimitSettings {
+                global: Some(1_000_000),
+                headroom_percent: 20
+            }
+        );
+        assert!(matches!(
+            fx.engine.set_headroom(100),
+            Err(EngineError::InvalidSetting(_))
+        ));
+        assert_eq!(fx.engine.shared.global.rate(), Some(1_000_000));
+        fx.engine.set_global_limit(None).unwrap();
+        assert_eq!(fx.engine.limit_settings().unwrap().global, None);
+        assert_eq!(fx.engine.shared.global.rate(), None);
+
+        let mut req = fx.request(&server, "/blob/10");
+        req.speed_limit = Some(5_000);
+        let added = fx.engine.add(req).await.unwrap();
+        assert_eq!(added.speed_limit, Some(5_000));
+        let snap = fx.engine.set_speed_limit(&added.id, Some(0)).unwrap();
+        assert_eq!(snap.speed_limit, Some(0));
+        assert!(matches!(
+            fx.engine.set_speed_limit("nope", None),
+            Err(EngineError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queue_limit_is_shared_by_its_downloads() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let q = fx
+            .engine
+            .create_queue(&QueueSpec {
+                name: "slow".into(),
+                speed_limit: Some(200_000),
+                ..QueueSpec::default()
+            })
+            .unwrap();
+        let mut ids = Vec::new();
+        for seed in 0..2 {
+            let mut req = fx.request(&server, &format!("/blob/300000?seed={seed}"));
+            req.queue = Some(q.id.clone());
+            ids.push(fx.engine.add(req).await.unwrap().id);
+        }
+        let started = Instant::now();
+        let (a, b) = tokio::join!(fx.run(&ids[0]), fx.run(&ids[1]));
+        assert_eq!((a.state, b.state), (State::Completed, State::Completed));
+        // 600 kB at 200 kB/s together, less the 40 kB burst.
+        let secs = started.elapsed().as_secs_f64();
+        assert!((2.6..3.3).contains(&secs), "{secs} s");
+    }
+
+    /// §12: 0 is "paused by limit"; lifting it applies at once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_limit_changes_while_running() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let mut req = fx.request(&server, "/blob/2000000");
+        req.speed_limit = Some(0);
+        let id = fx.engine.add(req).await.unwrap().id;
+        let run = fx.run(&id);
+        let lift = async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            // Still active, with almost nothing through (one read before
+            // the first wait).
+            let p = fx
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, EngineEvent::Progress { downloaded, .. } if *downloaded > 64 * 1024));
+            assert!(!p, "paused by limit");
+            assert_eq!(fx.engine.get(&id).unwrap().state, State::Active);
+            fx.engine.set_speed_limit(&id, None).unwrap();
+            Instant::now()
+        };
+        let (done, lifted) = tokio::join!(run, lift);
+        assert_eq!(done.state, State::Completed);
+        assert!(
+            lifted.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            lifted.elapsed()
         );
     }
 }
