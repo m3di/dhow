@@ -8,10 +8,13 @@ pub const MAX_HEAD: usize = 16 * 1024;
 
 pub struct Request {
     pub method: String,
+    /// As received: path plus raw (still percent-encoded) query.
+    pub target: String,
     pub path: String,
+    /// Percent-decoded.
     pub query: Vec<(String, String)>,
     pub keep_alive: bool,
-    headers: Vec<(String, String)>,
+    pub headers: Vec<(String, String)>,
 }
 
 impl Request {
@@ -49,11 +52,12 @@ pub fn parse_head(head: &[u8]) -> Option<Request> {
         .filter(|p| !p.is_empty())
         .map(|p| {
             let (k, v) = p.split_once('=').unwrap_or((p, ""));
-            (k.to_owned(), v.to_owned())
+            Some((percent_decode(k)?, percent_decode(v)?))
         })
-        .collect();
+        .collect::<Option<_>>()?;
     let mut req = Request {
         method: method.to_owned(),
+        target: target.to_owned(),
         path: path.to_owned(),
         query,
         keep_alive: version == "HTTP/1.1",
@@ -66,6 +70,22 @@ pub fn parse_head(head: &[u8]) -> Option<Request> {
         req.keep_alive = false;
     }
     Some(req)
+}
+
+fn percent_decode(s: &str) -> Option<String> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut bytes = s.bytes();
+    while let Some(b) = bytes.next() {
+        out.push(match b {
+            b'%' => {
+                let hex = [bytes.next()?, bytes.next()?];
+                u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?
+            }
+            b'+' => b' ',
+            b => b,
+        });
+    }
+    String::from_utf8(out).ok()
 }
 
 pub enum RangeSpec {
@@ -160,5 +180,9 @@ mod tests {
         );
         assert!(!parse_head(b"GET / HTTP/1.0\r\n\r\n").unwrap().keep_alive);
         assert!(parse_head(b"garbage\r\n\r\n").is_none());
+        let req = parse_head(b"GET /b?header=X-A%3A%201+2 HTTP/1.1\r\n\r\n").unwrap();
+        assert_eq!(req.query, [("header".to_owned(), "X-A: 1 2".to_owned())]);
+        assert_eq!(req.target, "/b?header=X-A%3A%201+2");
+        assert!(parse_head(b"GET /b?x=%zz HTTP/1.1\r\n\r\n").is_none());
     }
 }
