@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["dhow-core", "dhow-cli", "dhow-testserver", "dhow-ffi"]
+members = ["dhow-core", "dhow-cli", "dhow-testserver", "dhow-ffi", "../spec-tests"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,4 +10,8 @@ publish = false
 
 [workspace.dependencies]
 dhow-core = { path = "dhow-core" }
+dhow-testserver = { path = "dhow-testserver" }
+blake3 = "1"
 clap = { version = "4", features = ["derive"] }
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "sync"] }
