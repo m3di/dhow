@@ -30,3 +30,19 @@ fn network_shows_the_environment_proxy() {
     let kinds = ["wifi", "ethernet", "cellular", "vpn", "unknown"];
     assert!(kinds.contains(&n["interface"].as_str().unwrap()), "{n}");
 }
+
+#[test]
+fn network_hides_proxy_credentials() {
+    let sb = Sandbox::with_env(&[
+        (
+            "https_proxy",
+            "http://user:pa55@proxy.test:3128/?key=s3cret",
+        ),
+        ("http_proxy", "http://tok3n@proxy.test:8080"),
+    ]);
+    let out = sb.dhow(["network"]);
+    out.assert_success();
+    let proxy = &out.events()[0]["system_proxy"];
+    assert_eq!(proxy["https"], "http://***@proxy.test:3128/");
+    assert_eq!(proxy["http"], "http://***@proxy.test:8080/");
+}

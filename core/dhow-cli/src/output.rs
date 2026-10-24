@@ -9,7 +9,7 @@ use dhow_core::engine::queues::QueueSnapshot;
 use dhow_core::engine::speed::SpeedSample;
 use dhow_core::engine::{EngineEvent, Snapshot, WarningKind};
 use dhow_core::naming::ExtraExtensions;
-use dhow_core::platform::{InterfaceKind, NetworkInfo, ProxyConfig, ProxyMode};
+use dhow_core::platform::{InterfaceKind, NetworkInfo, ProxyConfig, ProxyMode, redact_proxy_url};
 use dhow_core::probe::Resumable;
 use serde_json::{Value, json};
 
@@ -169,17 +169,9 @@ pub fn network(n: &NetworkInfo) -> Value {
     })
 }
 
-/// Passwords in proxy URLs are not printed.
+/// Credentials and query strings in proxy URLs are not printed.
 fn proxy(c: &ProxyConfig) -> Value {
-    let url = |u: &Option<dhow_core::http::Url>| {
-        u.as_ref().map(|u| {
-            let mut u = u.clone();
-            if u.password().is_some() {
-                let _ = u.set_password(Some("***"));
-            }
-            u.to_string()
-        })
-    };
+    let url = |u: &Option<dhow_core::http::Url>| u.as_ref().map(redact_proxy_url);
     json!({
         "http": url(&c.http), "https": url(&c.https), "all": url(&c.all),
         "no_proxy": c.no_proxy, "pac": url(&c.pac),

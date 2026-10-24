@@ -4,13 +4,17 @@
 //! `/sys/class/net`, the default route from `/proc/net/route`.
 //!
 //! Every input is a field, so tests feed it maps, fake directories and
-//! canned output. It reads on query only; `watch_network` is unsupported
-//! for now (it needs netlink or NetworkManager's D-Bus signals).
+//! canned output; the GTK shell should set `gsettings` to a `gio::Settings`
+//! reader instead of the subprocess. It reads on query only and blocks
+//! (up to [`GSETTINGS_DEADLINE`]): async callers use `spawn_blocking`.
+//! `watch_network` is unsupported for now (it needs netlink or
+//! NetworkManager's D-Bus signals).
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use reqwest::Url;
 
@@ -18,6 +22,21 @@ use super::{AdapterError, InterfaceKind, NetworkInfo, PlatformAdapter, ProxyConf
 
 type Lookup = Box<dyn Fn(&str) -> Option<String> + Send + Sync>;
 type Fetch = Box<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// A wedged dconf/D-Bus must not hang a query.
+pub const GSETTINGS_DEADLINE: Duration = Duration::from_secs(1);
+
+/// `XDG_CURRENT_DESKTOP` names whose settings panels write
+/// `org.gnome.system.proxy` (GIO's GNOME resolver keys on `GNOME`; Budgie,
+/// Pop and Ubuntu list it too).
+const GNOME_DESKTOPS: [&str; 6] = [
+    "GNOME",
+    "Unity",
+    "X-Cinnamon",
+    "Cinnamon",
+    "Pantheon",
+    "Budgie",
+];
 
 pub struct LinuxAdapter {
     /// An environment variable.
@@ -36,17 +55,7 @@ impl LinuxAdapter {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".config")));
         Self {
-            gsettings: Some(Box::new(|| {
-                let out = Command::new("gsettings")
-                    .args(["list-recursively", "org.gnome.system.proxy"])
-                    .stdin(Stdio::null())
-                    .stderr(Stdio::null())
-                    .output()
-                    .ok()?;
-                out.status
-                    .success()
-                    .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-            })),
+            gsettings: Some(Box::new(gsettings_subprocess)),
             kioslaverc: config_home.map(|c| c.join("kioslaverc")),
             sys_class_net: Some("/sys/class/net".into()),
             proc_net_route: Some("/proc/net/route".into()),
@@ -71,13 +80,21 @@ impl LinuxAdapter {
         if let Some(c) = env_proxy(&self.env) {
             return Some(c);
         }
-        let kde = (self.env)("XDG_CURRENT_DESKTOP")
-            .is_some_and(|d| d.split(':').any(|d| d.eq_ignore_ascii_case("KDE")));
-        if kde {
+        // Other desktops and headless: environment only, so a stale
+        // dconf value doesn't count and nothing is forked.
+        let desktop = (self.env)("XDG_CURRENT_DESKTOP").unwrap_or_default();
+        let is = |names: &[&str]| {
+            desktop
+                .split(':')
+                .any(|d| names.iter().any(|n| d.eq_ignore_ascii_case(n)))
+        };
+        if is(&["KDE"]) {
             let text = fs::read_to_string(self.kioslaverc.as_ref()?).ok()?;
             kde_proxy(&text, &self.env)
-        } else {
+        } else if is(&GNOME_DESKTOPS) {
             gnome_proxy(&self.gsettings.as_ref()?()?)
+        } else {
+            None
         }
     }
 
@@ -122,6 +139,35 @@ impl PlatformAdapter for LinuxAdapter {
             proxy_in_use: ProxyMode::None,
         })
     }
+}
+
+/// Killed after [`GSETTINGS_DEADLINE`]. Its output is a few hundred bytes,
+/// well under a pipe buffer, so it can't block on a full stdout first.
+fn gsettings_subprocess() -> Option<String> {
+    let mut child = Command::new("gsettings")
+        .args(["list-recursively", "org.gnome.system.proxy"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + GSETTINGS_DEADLINE;
+    // Polled only for this query's ≤ 1 s, never while idle.
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let out = child.wait_with_output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// `http_proxy` and friends, lowercase first (curl's order).
@@ -295,6 +341,7 @@ struct Interface {
 }
 
 const ARPHRD_ETHER: u32 = 1;
+const ARPHRD_PPP: u32 = 512;
 const ARPHRD_RAWIP: u32 = 519;
 /// tun and WireGuard devices.
 const ARPHRD_NONE: u32 = 65534;
@@ -317,7 +364,13 @@ fn read_interfaces(dir: &Path) -> Vec<Interface> {
                 return None;
             }
             let arp: u32 = read("type")?.trim().parse().ok()?;
-            let kind = if name.starts_with("tun") || name.starts_with("wg") || arp == ARPHRD_NONE {
+            // Hints, not proof: PPP is also DSL, tap also VM networking.
+            let vpn = ["tun", "tap", "wg", "ppp"]
+                .iter()
+                .any(|p| name.starts_with(p))
+                || arp == ARPHRD_NONE
+                || arp == ARPHRD_PPP;
+            let kind = if vpn {
                 InterfaceKind::Vpn
             } else if path.join("wireless").exists() || path.join("phy80211").exists() {
                 InterfaceKind::Wifi
@@ -478,9 +531,36 @@ org.gnome.system.proxy.socks port 0
         // gsettings missing or failing.
         let a = LinuxAdapter {
             gsettings: Some(Box::new(|| None)),
+            ..adapter(&[("XDG_CURRENT_DESKTOP", "GNOME")])
+        };
+        assert_eq!(a.proxy(), None);
+    }
+
+    #[test]
+    fn gsettings_only_on_gnome_desktops() {
+        for desktop in ["sway", "XFCE", ""] {
+            let a = LinuxAdapter {
+                gsettings: Some(Box::new(|| panic!("asked gsettings"))),
+                ..adapter(&[("XDG_CURRENT_DESKTOP", desktop)])
+            };
+            assert_eq!(a.proxy(), None, "{desktop}");
+        }
+        let a = LinuxAdapter {
+            gsettings: Some(Box::new(|| panic!("asked gsettings"))),
             ..adapter(&[])
         };
         assert_eq!(a.proxy(), None);
+        for desktop in ["X-Cinnamon", "Budgie:GNOME", "pop:GNOME", "Unity"] {
+            let a = LinuxAdapter {
+                env: env(&[("XDG_CURRENT_DESKTOP", desktop)]),
+                ..gnome(GNOME_MANUAL)
+            };
+            assert_eq!(
+                a.proxy().unwrap().http,
+                url("http://web.test:8080"),
+                "{desktop}"
+            );
+        }
     }
 
     fn kde(rc: &str, vars: &[(&str, &str)]) -> Option<ProxyConfig> {
@@ -583,6 +663,22 @@ org.gnome.system.proxy.socks port 0
         iface(&net, "tun0", "unknown", 65534, &[]);
         let vpn_route = route(&[("tun0", "00000000", 0), ("wlp2s0", "00000000", 600)]);
         assert_eq!(sys(&net, Some(&vpn_route)), (InterfaceKind::Vpn, true));
+    }
+
+    #[test]
+    fn ppp_and_tap_hint_a_vpn() {
+        let root = tempfile::tempdir().unwrap();
+        let net = root.path().join("net");
+        iface(&net, "wlp2s0", "up", 1, &["device", "wireless"]);
+        iface(&net, "vpn-office", "unknown", 512, &[]);
+        assert_eq!(sys(&net, None), (InterfaceKind::Wifi, true));
+        fs::remove_dir_all(net.join("vpn-office")).unwrap();
+        iface(&net, "tap0", "up", 1, &[]);
+        let route = route(&[("tap0", "00000000", 0)]);
+        assert_eq!(sys(&net, Some(&route)), (InterfaceKind::Vpn, true));
+        fs::remove_dir_all(net.join("tap0")).unwrap();
+        iface(&net, "ppp0", "unknown", 512, &[]);
+        assert_eq!(sys(&net, None), (InterfaceKind::Wifi, true));
     }
 
     #[test]

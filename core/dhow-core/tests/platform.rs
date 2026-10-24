@@ -114,3 +114,40 @@ async fn engine_reports_the_adapter_and_keeps_awake_while_transferring() {
         "{awake:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keep_awake_ends_when_a_run_is_dropped() {
+    let server = TestServer::start().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    let engine = Engine::open_with(
+        &dir.path().join("data"),
+        DownloadConfig::default(),
+        fake.clone(),
+    )
+    .unwrap();
+    let req = AddRequest {
+        url: Url::parse(&server.url("/blob/10000000?throttle=100000")).unwrap(),
+        headers: vec![],
+        directory: dir.path().to_owned(),
+        filename: Some("slow.bin".into()),
+        paused: false,
+        connections: Some(1),
+        queue: None,
+        speed_limit: None,
+        target_fs: TargetFs::host(),
+    };
+    let id = engine.add(req, &|_| {}).await.unwrap().id;
+    let (_keep, stop) = watch::channel(false);
+    let started = async {
+        while fake.awake.lock().unwrap().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    };
+    // The run future is dropped mid-transfer, as a shell or a `?` would.
+    tokio::select! {
+        r = engine.run(&id, &|_| {}, &stop) => panic!("finished: {r:?}"),
+        _ = started => {}
+    }
+    assert_eq!(*fake.awake.lock().unwrap(), [true, false]);
+}

@@ -31,25 +31,35 @@ pub(super) struct SpeedBook {
     rolled: i64,
 }
 
-impl Engine {
-    pub(super) fn sampling(&self, on: bool) -> Result<(), EngineError> {
-        let mut book = self.speed();
-        // Under the lock, so on/off reach the adapter in order.
-        if on {
-            book.running += 1;
-            if book.running == 1 {
-                self.platform.keep_awake(true);
-            }
-            return Ok(());
-        }
+pub(super) struct Sampling<'a>(&'a Engine);
+
+impl Drop for Sampling<'_> {
+    fn drop(&mut self) {
+        let engine = self.0;
+        let mut book = engine.speed();
         book.running -= 1;
         if book.running == 0 {
-            self.platform.keep_awake(false);
+            engine.platform.keep_awake(false);
             let all = std::mem::take(&mut book.pending);
             drop(book);
-            self.write_global(all)?;
+            if let Err(e) = engine.write_global(all) {
+                tracing::warn!(error = %e, "could not record speed samples");
+            }
         }
-        Ok(())
+    }
+}
+
+impl Engine {
+    /// Counts a running download until the guard drops, also when its
+    /// `run` future is dropped or panics, so keep-awake can't leak on.
+    pub(super) fn sampling(&self) -> Sampling<'_> {
+        let mut book = self.speed();
+        book.running += 1;
+        // Under the lock, so on/off reach the adapter in order.
+        if book.running == 1 {
+            self.platform.keep_awake(true);
+        }
+        Sampling(self)
     }
 
     /// Records one download's sample taken at `now_ms`.

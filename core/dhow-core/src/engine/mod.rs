@@ -608,14 +608,12 @@ impl Engine {
                 self.sample(id, &progress, on_event);
             }
         };
-        self.sampling(true)?;
+        let sampling = self.sampling();
         let result = tokio::select! {
             r = fetch => r,
             _ = sampler => unreachable!("samples forever"),
         };
-        if let Err(e) = self.sampling(false) {
-            tracing::warn!(id, error = %e, "could not record speed samples");
-        }
+        drop(sampling);
         self.drop_buckets(id);
         let done = match result {
             Ok(done) => done,
