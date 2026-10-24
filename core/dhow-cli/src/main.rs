@@ -14,8 +14,8 @@ use dhow_core::engine::{AddRequest, Engine, EngineError, EngineEvent, Snapshot, 
 use dhow_core::http::{Header, Url};
 use dhow_core::logging;
 use dhow_core::naming::{Category, TargetFs, normalize_extension};
-use dhow_core::platform::PlatformAdapter;
 use dhow_core::platform::linux::LinuxAdapter;
+use dhow_core::platform::{PlatformAdapter, ProxyConfig, ProxyMode};
 use dhow_core::schedule::{Action, Schedule, Window};
 use dhow_core::storage::Db;
 use futures_util::StreamExt;
@@ -154,8 +154,8 @@ enum Command {
     /// Completed downloads by category: bytes and files still on disk,
     /// ids of those whose file is gone
     Storage,
-    /// Show or change the global speed limit, headroom and extra
-    /// category extensions
+    /// Show or change the global speed limit, headroom, extra category
+    /// extensions and proxy
     Settings {
         /// Limit for all downloads together (see `dhow limit`)
         #[arg(long)]
@@ -168,6 +168,11 @@ enum Command {
         /// its earlier extras (`CATEGORY=` clears them); repeatable
         #[arg(long = "extensions", value_name = "CATEGORY=EXTS")]
         extensions: Vec<String>,
+        /// `system` (the OS setting, the default), `none` (direct) or a
+        /// proxy URL for every request (`http://`, `https://`, `socks5://` or
+        /// `socks5h://`, `[user:pass@]host:port`)
+        #[arg(long, value_name = "system|none|URL")]
+        proxy: Option<String>,
     },
     /// Interface kind, VPN, the system proxy and the proxy in use
     Network,
@@ -543,13 +548,19 @@ async fn run(
             global_limit,
             headroom,
             extensions,
+            proxy,
         } => {
             // All parsed before any is applied.
             let global_limit = global_limit.map(|v| parse_rate(&v)).transpose()?;
+            let proxy = proxy.map(|v| parse_proxy(&v)).transpose()?;
             let extensions = extensions
                 .iter()
                 .map(|v| parse_extensions(v))
                 .collect::<Res<Vec<_>>>()?;
+            // First: the core may still reject it.
+            if let Some(mode) = proxy {
+                engine.set_proxy_mode(mode)?;
+            }
             for (category, exts) in extensions {
                 engine.set_extra_extensions(category, &exts)?;
             }
@@ -562,6 +573,7 @@ async fn run(
             output::emit(output::settings(
                 &engine.limit_settings()?,
                 &engine.extra_extensions()?,
+                &engine.proxy_mode()?,
             ));
             lock::poke_runners(&data_dir);
             Ok(ExitCode::SUCCESS)
@@ -577,6 +589,26 @@ async fn run(
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// `system`, `none` or a proxy URL (`http://` assumed without a scheme).
+fn parse_proxy(v: &str) -> Res<ProxyMode> {
+    Ok(match v.trim() {
+        "system" => ProxyMode::System,
+        "none" | "off" | "direct" => ProxyMode::None,
+        v => {
+            let url = if v.contains("://") {
+                Url::parse(v)
+            } else {
+                Url::parse(&format!("http://{v}"))
+            };
+            let url = url.map_err(|_| format!("--proxy: system, none or a URL, not {v:?}"))?;
+            ProxyMode::Custom(Box::new(ProxyConfig {
+                all: Some(url),
+                ..ProxyConfig::default()
+            }))
+        }
+    })
 }
 
 /// Bytes/s: a number with an optional `K`, `M` or `G` (×1024, a trailing

@@ -123,12 +123,13 @@ pub fn sample(id: Option<&str>, s: &SpeedSample) -> Value {
     })
 }
 
-pub fn settings(s: &LimitSettings, extra: &ExtraExtensions) -> Value {
+pub fn settings(s: &LimitSettings, extra: &ExtraExtensions, proxy: &ProxyMode) -> Value {
     json!({
         "event": "settings",
         "global_speed_limit": s.global,
         "headroom_percent": s.headroom_percent,
         "extra_extensions": extra,
+        "proxy": proxy_mode(proxy),
     })
 }
 
@@ -161,12 +162,16 @@ pub fn network(n: &NetworkInfo) -> Value {
         },
         "vpn_active": n.vpn_active,
         "system_proxy": n.system_proxy.as_ref().map(proxy),
-        "proxy_in_use": match &n.proxy_in_use {
-            ProxyMode::System => json!("system"),
-            ProxyMode::None => json!("none"),
-            ProxyMode::Custom(c) => proxy(c),
-        },
+        "proxy_in_use": proxy_mode(&n.proxy_in_use),
     })
+}
+
+fn proxy_mode(m: &ProxyMode) -> Value {
+    match m {
+        ProxyMode::System => json!("system"),
+        ProxyMode::None => json!("none"),
+        ProxyMode::Custom(c) => proxy(c),
+    }
 }
 
 /// Credentials and query strings in proxy URLs are not printed.

@@ -75,10 +75,16 @@ impl LinuxAdapter {
         }
     }
 
-    /// `None`: direct.
+    /// `None`: direct, or the desktop's setting couldn't be read.
     pub fn proxy(&self) -> Option<ProxyConfig> {
+        self.try_proxy().ok().flatten()
+    }
+
+    /// `Ok(None)`: direct. `Err`: gsettings failed or timed out, or
+    /// `kioslaverc` exists but can't be read; not to be taken as direct.
+    pub fn try_proxy(&self) -> Result<Option<ProxyConfig>, AdapterError> {
         if let Some(c) = env_proxy(&self.env) {
-            return Some(c);
+            return Ok(Some(c));
         }
         // Other desktops and headless: environment only, so a stale
         // dconf value doesn't count and nothing is forked.
@@ -89,12 +95,24 @@ impl LinuxAdapter {
                 .any(|d| names.iter().any(|n| d.eq_ignore_ascii_case(n)))
         };
         if is(&["KDE"]) {
-            let text = fs::read_to_string(self.kioslaverc.as_ref()?).ok()?;
-            kde_proxy(&text, &self.env)
+            let Some(path) = &self.kioslaverc else {
+                return Ok(None);
+            };
+            match fs::read_to_string(path) {
+                Ok(text) => Ok(kde_proxy(&text, &self.env)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(AdapterError::Failed(format!("kioslaverc: {e}"))),
+            }
         } else if is(&GNOME_DESKTOPS) {
-            gnome_proxy(&self.gsettings.as_ref()?()?)
+            let Some(fetch) = &self.gsettings else {
+                return Ok(None);
+            };
+            match fetch() {
+                Some(listing) => Ok(gnome_proxy(&listing)),
+                None => Err(AdapterError::Failed("gsettings did not answer".into())),
+            }
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -127,7 +145,7 @@ impl LinuxAdapter {
 impl PlatformAdapter for LinuxAdapter {
     /// The same for every URL: the core doesn't evaluate PAC.
     fn system_proxy(&self, _for_url: &Url) -> Result<ProxyConfig, AdapterError> {
-        Ok(self.proxy().unwrap_or_default())
+        Ok(self.try_proxy()?.unwrap_or_default())
     }
 
     fn network_info(&self) -> Result<NetworkInfo, AdapterError> {
@@ -534,6 +552,9 @@ org.gnome.system.proxy.socks port 0
             ..adapter(&[("XDG_CURRENT_DESKTOP", "GNOME")])
         };
         assert_eq!(a.proxy(), None);
+        // Unknown, not direct: the engine mustn't bypass a proxy for it.
+        let any = Url::parse("http://x/").unwrap();
+        assert!(matches!(a.system_proxy(&any), Err(AdapterError::Failed(_))));
     }
 
     #[test]

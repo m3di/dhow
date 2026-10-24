@@ -81,7 +81,8 @@ async fn engine_reports_the_adapter_and_keeps_awake_while_transferring() {
         info.system_proxy.unwrap().https.unwrap().as_str(),
         "http://proxy.test:3128/"
     );
-    assert_eq!(info.proxy_in_use, ProxyMode::None);
+    // The default mode, with a system proxy reported.
+    assert_eq!(info.proxy_in_use, ProxyMode::System);
     assert!(fake.awake.lock().unwrap().is_empty(), "nothing ran yet");
 
     let mut ids = Vec::new();

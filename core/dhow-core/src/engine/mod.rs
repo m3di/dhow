@@ -10,6 +10,7 @@
 pub mod categories;
 pub mod groups;
 pub mod limits;
+mod proxy;
 pub mod queues;
 pub mod speed;
 #[cfg(test)]
@@ -32,7 +33,7 @@ use crate::download::{
 use crate::http::{self, Header};
 use crate::journal::format;
 use crate::naming::{self, Category, TargetFs};
-use crate::platform::{AdapterError, NetworkInfo, NoopAdapter, PlatformAdapter, ProxyMode};
+use crate::platform::{AdapterError, NetworkInfo, NoopAdapter, PlatformAdapter, ProxyConfig};
 use crate::probe::{self, ProbeError, Resumable};
 use crate::speed::{Ema, rollup_cutoff};
 use crate::storage::{DEFAULT_QUEUE_ID, Db, StorageError};
@@ -293,6 +294,8 @@ pub struct Engine {
     buckets: Mutex<limits::Buckets>,
     speed: Mutex<speed::SpeedBook>,
     platform: Arc<dyn PlatformAdapter>,
+    /// The adapter's last answer to `system_proxy`.
+    last_system: Mutex<Option<ProxyConfig>>,
 }
 
 impl Engine {
@@ -317,6 +320,7 @@ impl Engine {
             buckets: Mutex::default(),
             speed: Mutex::default(),
             platform,
+            last_system: Mutex::default(),
         };
         engine.refresh_limits()?;
         // Leftovers of earlier runs whose hour has since ended.
@@ -329,8 +333,7 @@ impl Engine {
     /// watched here.
     pub fn network_info(&self) -> Result<NetworkInfo, AdapterError> {
         let mut info = self.platform.network_info()?;
-        // `http::client` uses no proxy until M3.4 adds the setting.
-        info.proxy_in_use = ProxyMode::None;
+        info.proxy_in_use = self.proxy_in_use(info.system_proxy.as_ref());
         Ok(info)
     }
 
@@ -360,7 +363,7 @@ impl Engine {
             .clone()
             .unwrap_or_else(|| DEFAULT_QUEUE_ID.to_owned());
         self.queue(&queue_id)?;
-        let lease = self.client.lease().map_err(io::Error::other)?;
+        let lease = self.lease(&req.url).await?;
         let info = probe::probe(&lease.client, &req.url, &req.headers, self.config.probe).await?;
         drop(lease);
         let base = match &req.filename {
@@ -576,10 +579,13 @@ impl Engine {
             });
             return self.get(id);
         }
+        // Before it is Active: a failure here leaves it as it was.
+        let url = Url::parse(&snap.url).map_err(io::Error::other)?;
+        let lease = self.lease(&url).await?;
         self.transition(id, State::Active, None, on_event)?;
 
         let req = Request {
-            url: Url::parse(&snap.url).map_err(io::Error::other)?,
+            url,
             headers: self.headers(id)?,
             part: part.clone(),
             sidecar: sidecar.clone(),
@@ -589,7 +595,6 @@ impl Engine {
         };
         let progress = Mutex::new(Progress::new(snap.total_size));
         let dl_event = |e: DownloadEvent| self.on_download_event(id, e, &progress, on_event);
-        let lease = self.client.lease().map_err(io::Error::other)?;
         let fetch = download::download(
             &req,
             &lease.client,

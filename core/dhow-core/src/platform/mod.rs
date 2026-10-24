@@ -69,7 +69,7 @@ impl ProxyConfig {
     }
 }
 
-/// Which proxy the HTTP client uses (§8); the setting arrives with M3.4.
+/// Which proxy the HTTP client uses (§8): the `proxy_mode` setting.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProxyMode {
     System,
