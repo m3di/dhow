@@ -10,7 +10,10 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 /// Append-only. Never edit a migration that has shipped; add a new one.
-const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_initial.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("migrations/0001_initial.sql"),
+    include_str!("migrations/0002_queue_run_state.sql"),
+];
 
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
 pub const DEFAULT_QUEUE_ID: &str = "00000000-0000-0000-0000-000000000000";

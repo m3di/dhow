@@ -16,4 +16,5 @@ tempfile.workspace = true
 [dev-dependencies]
 base64.workspace = true
 fastrand.workspace = true
+jiff.workspace = true
 sha2.workspace = true

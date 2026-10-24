@@ -336,10 +336,12 @@ Schedule {
 }
 ```
 
-- `Start`: the queue starts at a window's `start`; downloads continue past `end`.
-- `StartAndStopOutside`: downloads in the queue are paused at `end` (journal commit, connections closed) and resumed at the next `start`.
-- The engine keeps a single `sleep_until(next_edge)` across all queues (`ARCHITECTURE §7`). DST and timezone changes recompute the edge; the adapter's `watch_network` is not involved.
-- `StartQueue`/`StopQueue` override the schedule until the next edge.
+- Window times are local wall-clock `HH:MM` or `HH:MM:SS`; `days` are the days a window *starts* on. An `end` at or before `start` runs past midnight into the next day; `start == end` is a whole day. Local times are turned into instants with the current time zone's rules, so a window keeps its local time across DST changes (a start inside a DST gap begins right after it).
+- `Start`: downloads in the queue start only inside a window; downloads running at `end` continue.
+- `StartAndStopOutside`: downloads in the queue start only inside a window, and are paused at `end` (journal commit, connections closed) and resumed at the next `start`: the runner puts them back in the queue (`Queued`), unlike a user's pause.
+- The engine keeps a single `sleep_until(next_edge)` across all queues (`ARCHITECTURE §7`): the earliest window start/end or override expiry of any queue; none if no queue has a schedule or a timed override. Edges are recomputed on every wake, so DST is followed exactly; a time-zone change while asleep takes effect at the next wake (a platform notification can wake it sooner); the adapter's `watch_network` is not involved.
+- `StartQueue`/`StopQueue` override the schedule until the next edge (indefinitely for a queue without a schedule). Stopping also pauses the queue's running downloads, which go back to the queue.
+- Starting a download by hand (`Resume`, an `Add` that starts now) ignores its queue's schedule.
 - The **default queue** exists always, cannot be deleted, has no schedule. Its name is NULL until the user renames it (the shell shows a localized one).
 - `DeleteQueue` appends the queue's downloads to `move_items_to` in their order; `MoveToQueue` appends one; `Reorder` places one before another in the same queue, or last.
 

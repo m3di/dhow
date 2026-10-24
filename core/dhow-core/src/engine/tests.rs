@@ -552,3 +552,238 @@ mod queue_tests {
         assert_eq!(runnable(&[&ids[0], &ids[1], &n1.id]), [ids[4].clone()]);
     }
 }
+
+mod schedule_tests {
+    use jiff::Zoned;
+    use jiff::tz::TimeZone;
+
+    use super::*;
+    use crate::engine::queues::{QueueSpec, RunState};
+    use crate::schedule::{Action, Schedule, Window};
+    use crate::storage::DEFAULT_QUEUE_ID;
+
+    // 2026-10-26 is a Monday.
+    fn utc(s: &str) -> Zoned {
+        s.parse::<jiff::civil::DateTime>()
+            .unwrap()
+            .to_zoned(TimeZone::UTC)
+            .unwrap()
+    }
+
+    fn scheduled(fx: &Fx, action: Action) -> String {
+        let spec = QueueSpec {
+            name: "Office".into(),
+            schedule: Some(Schedule {
+                windows: vec![Window::parse("mon 09:00-17:00").unwrap()],
+                action,
+            }),
+            ..QueueSpec::default()
+        };
+        fx.engine.create_queue(&spec).unwrap().id
+    }
+
+    async fn add_to(fx: &Fx, server: &TestServer, queue: &str) -> String {
+        let mut req = fx.request(server, "/blob/10");
+        req.queue = Some(queue.into());
+        fx.engine.add(req).await.unwrap().id
+    }
+
+    fn runnable(fx: &Fx, now: &Zoned) -> Vec<String> {
+        fx.engine
+            .next_runnable_at(now, |_| false)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn windows_gate_starting_and_stop_and_start_outside_stops_running() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let q = scheduled(&fx, Action::StartAndStopOutside);
+        let dl = add_to(&fx, &server, &q).await;
+        let other = fx
+            .engine
+            .add(fx.request(&server, "/blob/10"))
+            .await
+            .unwrap()
+            .id;
+        assert_eq!(
+            runnable(&fx, &utc("2026-10-26T10:00")),
+            [other.clone(), dl.clone()]
+        );
+        assert_eq!(
+            runnable(&fx, &utc("2026-10-26T18:00")),
+            vec![other.clone()],
+            "default queue unaffected"
+        );
+        assert_eq!(
+            fx.engine
+                .to_stop_at(&utc("2026-10-26T18:00"), [dl.as_str(), other.as_str()])
+                .unwrap(),
+            vec![dl.clone()]
+        );
+        assert!(
+            fx.engine
+                .to_stop_at(&utc("2026-10-26T10:00"), [dl.as_str()])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn start_lets_running_downloads_continue_past_the_end() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let q = scheduled(&fx, Action::Start);
+        let dl = add_to(&fx, &server, &q).await;
+        assert!(
+            runnable(&fx, &utc("2026-10-26T18:00")).is_empty(),
+            "nothing new starts"
+        );
+        assert!(
+            fx.engine
+                .to_stop_at(&utc("2026-10-26T18:00"), [dl.as_str()])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_next_edge_across_queues_and_none_without_schedules() {
+        let fx = Fx::new();
+        assert_eq!(
+            fx.engine.next_edge_at(&utc("2026-10-26T10:00")).unwrap(),
+            None
+        );
+        scheduled(&fx, Action::Start);
+        let evening = QueueSpec {
+            name: "Evening".into(),
+            schedule: Some(Schedule {
+                windows: vec![Window::parse("mon 12:00-13:00").unwrap()],
+                action: Action::Start,
+            }),
+            ..QueueSpec::default()
+        };
+        fx.engine.create_queue(&evening).unwrap();
+        let edge = |at: &str| fx.engine.next_edge_at(&utc(at)).unwrap().unwrap();
+        assert_eq!(
+            edge("2026-10-26T10:00"),
+            utc("2026-10-26T12:00").timestamp()
+        );
+        assert_eq!(
+            edge("2026-10-26T12:30"),
+            utc("2026-10-26T13:00").timestamp()
+        );
+        assert_eq!(
+            edge("2026-10-26T13:00"),
+            utc("2026-10-26T17:00").timestamp()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn overrides_last_until_the_next_edge() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let q = scheduled(&fx, Action::StartAndStopOutside);
+        let dl = add_to(&fx, &server, &q).await;
+        // StartQueue on Monday evening: runs until the next edge (next Monday 09:00).
+        let snap = fx
+            .engine
+            .set_run_state(&q, RunState::Started, &utc("2026-10-26T18:00"))
+            .unwrap();
+        assert_eq!(
+            snap.run_state_until,
+            Some(utc("2026-11-02T09:00").timestamp().as_millisecond())
+        );
+        assert_eq!(runnable(&fx, &utc("2026-10-28T18:00")), vec![dl.clone()]);
+        // StopQueue Monday morning: stopped, and running ones stop, until 17:00.
+        fx.engine
+            .set_run_state(&q, RunState::Stopped, &utc("2026-10-26T10:00"))
+            .unwrap();
+        assert!(runnable(&fx, &utc("2026-10-26T11:00")).is_empty());
+        assert_eq!(
+            fx.engine
+                .to_stop_at(&utc("2026-10-26T11:00"), [dl.as_str()])
+                .unwrap(),
+            vec![dl.clone()]
+        );
+        // After 17:00 the schedule rules again (outside: still not running).
+        assert!(runnable(&fx, &utc("2026-10-26T17:30")).is_empty());
+        assert!(
+            !runnable(&fx, &utc("2026-11-02T10:00")).is_empty(),
+            "next window as usual"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stopping_an_unscheduled_queue_lasts_until_started() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let dl = fx
+            .engine
+            .add(fx.request(&server, "/blob/10"))
+            .await
+            .unwrap()
+            .id;
+        let snap = fx
+            .engine
+            .set_run_state(
+                DEFAULT_QUEUE_ID,
+                RunState::Stopped,
+                &utc("2026-10-26T10:00"),
+            )
+            .unwrap();
+        assert_eq!(snap.run_state_until, None);
+        assert!(runnable(&fx, &utc("2027-01-01T00:00")).is_empty());
+        assert_eq!(
+            fx.engine.next_edge_at(&utc("2026-10-26T10:00")).unwrap(),
+            None,
+            "no timer for it"
+        );
+        fx.engine
+            .set_run_state(DEFAULT_QUEUE_ID, RunState::Auto, &utc("2026-10-26T10:00"))
+            .unwrap();
+        assert_eq!(runnable(&fx, &utc("2026-10-26T10:00")), vec![dl]);
+    }
+
+    #[test]
+    fn default_queue_has_no_schedule_and_schedules_need_windows() {
+        let fx = Fx::new();
+        let with = |windows| QueueSpec {
+            name: "x".into(),
+            schedule: Some(Schedule {
+                windows,
+                action: Action::Start,
+            }),
+            ..QueueSpec::default()
+        };
+        assert!(matches!(
+            fx.engine.update_queue(
+                DEFAULT_QUEUE_ID,
+                &with(vec![Window::parse("daily 01:00-02:00").unwrap()])
+            ),
+            Err(EngineError::InvalidQueue(_))
+        ));
+        assert!(matches!(
+            fx.engine.create_queue(&with(vec![])),
+            Err(EngineError::InvalidQueue(_))
+        ));
+        let q = fx
+            .engine
+            .create_queue(&with(vec![Window::parse("daily 01:00-02:00").unwrap()]))
+            .unwrap();
+        assert_eq!(
+            fx.engine
+                .queue(&q.id)
+                .unwrap()
+                .schedule
+                .unwrap()
+                .windows
+                .len(),
+            1,
+            "round-trips"
+        );
+    }
+}

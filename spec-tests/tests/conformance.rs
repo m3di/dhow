@@ -451,7 +451,12 @@ fn pause_from_another_process_then_resume() {
     run.wait_for(|e| e["event"] == "progress" && e["downloaded"].as_u64().unwrap() > 0);
     let paused = sb.dhow(["pause", &id]);
     paused.assert_success();
-    assert_eq!(paused.events()[0]["state"], "paused");
+    let summary = paused
+        .events()
+        .into_iter()
+        .find(|e| e["event"] == "download")
+        .unwrap();
+    assert_eq!(summary["state"], "paused");
     let runner = run.wait();
     assert!(runner.status.success(), "{runner:?}");
     assert!(runner.has("state", "to", "paused"));

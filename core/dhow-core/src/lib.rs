@@ -9,6 +9,7 @@ pub mod logging;
 pub mod naming;
 pub mod probe;
 pub mod rangeset;
+pub mod schedule;
 pub mod storage;
 pub mod transfer;
 pub mod writer;

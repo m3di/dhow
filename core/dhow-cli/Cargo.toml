@@ -14,6 +14,7 @@ path = "src/main.rs"
 dhow-core.workspace = true
 clap.workspace = true
 futures-util.workspace = true
+jiff.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
