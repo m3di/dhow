@@ -32,4 +32,13 @@ jobs:
           workspaces: core
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: |
+          cargo test --workspace --locked --no-run
+          for t in budget multi; do
+            pass=0; fail=0
+            for i in $(seq 1 100); do
+              if cargo test -q -p dhow-core --test $t --locked > out.txt 2>&1; then pass=$((pass+1)); else fail=$((fail+1)); echo "=== $t run $i FAILED"; grep -E "panicked" -A1 out.txt; fi
+            done
+            echo "$t pass=$pass fail=$fail"
+          done
       - run: cargo test --workspace --locked
