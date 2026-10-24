@@ -11,7 +11,7 @@ use dhow_core::journal::{Header, Journal, format};
 use dhow_core::probe::Resumable;
 use dhow_core::rangeset::RangeSet;
 use dhow_core::transfer::{
-    Cause, ConnEvent, IdentityChange, RetryPolicy, Source, TransferConfig, TransferError,
+    Cause, ConnEvent, Cursor, IdentityChange, RetryPolicy, Source, TransferConfig, TransferError,
     run_connection, validator,
 };
 use dhow_core::writer::actor;
@@ -99,7 +99,15 @@ async fn download(server: &TestServer, spec: Spec<'_>) -> Run {
     let started = Instant::now();
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        run_connection(&src, 0, range, None, &handle, &FAST, &on_event),
+        run_connection(
+            &src,
+            0,
+            &Cursor::new(range),
+            None,
+            &handle,
+            &FAST,
+            &on_event,
+        ),
     )
     .await
     .expect("transfer hung");

@@ -44,6 +44,7 @@ impl Fx {
             directory: self.downloads.clone(),
             filename: None,
             paused: false,
+            connections: None,
             target_fs: TargetFs::Posix,
         }
     }

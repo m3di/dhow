@@ -21,6 +21,7 @@ use rusqlite::{OptionalExtension, Row, params};
 use tokio::sync::watch;
 
 use crate::complete::{self, CompleteError, Target};
+use crate::download::ramp::LinkState;
 use crate::download::{self, DownloadConfig, DownloadError, DownloadEvent, Request, ResetReason};
 use crate::http::{self, Header};
 use crate::journal::format;
@@ -141,6 +142,9 @@ pub enum WarningKind {
     SizeUnverified,
     /// No validator: only overlap checks guard resume (I4).
     IdentityWeak,
+    /// The server stopped honoring `Range` mid-download (§9 Protocol);
+    /// continuing on one connection.
+    ServerIgnoredRange,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -155,6 +159,7 @@ pub enum EngineEvent {
         id: DownloadId,
         downloaded: u64,
         total: Option<u64>,
+        connections: u32,
     },
     /// Started over from zero; the shell says why.
     Reset {
@@ -187,6 +192,8 @@ pub struct AddRequest {
     pub filename: Option<String>,
     /// Record as paused instead of queued.
     pub paused: bool,
+    /// Connections for this download; `None` = the default (§4.1).
+    pub connections: Option<u8>,
     pub target_fs: TargetFs,
 }
 
@@ -239,6 +246,8 @@ pub struct Engine {
     db: Arc<Mutex<Db>>,
     client: Client,
     config: DownloadConfig,
+    /// What this process knows about the user's link (§10.A).
+    link: LinkState,
 }
 
 impl Engine {
@@ -250,6 +259,7 @@ impl Engine {
             db: Arc::new(Mutex::new(db)),
             client,
             config,
+            link: LinkState::default(),
         })
     }
 
@@ -307,8 +317,9 @@ impl Engine {
         db.conn().execute(
             "INSERT INTO downloads (id, url, headers, final_path, part_path, state, fail_reason,
                  queue_id, position, category, created_at, total_size, etag, last_modified,
-                 digest, resumable)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'other', ?10, ?11, ?12, ?13, ?14, ?15)",
+                 digest, resumable, connections)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'other', ?10, ?11, ?12, ?13, ?14, ?15,
+                 ?16)",
             params![
                 id,
                 req.url.as_str(),
@@ -325,6 +336,7 @@ impl Engine {
                 info.last_modified,
                 info.digest.as_ref().map(digest_text),
                 resumable_str(info.resumable),
+                req.connections.map(|n| n.max(1)),
             ],
         )?;
         drop(db);
@@ -448,10 +460,19 @@ impl Engine {
             headers: self.headers(id)?,
             part: part.clone(),
             sidecar: sidecar.clone(),
+            connections: self.connections(id)?,
         };
         let progress = Mutex::new(Progress::new(snap.total_size));
         let dl_event = |e: DownloadEvent| self.on_download_event(id, e, &progress, on_event);
-        let result = download::download(&req, &self.client, &self.config, &dl_event, stop).await;
+        let result = download::download(
+            &req,
+            &self.client,
+            &self.config,
+            &self.link,
+            &dl_event,
+            stop,
+        )
+        .await;
         let done = match result {
             Ok(done) => done,
             Err(DownloadError::Stopped) => {
@@ -583,6 +604,16 @@ impl Engine {
                     delay,
                 });
             }
+            DownloadEvent::Connections(n) => {
+                p.connections = n;
+                p.flush(id, on_event);
+            }
+            DownloadEvent::Downgraded => {
+                on_event(EngineEvent::Warning {
+                    id: id.to_owned(),
+                    kind: WarningKind::ServerIgnoredRange,
+                });
+            }
             DownloadEvent::Connection(ConnEvent::NotResumable) => {
                 on_event(EngineEvent::Warning {
                     id: id.to_owned(),
@@ -590,6 +621,16 @@ impl Engine {
                 });
             }
         }
+    }
+
+    fn connections(&self, id: &str) -> Result<Option<u8>, EngineError> {
+        let db = self.db();
+        let n: Option<i64> = db.conn().query_row(
+            "SELECT connections FROM downloads WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        Ok(n.and_then(|n| u8::try_from(n).ok()))
     }
 
     fn headers(&self, id: &str) -> Result<Vec<Header>, EngineError> {
@@ -643,8 +684,9 @@ impl Engine {
 struct Progress {
     downloaded: u64,
     total: Option<u64>,
+    connections: u32,
     last: Instant,
-    sent: Option<u64>,
+    sent: Option<(u64, u32)>,
 }
 
 impl Progress {
@@ -652,21 +694,23 @@ impl Progress {
         Self {
             downloaded: 0,
             total,
+            connections: 0,
             last: Instant::now(),
             sent: None,
         }
     }
 
     fn flush(&mut self, id: &str, on_event: &(dyn Fn(EngineEvent) + Send + Sync)) {
-        if self.sent == Some(self.downloaded) {
+        if self.sent == Some((self.downloaded, self.connections)) {
             return;
         }
         self.last = Instant::now();
-        self.sent = Some(self.downloaded);
+        self.sent = Some((self.downloaded, self.connections));
         on_event(EngineEvent::Progress {
             id: id.to_owned(),
             downloaded: self.downloaded,
             total: self.total,
+            connections: self.connections,
         });
     }
 }

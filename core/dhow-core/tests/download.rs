@@ -4,6 +4,7 @@ use std::fs::OpenOptions;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use dhow_core::download::ramp::LinkState;
 use dhow_core::download::{
     DownloadConfig, DownloadError, DownloadEvent, Downloaded, Request, ResetReason, download,
 };
@@ -53,6 +54,7 @@ impl Env {
             headers: vec![],
             part: dir.path().join("f.part"),
             sidecar: dir.path().join("f.dhow"),
+            connections: None,
         };
         Self { _dir: dir, req }
     }
@@ -76,7 +78,14 @@ impl Env {
         let client = http::client().unwrap();
         let result = tokio::time::timeout(
             Duration::from_secs(30),
-            download(&self.req, &client, config, &on_event, &stop),
+            download(
+                &self.req,
+                &client,
+                config,
+                &LinkState::default(),
+                &on_event,
+                &stop,
+            ),
         )
         .await
         .expect("download hung");

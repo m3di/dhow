@@ -389,3 +389,81 @@ async fn actor_error_is_fatal_and_reported() {
         "a failed writer commits nothing more"
     );
 }
+
+#[test]
+fn split_journals_before_returning_and_bounds_the_owner() {
+    let (fx, mut w) = Fixture::new(Some(1000), NO_AUTO);
+    w.define(0, 0..1000).unwrap();
+    w.write(0, 0, &data(100, 1)).unwrap();
+    assert_eq!(w.split(0, 1, 600).unwrap(), Some(600..1000));
+    let replayed = format::replay(&std::fs::read(&fx.sidecar).unwrap()).unwrap();
+    assert_eq!(
+        replayed.valid_len as usize,
+        format::HEADER_LEN + 3 * format::RECORD_LEN,
+        "define, split, define"
+    );
+    // The owner's in-flight bytes past 600 are dropped, the rest kept.
+    w.write(0, 100, &data(550, 2)).unwrap();
+    w.write(0, 650, &data(50, 2)).unwrap();
+    w.write(1, 600, &data(400, 3)).unwrap();
+    w.commit().unwrap();
+    assert!(fx.committed_on_disk().is_exactly(1000));
+    let bytes = fx.part_bytes();
+    assert_eq!(&bytes[100..600], &data(500, 2)[..]);
+    assert_eq!(
+        &bytes[600..1000],
+        &data(400, 3)[..],
+        "the new chunk's bytes, not the owner's"
+    );
+}
+
+#[test]
+fn split_refuses_points_outside_the_unwritten_part() {
+    let (_fx, mut w) = Fixture::new(Some(1000), NO_AUTO);
+    w.define(0, 0..1000).unwrap();
+    w.write(0, 0, &data(300, 1)).unwrap();
+    assert_eq!(w.split(0, 1, 300).unwrap(), None, "already written");
+    assert_eq!(w.split(0, 1, 1000).unwrap(), None, "nothing left to take");
+    assert!(matches!(
+        w.split(9, 1, 500),
+        Err(WriterError::UnknownChunk { .. })
+    ));
+    assert!(matches!(
+        w.split(0, 0, 500),
+        Err(WriterError::BadChunk { .. })
+    ));
+}
+
+#[test]
+fn unsplit_chunks_stay_strict() {
+    let (_fx, mut w) = Fixture::new(Some(1000), NO_AUTO);
+    w.define(0, 0..100).unwrap();
+    assert!(matches!(
+        w.write(0, 0, &data(101, 1)),
+        Err(WriterError::OutOfBounds { .. })
+    ));
+}
+
+#[test]
+fn merge_undoes_a_split_before_anything_was_dropped() {
+    let (_fx, mut w) = Fixture::new(Some(1000), NO_AUTO);
+    w.define(0, 0..1000).unwrap();
+    w.write(0, 0, &data(100, 1)).unwrap();
+    w.split(0, 1, 500).unwrap().unwrap();
+    assert!(w.merge(0, 1).unwrap());
+    w.write(0, 100, &data(900, 1)).unwrap();
+    w.commit().unwrap();
+    assert!(w.committed().is_exactly(1000));
+}
+
+#[test]
+fn merge_refuses_after_drops_or_writes() {
+    let (_fx, mut w) = Fixture::new(Some(1000), NO_AUTO);
+    w.define(0, 0..1000).unwrap();
+    w.split(0, 1, 500).unwrap().unwrap();
+    w.write(1, 500, &data(10, 2)).unwrap();
+    assert!(!w.merge(0, 1).unwrap(), "the new chunk already has bytes");
+    w.split(1, 2, 800).unwrap().unwrap();
+    w.write(1, 510, &data(400, 2)).unwrap(); // crosses 800: tail dropped
+    assert!(!w.merge(1, 2).unwrap(), "owner already dropped bytes");
+}

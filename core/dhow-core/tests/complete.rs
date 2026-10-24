@@ -37,6 +37,7 @@ async fn fetch_and_finalize(server: &TestServer, path: &str) -> Outcome {
         headers: vec![],
         part: dir.path().join("dl.part"),
         sidecar: dir.path().join("dl.dhow"),
+        connections: None,
     };
     let client = http::client().unwrap();
     let done = tokio::time::timeout(
@@ -45,6 +46,7 @@ async fn fetch_and_finalize(server: &TestServer, path: &str) -> Outcome {
             &req,
             &client,
             &DownloadConfig::default(),
+            &dhow_core::download::ramp::LinkState::default(),
             &|_| {},
             &tokio::sync::watch::channel(false).1,
         ),

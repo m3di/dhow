@@ -157,6 +157,11 @@ struct Chunk {
     written: u64,
     /// Everything in `[start, committed)` is durable and journaled.
     committed: u64,
+    /// Shrunk by [`Writer::split`]: writes its owner already had in flight
+    /// past the new end are dropped, not an error.
+    split: bool,
+    /// Some such write was dropped; the chunk can't be grown back.
+    dropped: bool,
 }
 
 #[cfg(test)]
@@ -221,6 +226,8 @@ impl Writer {
                 end: range.end,
                 written: range.start,
                 committed: range.start,
+                split: false,
+                dropped: false,
             },
         );
         Ok(())
@@ -232,8 +239,18 @@ impl Writer {
     pub fn write(&mut self, id: ChunkId, offset: u64, data: &[u8]) -> Result<(), WriterError> {
         let chunk = self
             .chunks
-            .get(&id)
+            .get_mut(&id)
             .ok_or(WriterError::UnknownChunk { chunk: id })?;
+        // §4.3: after a split the owner may still send what it had in
+        // flight; everything from the new end on belongs to another chunk.
+        let mut data = data;
+        if chunk.split && offset + data.len() as u64 > chunk.end {
+            chunk.dropped = true;
+            if offset >= chunk.end {
+                return Ok(());
+            }
+            data = &data[..(chunk.end - offset) as usize];
+        }
         if offset != chunk.written || offset + data.len() as u64 > chunk.end {
             return Err(WriterError::OutOfBounds {
                 chunk: id,
@@ -257,6 +274,70 @@ impl Writer {
             self.commit()?;
         }
         Ok(())
+    }
+
+    /// Work stealing (§4.3): chunk `owner` keeps `[.., at)`, new chunk `new`
+    /// gets `[at, end)`. Recorded in the journal before this returns, i.e.
+    /// before the new connection can send a request. `None` if `at` is no
+    /// longer inside the owner's unwritten part.
+    pub fn split(
+        &mut self,
+        owner: ChunkId,
+        new: ChunkId,
+        at: u64,
+    ) -> Result<Option<Range<u64>>, WriterError> {
+        let chunk = self
+            .chunks
+            .get(&owner)
+            .ok_or(WriterError::UnknownChunk { chunk: owner })?;
+        if self.chunks.contains_key(&new) {
+            return Err(WriterError::BadChunk {
+                chunk: new,
+                range: at..chunk.end,
+            });
+        }
+        if at <= chunk.written || at >= chunk.end {
+            return Ok(None);
+        }
+        let tail = at..chunk.end;
+        self.journal.append(&[
+            Record::Split {
+                keep_to: at,
+                new_start: at,
+            },
+            Record::Define(tail.clone()),
+        ])?;
+        let chunk = self.chunks.get_mut(&owner).expect("checked above");
+        chunk.end = at;
+        chunk.split = true;
+        self.chunks.insert(
+            new,
+            Chunk {
+                start: at,
+                end: tail.end,
+                written: at,
+                committed: at,
+                split: false,
+                dropped: false,
+            },
+        );
+        Ok(Some(tail))
+    }
+
+    /// Undoes a split (§9 Protocol downgrade): `from`, which must have
+    /// nothing written, goes back to `into`, which must end where `from`
+    /// starts and must not have dropped bytes. Returns whether it merged.
+    pub fn merge(&mut self, into: ChunkId, from: ChunkId) -> Result<bool, WriterError> {
+        let (Some(f), Some(i)) = (self.chunks.get(&from), self.chunks.get(&into)) else {
+            return Err(WriterError::UnknownChunk { chunk: from });
+        };
+        if f.written != f.start || i.end != f.start || i.dropped {
+            return Ok(false);
+        }
+        let end = f.end;
+        self.chunks.remove(&from);
+        self.chunks.get_mut(&into).expect("checked above").end = end;
+        Ok(true)
     }
 
     /// When the next timed commit is due; `None` when nothing is pending, so

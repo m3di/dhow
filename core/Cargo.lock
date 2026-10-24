@@ -350,6 +350,7 @@ dependencies = [
  "fastrand",
  "flume",
  "fs4",
+ "futures-util",
  "httpdate",
  "md-5",
  "mime_guess",
