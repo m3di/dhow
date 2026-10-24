@@ -124,23 +124,26 @@ File: `<final>.dhow`, next to `<final>.part`. Little-endian binary. Designed for
 ### 5.1 Layout
 
 ```
-Header (fixed 256 bytes, written once, fsync'd):
+All integers little-endian.
+
+Header (fixed 256 bytes, written once, fsync'd, directory fsync'd):
   magic        "DHOW"      4
   version      u16         2   (=1)
   flags        u16         2   (bit0: preallocated)
   total_size   u64         8   (u64::MAX if unknown)
   url_hash     [u8;32]     32  (blake3 of original url)
-  etag_len     u16         2
+  etag_len     u16         2   (full length; > 120 means truncated and is read back as no ETag)
   etag         [u8;120]    120 (truncated/padded)
   last_mod     i64         8   (unix seconds, 0 if none)
-  created_at   i64         8
-  reserved     ...         to 256
+  created_at   i64         8   (unix milliseconds)
+  reserved     [u8;66]     66  (zero)
+  crc32        u32         4   (CRC-32/ISO-HDLC over bytes 0..252)
 Records (append-only, each 24 bytes):
   kind         u8          1   (1=range_define, 2=range_commit, 3=range_split, 4=checkpoint)
   _pad         [u8;3]      3
   a            u64         8
   b            u64         8
-  crc32        u32         4   (over kind..b)
+  crc32        u32         4   (CRC-32/ISO-HDLC over kind..b, padding included)
 ```
 
 - `range_define(a=start, b=end)`: a chunk exists.
@@ -150,11 +153,15 @@ Records (append-only, each 24 bytes):
 
 ### 5.2 Reading
 
-On open, replay records in order, ignoring any record whose CRC fails **and every record after it** (a torn write at the tail). The result is the committed set: a sorted list of disjoint `[start, end)` intervals.
+On open, replay records in order, ignoring any record that is not one the writer could have produced **and every record after it** (a torn write at the tail). Not producible: CRC mismatch, partial record, unknown kind, non-zero padding, `start >= end` (`Define`/`Commit`), `keep_to > new_start` (`Split`), an end past a known `total_size`, or a `Checkpoint` with non-zero fields. The writer refuses to append such records, so they can only come from damage. The result is the committed set: a sorted list of disjoint `[start, end)` intervals.
+
+A header that fails magic, CRC or version checks makes the sidecar unusable: treat as §5.4.
+
+Before appending anything after replay, the file is truncated to the end of the last valid record and synced. Otherwise new records would land behind the garbage and the next replay would stop before them.
 
 ### 5.3 Compaction
 
-When the sidecar exceeds 64 KiB, rewrite it to `<final>.dhow.tmp` with the header + one `range_commit` per committed interval + `checkpoint`, fsync, atomic rename over the old one, fsync the directory.
+When the sidecar exceeds 64 KiB, rewrite it to `<final>.dhow.tmp` with the header + one `range_commit` per committed interval + `checkpoint`, fsync, atomic rename over the old one, fsync the directory. (The old handle is closed before the rename: Windows will not replace an open file.) A crash leaves either the old or the new sidecar; a leftover `.dhow.tmp` is deleted on open.
 
 ### 5.4 Recovery with no sidecar
 

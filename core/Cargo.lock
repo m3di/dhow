@@ -271,6 +271,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32fast"
+version = "1.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ba106e844045ddc02c20768ac4b0b7cb45f2cc2ecbd833ac9f5dacb183c2055"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "crossbeam-channel"
 version = "0.5.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -307,6 +316,8 @@ name = "dhow-core"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "blake3",
+ "crc32fast",
  "dhow-testserver",
  "dirs",
  "mime_guess",
