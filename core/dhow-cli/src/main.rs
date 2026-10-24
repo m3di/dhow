@@ -51,6 +51,24 @@ struct Cli {
     )]
     commit_interval_ms: u64,
 
+    /// Ramp-up measurement window in milliseconds (ENGINE-SPEC §4.4)
+    #[arg(
+        long,
+        env = "DHOW_RAMP_WINDOW_MS",
+        global = true,
+        default_value_t = 3000
+    )]
+    ramp_window_ms: u64,
+
+    /// Smallest chunk worth its own connection, in KiB (§4.1)
+    #[arg(
+        long,
+        env = "DHOW_MIN_CHUNK_KIB",
+        global = true,
+        default_value_t = 1024
+    )]
+    min_chunk_kib: u64,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -75,6 +93,9 @@ enum Command {
         /// Add it paused
         #[arg(long)]
         paused: bool,
+        /// Connections for this download [default: 8]
+        #[arg(short = 'c', long)]
+        connections: Option<u8>,
     },
     /// Run a paused, failed or interrupted download here until it finishes
     Resume { id: String },
@@ -119,6 +140,8 @@ fn main() -> ExitCode {
     config.transfer.retry.max_failures = cli.max_retries.max(1);
     config.transfer.retry.base = Duration::from_millis(cli.retry_base_ms);
     config.writer.commit_interval = Duration::from_millis(cli.commit_interval_ms.max(1));
+    config.ramp.window = Duration::from_millis(cli.ramp_window_ms.max(1));
+    config.ramp.min_chunk = cli.min_chunk_kib.max(1) * 1024;
     match runtime.block_on(run(command, &cli.data_dir, config)) {
         Ok(code) => code,
         Err(e) => fail(&*e),
@@ -154,6 +177,7 @@ async fn run(
             headers,
             queue,
             paused,
+            connections,
         } => {
             let directory = std::path::absolute(dir.unwrap_or_else(|| PathBuf::from(".")))?;
             let req = AddRequest {
@@ -165,6 +189,7 @@ async fn run(
                 directory,
                 filename: name,
                 paused,
+                connections,
                 target_fs: TargetFs::host(),
             };
             let added = engine.add(req).await?;

@@ -25,8 +25,10 @@ pub fn event(e: &EngineEvent) -> Value {
             id,
             downloaded,
             total,
+            connections,
         } => json!({
             "event": "progress", "id": id, "downloaded": downloaded, "total": total,
+            "connections": connections,
         }),
         EngineEvent::Reset { id, reason } => json!({
             "event": "reset", "id": id, "reason": match reason {
@@ -50,6 +52,7 @@ pub fn event(e: &EngineEvent) -> Value {
                 WarningKind::NotResumable => "not_resumable",
                 WarningKind::SizeUnverified => "size_unverified",
                 WarningKind::IdentityWeak => "identity_weak",
+                WarningKind::ServerIgnoredRange => "server_ignored_range",
             },
         }),
     }

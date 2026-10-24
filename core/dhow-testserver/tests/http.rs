@@ -446,3 +446,47 @@ fn throttle_slows_the_body() {
     );
     assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
 }
+
+#[test]
+fn throttle_first_slows_only_the_first_get() {
+    let server = TestServer::start().unwrap();
+    let path = "/blob/200000?throttle_first=1000000";
+    let started = std::time::Instant::now();
+    get(&server, path, "");
+    let first = started.elapsed();
+    let started = std::time::Instant::now();
+    assert_eq!(get(&server, path, "").body, blob::bytes(0, 0..200_000));
+    let second = started.elapsed();
+    assert!(first >= std::time::Duration::from_millis(150), "{first:?}");
+    assert!(second < first / 2, "{first:?} vs {second:?}");
+}
+
+#[test]
+fn link_is_shared_by_concurrent_connections() {
+    let server = TestServer::start().unwrap();
+    let started = std::time::Instant::now();
+    let fetches: Vec<_> = (0..2)
+        .map(|i| {
+            let addr = server.addr();
+            std::thread::spawn(move || {
+                let mut conn = TcpStream::connect(addr).unwrap();
+                let range = format!("Range: bytes={}-{}\r\n", i * 250_000, i * 250_000 + 249_999);
+                exchange(
+                    &mut conn,
+                    &format!("GET /blob/500000?link=1000000 HTTP/1.1\r\nHost: t\r\n{range}\r\n"),
+                )
+            })
+        })
+        .collect();
+    for (i, f) in fetches.into_iter().enumerate() {
+        let r = f.join().unwrap();
+        let start = i as u64 * 250_000;
+        assert_eq!(r.body, blob::bytes(0, start..start + 250_000));
+    }
+    // 500 kB through one 1 MB/s link: ~500 ms, not ~250 ms.
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(400),
+        "{elapsed:?}"
+    );
+}

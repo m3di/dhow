@@ -1,13 +1,21 @@
 //! One download, from probe to a fully committed part file: resume or
-//! reset, then fill every gap (ENGINE-SPEC §2, §5.4, §6 I3–I5, I7, §7, §9).
-//! Digest check and the final rename are the completion gate's (§8).
+//! reset, then fill every gap over one or more connections (ENGINE-SPEC §2,
+//! §4, §5.4, §6 I3–I5, I7, §7, §9). Digest check and the final rename are
+//! the completion gate's (§8).
 
+pub mod ramp;
+
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use reqwest::{Client, Url};
 use tokio::sync::watch;
 
@@ -15,15 +23,21 @@ use crate::http::Header;
 use crate::journal::{Header as JournalHeader, Journal, JournalError, format};
 use crate::probe::{self, ProbeError, ProbeInfo, ProbeOptions, Resumable};
 use crate::rangeset::RangeSet;
-use crate::transfer::{self, ConnEvent, OVERLAP, Overlap, Source, TransferConfig, TransferError};
-use crate::writer::actor::{self, Outcome, WriterGone};
-use crate::writer::{self, Writer, WriterConfig, WriterError};
+use crate::transfer::{
+    self, ConnEvent, Cursor, Finished, IdentityChange, OVERLAP, Overlap, Source, TransferConfig,
+    TransferError,
+};
+use crate::writer::actor::{self, Outcome, WriterGone, WriterHandle};
+use crate::writer::{self, ChunkId, Writer, WriterConfig, WriterError};
+use ramp::{LinkState, Ramp, RampConfig, Step};
 
 pub struct Request {
     pub url: Url,
     pub headers: Vec<Header>,
     pub part: PathBuf,
     pub sidecar: PathBuf,
+    /// Overrides `RampConfig::connections` for this download.
+    pub connections: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -31,6 +45,7 @@ pub struct DownloadConfig {
     pub probe: ProbeOptions,
     pub transfer: TransferConfig,
     pub writer: WriterConfig,
+    pub ramp: RampConfig,
     /// Restarts from zero allowed in one run before giving up, so a server
     /// whose file changes on every request can't loop forever.
     pub max_resets: u32,
@@ -42,6 +57,7 @@ impl Default for DownloadConfig {
             probe: ProbeOptions::default(),
             transfer: TransferConfig::default(),
             writer: WriterConfig::default(),
+            ramp: RampConfig::default(),
             max_resets: 3,
         }
     }
@@ -67,6 +83,11 @@ pub enum DownloadEvent {
     },
     /// Starting over from zero; everything on disk was discarded.
     Reset(ResetReason),
+    /// Connections now open.
+    Connections(u32),
+    /// §9 Protocol: the server stopped honoring `Range` mid-download; the
+    /// download continues on one connection.
+    Downgraded,
     Connection(ConnEvent),
 }
 
@@ -122,6 +143,7 @@ pub async fn download(
     req: &Request,
     client: &Client,
     config: &DownloadConfig,
+    link: &LinkState,
     on_event: &(dyn Fn(DownloadEvent) + Send + Sync),
     stop: &watch::Receiver<bool>,
 ) -> Result<Downloaded, DownloadError> {
@@ -137,7 +159,11 @@ pub async fn download(
         };
         on_event(DownloadEvent::Probed(Box::new(info.clone())));
         let (file, journal) = prepare(req, &info, force.take(), on_event)?;
-        match fetch(req, client, config, &info, file, journal, on_event, stop).await {
+        match fetch(
+            req, client, config, link, &info, file, journal, on_event, stop,
+        )
+        .await
+        {
             Ok(done) => return Ok(done),
             Err(Stop::Failed(e)) => return Err(e),
             Err(Stop::Reset(reason)) => {
@@ -256,6 +282,7 @@ async fn fetch(
     req: &Request,
     client: &Client,
     config: &DownloadConfig,
+    link: &LinkState,
     info: &ProbeInfo,
     file: File,
     journal: Journal,
@@ -269,7 +296,7 @@ async fn fetch(
         None => RangeSet::new().gaps(u64::MAX),
     };
     // Overlaps are read before the writer owns the file (I9).
-    let mut plan = Vec::with_capacity(gaps.len());
+    let mut pending = VecDeque::with_capacity(gaps.len());
     for gap in gaps {
         let overlap = match committed.ending_at(gap.start) {
             Some(prev) => {
@@ -282,7 +309,7 @@ async fn fetch(
             }
             None => None,
         };
-        plan.push((gap, overlap));
+        pending.push_back((gap, overlap));
     }
 
     let validator = transfer::validator(info.etag.as_deref(), info.last_modified.as_deref());
@@ -294,47 +321,155 @@ async fn fetch(
         resumable: info.resumable,
         validator: validator.clone(),
     };
+    let can_range = info.resumable != Resumable::No && total.is_some();
+    let rc = &config.ramp;
+    let limit = ramp::connection_limit(total, can_range, req.connections, rc, link);
     let (handle, done) = actor::spawn(Writer::new(file, journal, config.writer))?;
-    let conn_event = |e: ConnEvent| on_event(DownloadEvent::Connection(e));
-    let mut content_length_seen = true;
-    for (id, (range, overlap)) in (0u32..).zip(plan) {
-        if handle.define(id, range.clone()).await.is_err() {
-            return Err(writer_failure(done).await.into());
+
+    // Shared with every connection's events.
+    let received = AtomicU64::new(0);
+    let backoff_until = Mutex::new(None::<Instant>);
+    let single = AtomicBool::new(limit <= 1);
+    let conn_event = |e: ConnEvent| {
+        match &e {
+            ConnEvent::Received(n) => {
+                received.fetch_add(*n, Ordering::Relaxed);
+            }
+            ConnEvent::Retrying { delay, .. } => {
+                *backoff_until.lock().unwrap() = Some(Instant::now() + *delay);
+            }
+            // §2.3: `Unknown` turned out not to range; stay at one.
+            ConnEvent::NotResumable => single.store(true, Ordering::Relaxed),
         }
-        let result = tokio::select! {
-            biased;
-            _ = stopped(stop.clone()) => Err(None),
-            r = transfer::run_connection(
-                &src,
-                id,
-                range,
-                overlap,
-                &handle,
-                &config.transfer,
-                &conn_event,
-            ) => r.map_err(Some),
-        };
-        match result {
-            Ok(finished) => content_length_seen = finished.content_length_seen,
-            Err(e) => {
-                // Let the writer commit what arrived, and stop, before
-                // anything touches the files again.
-                drop(handle);
-                let writer_result = done.await;
-                return Err(match (e, writer_result) {
-                    (_, Ok(Err(we))) => Stop::Failed(we.into()),
-                    (None, _) => Stop::Failed(DownloadError::Stopped),
-                    (Some(TransferError::IdentityChanged(change)), _) => {
-                        tracing::warn!(?change, "download: identity changed");
-                        Stop::Reset(ResetReason::ServerFileChanged)
-                    }
-                    (Some(TransferError::NeedsRestart), _) => {
-                        Stop::Reset(ResetReason::CannotResume)
-                    }
-                    (Some(e), _) => Stop::Failed(e.into()),
-                });
+        on_event(DownloadEvent::Connection(e));
+    };
+
+    let mut plan = Plan {
+        pending,
+        live: HashMap::new(),
+        next_id: 0,
+    };
+    let mut running = FuturesUnordered::new();
+    let mut ramp = Ramp::new(Instant::now(), rc);
+    ramp.done = limit <= 1;
+    let mut connections = 0;
+    let mut content_length_seen = true;
+    let outcome: Result<(), Option<TransferError>> = 'run: loop {
+        let open = running.len() as u32;
+        if open != connections {
+            connections = open;
+            on_event(DownloadEvent::Connections(open));
+        }
+        if running.is_empty() {
+            match plan.next_work(&handle, None, rc).await {
+                Ok(Some(work)) => {
+                    running.push(connection(
+                        &src,
+                        work,
+                        &handle,
+                        &config.transfer,
+                        &conn_event,
+                    ));
+                    continue;
+                }
+                Ok(None) => break Ok(()),
+                Err(WriterGone) => break Err(None),
             }
         }
+        let single_now = single.load(Ordering::Relaxed);
+        let can_ramp = !ramp.done && !single_now && open < limit;
+        if let Some(until) = backoff_until.lock().unwrap().take() {
+            ramp.pause_until(until);
+        }
+        let next_check = ramp.next_check;
+        tokio::select! {
+            biased;
+            _ = stopped(stop.clone()) => break 'run Err(None),
+            Some((id, result)) = running.next() => {
+                let cursor = plan.live.remove(&id).expect("live chunk");
+                match result {
+                    Ok(finished) => {
+                        content_length_seen = finished.content_length_seen;
+                        // Refill the slot: unstarted ranges first, then
+                        // steal from the slowest (§4.3). One connection at
+                        // a time once downgraded.
+                        if !single.load(Ordering::Relaxed) || running.is_empty() {
+                            match plan.next_work(&handle, cursor.rate(), rc).await {
+                                Ok(Some(work)) => running.push(connection(
+                                    &src, work, &handle, &config.transfer, &conn_event,
+                                )),
+                                Ok(None) => {}
+                                Err(WriterGone) => break 'run Err(None),
+                            }
+                        }
+                    }
+                    Err(TransferError::IdentityChanged(IdentityChange::RangeIgnored))
+                        if !running.is_empty() =>
+                    {
+                        // §9 Protocol: the server honored ranges and now
+                        // ignores them. Give the range back to the chunk it
+                        // was split from, whose response still covers it.
+                        match plan.merge_back(&handle, id, &cursor).await {
+                            Ok(true) => {
+                                single.store(true, Ordering::Relaxed);
+                                ramp.done = true;
+                                tracing::warn!("download: server ignores Range now; one connection");
+                                on_event(DownloadEvent::Downgraded);
+                            }
+                            Ok(false) => {
+                                break 'run Err(Some(TransferError::IdentityChanged(
+                                    IdentityChange::RangeIgnored,
+                                )));
+                            }
+                            Err(WriterGone) => break 'run Err(None),
+                        }
+                    }
+                    Err(e) => break 'run Err(Some(e)),
+                }
+            }
+            _ = tokio::time::sleep_until(next_check.into()), if can_ramp => {
+                let now = Instant::now();
+                match ramp.check(now, received.load(Ordering::Relaxed), rc) {
+                    Step::Wait => {}
+                    Step::Open => {
+                        let peers = plan.average_rate();
+                        match plan.next_work(&handle, peers, rc).await {
+                            Ok(Some(work)) => running.push(connection(
+                                &src, work, &handle, &config.transfer, &conn_event,
+                            )),
+                            // Nothing left worth a new connection.
+                            Ok(None) => ramp.done = true,
+                            Err(WriterGone) => break 'run Err(None),
+                        }
+                    }
+                    Step::Saturated => {
+                        tracing::info!(connections = open, "download: link saturated");
+                        link.record_saturation(open, rc.saturation_ttl);
+                    }
+                }
+            }
+        }
+    };
+    // Connections borrow the writer handle; they go first.
+    drop(running);
+    if connections > 0 {
+        on_event(DownloadEvent::Connections(0));
+    }
+    if let Err(e) = outcome {
+        // Let the writer commit what arrived, and stop, before anything
+        // touches the files again.
+        drop(handle);
+        let writer_result = done.await;
+        return Err(match (e, writer_result) {
+            (_, Ok(Err(we))) => Stop::Failed(we.into()),
+            (None, _) => Stop::Failed(DownloadError::Stopped),
+            (Some(TransferError::IdentityChanged(change)), _) => {
+                tracing::warn!(?change, "download: identity changed");
+                Stop::Reset(ResetReason::ServerFileChanged)
+            }
+            (Some(TransferError::NeedsRestart), _) => Stop::Reset(ResetReason::CannotResume),
+            (Some(e), _) => Stop::Failed(e.into()),
+        });
     }
     let committed = match handle.finish().await {
         Ok(c) => c,
@@ -353,6 +488,134 @@ async fn fetch(
         size_unverified: total.is_none() && !content_length_seen,
         identity_weak: validator.is_none(),
     })
+}
+
+/// One unit of work for a connection.
+struct Work {
+    id: ChunkId,
+    cursor: Arc<Cursor>,
+    overlap: Option<Overlap>,
+}
+
+/// What is left to fetch and who is fetching it.
+struct Plan {
+    /// Ranges nobody has started (resume gaps), in order.
+    pending: VecDeque<(std::ops::Range<u64>, Option<Overlap>)>,
+    live: HashMap<ChunkId, Arc<Cursor>>,
+    next_id: ChunkId,
+}
+
+impl Plan {
+    /// An unstarted range if any, else a piece stolen from the connection
+    /// that would finish last (§4.3). The split is journaled before this
+    /// returns, so before the new connection sends anything.
+    async fn next_work(
+        &mut self,
+        writer: &WriterHandle,
+        new_rate: Option<f64>,
+        config: &RampConfig,
+    ) -> Result<Option<Work>, WriterGone> {
+        if let Some((range, overlap)) = self.pending.pop_front() {
+            let id = self.take_id();
+            writer.define(id, range.clone()).await?;
+            return Ok(Some(self.start(id, range, overlap)));
+        }
+        // Slowest to finish first: remaining / rate, unknown rates last.
+        let mut owners: Vec<(ChunkId, Arc<Cursor>)> =
+            self.live.iter().map(|(id, c)| (*id, c.clone())).collect();
+        owners.sort_by(|a, b| eta(&b.1).total_cmp(&eta(&a.1)));
+        for (owner, cursor) in owners {
+            let Some(at) =
+                ramp::split_point(cursor.pos(), cursor.end(), cursor.rate(), new_rate, config)
+            else {
+                continue;
+            };
+            let id = self.take_id();
+            if let Some(tail) = writer.split(owner, id, at).await? {
+                cursor.set_end(at);
+                return Ok(Some(self.start(id, tail, None)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Undoes the split that created `id` (§9 Protocol downgrade): the
+    /// chunk ending at its start takes it back, if that connection hasn't
+    /// got there yet.
+    async fn merge_back(
+        &mut self,
+        writer: &WriterHandle,
+        id: ChunkId,
+        cursor: &Cursor,
+    ) -> Result<bool, WriterGone> {
+        let predecessor = self
+            .live
+            .iter()
+            .find(|(_, c)| c.end() == cursor.start() && c.pos() < cursor.start())
+            .map(|(pid, c)| (*pid, c.clone()));
+        let Some((pid, pc)) = predecessor else {
+            return Ok(false);
+        };
+        if !writer.merge(pid, id).await? {
+            return Ok(false);
+        }
+        pc.set_end(cursor.end());
+        Ok(true)
+    }
+
+    fn take_id(&mut self) -> ChunkId {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    fn start(
+        &mut self,
+        id: ChunkId,
+        range: std::ops::Range<u64>,
+        overlap: Option<Overlap>,
+    ) -> Work {
+        let cursor = Arc::new(Cursor::new(range));
+        self.live.insert(id, cursor.clone());
+        Work {
+            id,
+            cursor,
+            overlap,
+        }
+    }
+
+    /// Typical speed of the open connections: the guess for a new one.
+    fn average_rate(&self) -> Option<f64> {
+        let rates: Vec<f64> = self.live.values().filter_map(|c| c.rate()).collect();
+        (!rates.is_empty()).then(|| rates.iter().sum::<f64>() / rates.len() as f64)
+    }
+}
+
+fn eta(c: &Cursor) -> f64 {
+    match c.rate() {
+        Some(r) => c.remaining() as f64 / r,
+        None => 0.0,
+    }
+}
+
+async fn connection(
+    src: &Source,
+    work: Work,
+    writer: &WriterHandle,
+    config: &TransferConfig,
+    on_event: &(dyn Fn(ConnEvent) + Send + Sync),
+) -> (ChunkId, Result<Finished, TransferError>) {
+    let result = transfer::run_connection(
+        src,
+        work.id,
+        &work.cursor,
+        work.overlap,
+        writer,
+        config,
+        on_event,
+    )
+    .await;
+    (work.id, result)
 }
 
 async fn writer_failure(

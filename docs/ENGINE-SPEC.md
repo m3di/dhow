@@ -99,21 +99,24 @@ n = min(
 n = 1 if resumable == No or total_size == None
 ```
 
+Also capped by a recent **link saturation** (§4.4): if this process saw throughput stop growing at `k` connections in the last `settings.saturation_ttl` (default 60 s), `n <= k`.
+
 ### 4.2 Initial plan
 
-Split `[0, total_size)` into `n` contiguous chunks of equal size (last takes the remainder). Each chunk is one range in the sidecar with state `pending`.
+There is no up-front split. A download starts with its unfinished ranges as *pending* work: the whole file for a fresh download, the committed set's gaps on resume (each with its I5 overlap). The first connection takes the first pending range. Every further connection, whether opened by ramp-up (§4.4) or refilling a slot whose chunk just finished, takes the next pending range if any, else **steals** (§4.3). An equal up-front plan would leave chunks waiting for connections that throughput-aware ramp-up may never open.
 
 ### 4.3 Dynamic rebalancing (work stealing)
 
-When a connection finishes its chunk and the download is not complete:
-1. Find the active chunk with the largest *remaining* bytes `r`.
-2. If `r >= 2 * settings.min_chunk_size`, split it: the owner keeps `[pos, pos + r/2)`, the idle connection takes `[pos + r/2, end)`.
-3. Splitting MUST be recorded in the sidecar (one range becomes two) **before** the new connection sends its request.
-4. The owner learns of the split via a shared atomic `end` bound; it MUST stop writing at the new `end` even if the server keeps sending (it aborts the response).
+When a connection needs work and nothing is pending:
+1. Among the active chunks, consider first the one whose owner would finish **last** (remaining bytes ÷ the owner's measured speed).
+2. With both speeds known (the owner's, and the idle connection's own or else the average of the open connections), split so both parts finish together: the owner keeps `remaining · v_owner / (v_owner + v_new)` (at least one byte, it is mid-response) and the new connection takes the rest. Split only if that finishes the work at least `settings.min_steal_gain` (default 1 s) sooner than leaving it to the owner, however few bytes move: a crawling owner's last kilobytes are exactly what must be taken (T-4.3). Without speed estimates, halve, and only chunks of at least `2 · min_chunk_size`.
+3. Splitting MUST be recorded in the sidecar (`range_split` + `range_define`) **before** the new connection sends its request. The writer performs the split, so the split point is checked against what it has actually written.
+4. The owner learns of the split via a shared atomic `end` bound, re-read for every buffer; it MUST stop writing at the new `end` even if the server keeps sending (it aborts the response). Bytes it already handed to the writer past the new end are dropped by the writer; they belong to the new chunk.
+5. A chunk that ends at `total_size` still reads to EOF, so bytes past the file are seen (I6).
 
 ### 4.4 Connection ramp-up
 
-A download never opens all `n` connections at once. It opens 1, and opens one more each time 256 KiB has arrived without error, until `n`. On any connection error, ramp-up pauses for the retry backoff period. This is the mechanism that makes politeness (§10) smooth rather than bursty.
+A download never opens all `n` connections at once. It opens one; then, after each new connection, it lets it settle for a third of `settings.rampup_window` (default 3 s) and measures aggregate throughput for one window. It opens connection `k + 1` only if data flowed in that window and throughput with `k` connections beat the measurement with `k − 1` by at least `settings.rampup_min_gain` (default 10 %). Otherwise ramp-up stops at `k`, and "the link saturates at `k`" is recorded process-wide for `settings.saturation_ttl` (60 s) so other downloads start from that ceiling (§4.1). On any connection error, ramp-up pauses for the retry backoff period. This is what keeps a download from crowding the user's own link (§10.A) and makes politeness smooth rather than bursty.
 
 ---
 
@@ -266,7 +269,7 @@ Steps 5–7 are the only non-idempotent moment. If the process dies between 5 an
 | Transient | connection reset, timeout, 408, 429, 5xx, DNS failure, body cut short | Retry the *connection* with exponential backoff 1s·2ⁿ⁻¹ after the n-th failure, jitter ±25%, cap 60s. `settings.max_retries` (default 10) is the number of consecutive failed *attempts* per connection that gives up (the 10th failure fails, T-9a); an attempt that wrote at least one byte resets the count, so a server that keeps cutting responses short still finishes (T-I7). Download stays `Active` (shows "reconnecting"). After the cap: `Failed(Transient)`; `Retry` command restarts from the journal. |
 | Identity | 200 to a Range (see §7), size mismatch, `Content-Range` not what was asked, 416, overlap mismatch | Reset per I4. Not a retry; a restart. |
 | Permanent | any other 4xx (401/403/404/410 …), TLS failure, too many redirects, `NoSpace`, `DigestMismatch`, `ServerSentExtraData` | `Failed(...)` immediately. Journal kept; `Retry` re-probes first (links may be refreshed). |
-| Protocol | server ignores `Range` on a *non-first* request after having honored it | Downgrade download to single connection, keep committed bytes, continue. Warn. |
+| Protocol | server ignores `Range` on a *non-first* request after having honored it | Downgrade download to single connection, keep committed bytes, continue. Warn. The refused range is merged back into the chunk it was split from, whose earlier response still covers it; if that connection already passed the split point, there is nothing to continue from and the download resets. |
 
 `429` and `503` honor `Retry-After` if present (cap 5 min).
 
@@ -274,17 +277,15 @@ Steps 5–7 are the only non-idempotent moment. If the process dies between 5 an
 
 ## 10. Politeness scheduler
 
-The scheduler decides which downloads are `Active` and how many connections each may hold.
+The scheduler decides which downloads are `Active` and how many connections each may hold. "Politeness" has two audiences, and the user's own network comes first: too many connections on a saturated link or a small NAT router make every download crawl. §10.A protects the local network, §10.B the remote server.
 
-### 10.1 Global connection budget
+### 10.A Local network
+
+#### 10.1 Global connection budget
 
 `settings.global_connections` (default 16). The sum of all active connections across all downloads never exceeds it.
 
-### 10.2 Per-host cap
-
-`settings.per_host_connections` (default 4). Keyed by `effective_url` host (eTLD+1 is *not* used; `cdn1.x.com` and `cdn2.x.com` are different hosts, which is usually what the server operator intends).
-
-### 10.3 Allocation rule: oldest first, newcomers ramp
+#### 10.3 Allocation rule: oldest first, newcomers ramp
 
 Every time budget changes (download added/finished/paused, connection closed, setting changed):
 
@@ -294,11 +295,25 @@ Every time budget changes (download added/finished/paused, connection closed, se
 
 Effect: start 10 downloads on a 16-connection budget → the first one ramps to 8, the next to 4–8 as space allows, the rest crawl at 1 connection each, and as the oldest finish the rest ramp up in order. This is the behaviour requested in the brief.
 
-### 10.4 Queue concurrency
+#### 10.6 Adaptive ramp-up and headroom
+
+Ramp-up is throughput-aware (§4.4): a download stops adding connections where the link stops getting faster, and that ceiling is shared for a minute.
+
+`settings.headroom_percent` (default 0) keeps part of the link free for everything else on it: the global speed limit (§12) becomes `(1 − headroom) × observed peak throughput`, recomputed whenever the observed peak rises. With 0 there is no implicit limit. (Implemented with the global limiter, M2.5.)
+
+### 10.B Remote server
+
+#### 10.2 Per-host cap
+
+`settings.per_host_connections` (default 4). Keyed by `effective_url` host (eTLD+1 is *not* used; `cdn1.x.com` and `cdn2.x.com` are different hosts, which is usually what the server operator intends).
+
+`429` and `503` with `Retry-After` are honored per connection (§9).
+
+#### 10.4 Queue concurrency
 
 Independently, each queue has `max_concurrent` (default 3). A download in a queue that is at capacity is `Waiting(QueueConcurrency)` regardless of connection budget. Queue order is user-defined (`Reorder`), default FIFO by `created_at`.
 
-### 10.5 Fairness within a round
+#### 10.5 Fairness within a round
 
 Per-host cap applies before global; a single slow host cannot starve downloads from other hosts because the walk continues past a host-capped download.
 
@@ -384,6 +399,7 @@ All run against `dhow-testserver` through `dhow-cli`. Each maps to a section abo
 | T-9a | 10 consecutive resets on one connection | `Failed(Transient)`; `Retry` completes |
 | T-9b | server ignores `Range` after honoring it once | downgrade to 1 connection, completes, `Warning` emitted |
 | T-10 | 10 downloads, budget 16, per-host 4 | oldest reaches 4 first; connection counts over time match the ramp model |
+| T-10b | `n = 8`, each connection 500 kB/s, link saturates at 2 MB/s (4 connections) | ramp-up stops at 4 ± 1; the next download starts at that ceiling |
 | T-11 | schedule window ends during transfer (`StartAndStopOutside`) | paused with committed journal; resumed at next start |
 | T-12 | global limit 100 KiB/s, 3 downloads | aggregate within ±10% over 10 s |
 | T-13 | add `A.part1.rar`, `A.part2.rar`, `B.rar` | one auto group of two; `B` ungrouped |

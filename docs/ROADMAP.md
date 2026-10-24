@@ -26,7 +26,7 @@ Exit: T-I1 through T-I10 (except T-I6, which needs a chunk that ends before the 
 
 ## M2 — Multi-connection & scheduling
 
-- M2.1 Chunk planning, ramp-up, work stealing (`§4`).
+- M2.1 Chunk planning, ramp-up, work stealing (`§4`), throughput-aware ramp-up and §10.A/§10.B split (issue #8).
 - M2.2 Global budget, per-host cap, oldest-first allocation (`§10`).
 - M2.3 Queues, ordering, concurrency (`§10.4, §11`).
 - M2.4 Schedules with a single sleep edge (`§11`, `ARCHITECTURE §7`).
@@ -34,7 +34,7 @@ Exit: T-I1 through T-I10 (except T-I6, which needs a chunk that ends before the 
 - M2.6 Speed sampling, EMA, ETA (`§14`).
 - M2.7 Idle guarantee test (T-idle).
 
-Exit: T-I6, T-4.3, T-9b, T-10, T-11, T-12, T-idle pass. 10 parallel downloads from `dhow-testserver` complete bit-exact with the ramp behaviour visible in CLI output.
+Exit: T-I6, T-4.3, T-9b, T-10, T-10b, T-11, T-12, T-idle pass. 10 parallel downloads from `dhow-testserver` complete bit-exact with the ramp behaviour visible in CLI output.
 
 ## M3 — Organisation & platform adapter
 

@@ -35,6 +35,17 @@ enum Msg {
     Commit {
         reply: oneshot::Sender<RangeSet>,
     },
+    Split {
+        owner: ChunkId,
+        new: ChunkId,
+        at: u64,
+        reply: oneshot::Sender<Option<Range<u64>>>,
+    },
+    Merge {
+        into: ChunkId,
+        from: ChunkId,
+        reply: oneshot::Sender<bool>,
+    },
     Finish {
         reply: oneshot::Sender<RangeSet>,
     },
@@ -85,6 +96,31 @@ impl WriterHandle {
     pub async fn commit(&self) -> Result<RangeSet, WriterGone> {
         let (reply, rx) = oneshot::channel();
         self.send(Msg::Commit { reply }).await?;
+        rx.await.map_err(|_| WriterGone)
+    }
+
+    /// See [`Writer::split`]. Resolves once the split is journaled.
+    pub async fn split(
+        &self,
+        owner: ChunkId,
+        new: ChunkId,
+        at: u64,
+    ) -> Result<Option<Range<u64>>, WriterGone> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Msg::Split {
+            owner,
+            new,
+            at,
+            reply,
+        })
+        .await?;
+        rx.await.map_err(|_| WriterGone)
+    }
+
+    /// See [`Writer::merge`].
+    pub async fn merge(&self, into: ChunkId, from: ChunkId) -> Result<bool, WriterGone> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Msg::Merge { into, from, reply }).await?;
         rx.await.map_err(|_| WriterGone)
     }
 
@@ -154,6 +190,17 @@ fn run(mut w: Writer, rx: flume::Receiver<Msg>) -> Result<Outcome, WriterError> 
                 offset,
                 data,
             } => w.write(chunk, offset, &data)?,
+            Msg::Split {
+                owner,
+                new,
+                at,
+                reply,
+            } => {
+                let _ = reply.send(w.split(owner, new, at)?);
+            }
+            Msg::Merge { into, from, reply } => {
+                let _ = reply.send(w.merge(into, from)?);
+            }
             Msg::Commit { reply } => {
                 w.commit()?;
                 let _ = reply.send(w.committed().clone());

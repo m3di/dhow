@@ -44,13 +44,23 @@ pub fn cli_path() -> PathBuf {
 /// have committed state to resume from.
 pub struct Sandbox {
     dir: tempfile::TempDir,
+    env: Vec<(String, String)>,
 }
 
 impl Sandbox {
     pub fn new() -> Self {
+        Self::with_env(&[])
+    }
+
+    /// With extra environment for every `dhow` it runs.
+    pub fn with_env(env: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().expect("create sandbox");
         std::fs::create_dir(dir.path().join("dl")).expect("create dl/");
-        Self { dir }
+        let env = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        Self { dir, env }
     }
 
     pub fn path(&self) -> &Path {
@@ -94,6 +104,7 @@ impl Sandbox {
             .env("DHOW_RETRY_BASE_MS", "1")
             // Commit often, so an interrupted run has something on disk.
             .env("DHOW_COMMIT_INTERVAL_MS", "100")
+            .envs(self.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -214,9 +225,19 @@ impl Running {
     }
 
     /// SIGKILL on Unix, TerminateProcess on Windows: no chance to clean up.
-    pub fn kill9(mut self) {
+    /// Returns every event it printed before dying.
+    pub fn kill9(mut self) -> Vec<Value> {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let mut seen = std::mem::take(&mut self.seen);
+        if let Some(reader) = self.stdout.take() {
+            for line in reader.join().unwrap_or_default().lines() {
+                if let Ok(v) = serde_json::from_str(line) {
+                    seen.push(v);
+                }
+            }
+        }
+        seen
     }
 
     /// Waits for exit, killing after [`CLI_TIMEOUT`].

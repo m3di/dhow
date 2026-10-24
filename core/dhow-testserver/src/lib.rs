@@ -24,6 +24,8 @@
 //! | `change_after=<n>` | after `n` `GET`s of this URL it is a different file: new content and `ETag` |
 //! | `lie_after=<n>` | after `n` `GET`s the content changes but the `ETag` doesn't (a lying server) |
 //! | `throttle=<bytes/s>` | send the body at about this rate (in 10 ms slices) |
+//! | `throttle_first=<bytes/s>` | the first `GET` of this URL at this rate instead (one slow connection) |
+//! | `link=<bytes/s>` | all bodies of this URL share one link of this capacity (saturates with enough connections) |
 //! | `validators=none\|weak` | no `ETag`/`Last-Modified` at all, or only a weak `ETag` |
 //! | `change_each=1` | every `GET` serves a different file (`HEAD` shows the next one) |
 //! | `ignore_range_after=<n>` | honor `Range` on the first `n` `GET`s of this URL, then ignore it |
@@ -68,8 +70,16 @@ impl Seen {
 }
 
 type Log = Arc<Mutex<Vec<Seen>>>;
-/// `GET`s seen per exact target, for `fail=`.
-type Counts = Arc<Mutex<HashMap<String, u32>>>;
+/// Per-server state shared by every connection: request counts per exact
+/// target (for `fail=` and friends) and `link=` schedules.
+#[derive(Default)]
+struct Shared {
+    counts: Mutex<HashMap<String, u32>>,
+    /// When the shared link is next free, per target.
+    links: Mutex<HashMap<String, std::time::Instant>>,
+}
+
+type Counts = Arc<Shared>;
 
 /// A server running on its own thread, bound to an ephemeral loopback port.
 /// Shuts down when dropped.
@@ -225,6 +235,8 @@ struct Knobs {
     change_each: bool,
     validators: Validators,
     throttle: Option<u64>,
+    throttle_first: Option<u64>,
+    link: Option<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -257,6 +269,8 @@ fn knobs(query: &[(String, String)]) -> Option<Knobs> {
         change_each: false,
         validators: Validators::Strong,
         throttle: None,
+        throttle_first: None,
+        link: None,
     };
     for (name, value) in query {
         match (name.as_str(), value.as_str()) {
@@ -291,6 +305,10 @@ fn knobs(query: &[(String, String)]) -> Option<Knobs> {
             ("validators", "weak") => k.validators = Validators::Weak,
             ("validators", "none") => k.validators = Validators::None,
             ("throttle", v) => k.throttle = Some(v.parse().ok().filter(|&r: &u64| r > 0)?),
+            ("throttle_first", v) => {
+                k.throttle_first = Some(v.parse().ok().filter(|&r: &u64| r > 0)?)
+            }
+            ("link", v) => k.link = Some(v.parse().ok().filter(|&r: &u64| r > 0)?),
             _ => return None,
         }
     }
@@ -329,7 +347,7 @@ async fn respond(stream: &mut TcpStream, req: &Request, counts: &Counts) -> io::
     }
     if !is_head && k.fail > 0 {
         let seen = {
-            let mut counts = counts.lock().unwrap();
+            let mut counts = counts.counts.lock().unwrap();
             let n = counts.entry(req.target.clone()).or_default();
             *n += 1;
             *n
@@ -349,7 +367,7 @@ async fn respond(stream: &mut TcpStream, req: &Request, counts: &Counts) -> io::
 
     // GETs of this URL before this request; HEAD looks without counting.
     let gets_before = {
-        let mut counts = counts.lock().unwrap();
+        let mut counts = counts.counts.lock().unwrap();
         let n = counts.entry(format!("gets:{}", req.target)).or_default();
         let before = *n;
         if !is_head {
@@ -372,7 +390,7 @@ async fn respond(stream: &mut TcpStream, req: &Request, counts: &Counts) -> io::
     let etag = format!("\"{seed:x}-{size:x}\"");
     let range_allowed = match k.ignore_range_after {
         Some(n) if !is_head => {
-            let mut counts = counts.lock().unwrap();
+            let mut counts = counts.counts.lock().unwrap();
             let seen = counts
                 .entry(format!("ignore_range_after:{}", req.target))
                 .or_default();
@@ -459,18 +477,40 @@ async fn respond(stream: &mut TcpStream, req: &Request, counts: &Counts) -> io::
     let stop = cut.map_or(body.end, |n| body.end.min(body.start + n));
     let mut buf = vec![0; BODY_BUF];
     let mut pos = body.start;
-    // Throttled: one slice per 10 ms.
-    let slice = k
-        .throttle
-        .map_or(BODY_BUF as u64, |r| (r / 100).clamp(1, BODY_BUF as u64));
+    // Throttled: 10 ms slices on a schedule. A shared link adds a second
+    // schedule all connections of this URL wait on.
+    let throttle = match k.throttle_first {
+        Some(r) if gets_before == 0 => Some(r),
+        _ => k.throttle,
+    };
+    let slice = match (throttle, k.link) {
+        (Some(r), _) | (None, Some(r)) => (r / 100).clamp(1, BODY_BUF as u64),
+        (None, None) => BODY_BUF as u64,
+    };
+    let paced_from = std::time::Instant::now();
     while pos < stop {
         let n = (stop - pos).min(slice) as usize;
+        if let Some(rate) = k.link {
+            let at = {
+                let mut links = counts.links.lock().unwrap();
+                let now = std::time::Instant::now();
+                let next = links.entry(req.target.clone()).or_insert(now);
+                let at = (*next).max(now);
+                *next = at + std::time::Duration::from_secs_f64(n as f64 / rate as f64);
+                at
+            };
+            tokio::time::sleep_until(at.into()).await;
+        }
         blob::fill(content_seed, pos, &mut buf[..n]);
         stream.write_all(&buf[..n]).await?;
         pos += n as u64;
-        if k.throttle.is_some() {
+        // Paced by schedule, not by sleeping after each write, so the
+        // rate holds however long the writes take.
+        if let Some(rate) = throttle {
             stream.flush().await?;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let due = paced_from
+                + std::time::Duration::from_secs_f64((pos - body.start) as f64 / rate as f64);
+            tokio::time::sleep_until(due.into()).await;
         }
     }
     if stop < body.end {
