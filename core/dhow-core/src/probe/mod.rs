@@ -10,6 +10,7 @@ use reqwest::header::{self, HeaderMap};
 use reqwest::{Client, Method, StatusCode, Url};
 
 use crate::http::{self, Header, redact};
+use crate::naming::{self, TargetFs};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Resumable {
@@ -31,6 +32,9 @@ pub struct ProbeInfo {
     pub content_type: Option<String>,
     pub content_disposition: Option<String>,
     pub digest: Option<Digest>,
+    /// [`naming::base_name`] for the host filesystem. Collisions are resolved
+    /// at `Add` (and again at rename) against the real target directory.
+    pub suggested_name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -101,13 +105,15 @@ pub async fn probe(
     });
     if head_settles || !opts.range_get {
         return match head {
-            Some(h) => Ok(info(Some(&h), None)),
+            Some(h) => Ok(info(url, Some(&h), None)),
             None => Err(head_err.unwrap_or(ProbeError::Network)),
         };
     }
 
     match send(client, Method::GET, url, headers).await {
-        Ok(g) if matches!(g.status.as_u16(), 200 | 206 | 416) => Ok(info(head.as_ref(), Some(&g))),
+        Ok(g) if matches!(g.status.as_u16(), 200 | 206 | 416) => {
+            Ok(info(url, head.as_ref(), Some(&g)))
+        }
         result => {
             let err = match result {
                 Ok(g) => ProbeError::Status(g.status.as_u16()),
@@ -115,7 +121,7 @@ pub async fn probe(
             };
             tracing::debug!(url = %target, error = %err, "probe: range GET failed");
             match head {
-                Some(h) => Ok(info(Some(&h), None)),
+                Some(h) => Ok(info(url, Some(&h), None)),
                 None => Err(err),
             }
         }
@@ -158,7 +164,7 @@ fn classify(e: reqwest::Error) -> ProbeError {
 
 /// Combines what `HEAD` and the 0-0 `GET` said (ENGINE-SPEC §2.2, §2.3). The
 /// `GET`, when present, is the more direct evidence and wins.
-fn info(head: Option<&Seen>, get: Option<&Seen>) -> ProbeInfo {
+fn info(original_url: &Url, head: Option<&Seen>, get: Option<&Seen>) -> ProbeInfo {
     let last = get.or(head).expect("at least one response");
     let head_length = head.and_then(|h| content_length(&h.headers));
     let head_ranges = head.and_then(|h| accept_ranges(&h.headers));
@@ -192,12 +198,13 @@ fn info(head: Option<&Seen>, get: Option<&Seen>) -> ProbeInfo {
         }
     };
 
+    // Raw bytes, not `to_str()`: servers routinely send UTF-8 (or Latin-1)
+    // filenames in Content-Disposition.
     let text = |name: header::HeaderName| {
         let read = |s: &Seen| {
             s.headers
                 .get(&name)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned)
+                .map(|v| naming::decode_text(v.as_bytes().to_vec()))
         };
         get.and_then(read).or_else(|| head.and_then(read))
     };
@@ -209,6 +216,15 @@ fn info(head: Option<&Seen>, get: Option<&Seen>) -> ProbeInfo {
     .flatten()
     .max_by_key(|d| d.algorithm);
 
+    let content_type = text(header::CONTENT_TYPE);
+    let content_disposition = text(header::CONTENT_DISPOSITION);
+    let suggested_name = naming::base_name(
+        content_disposition.as_deref(),
+        content_type.as_deref(),
+        &last.url,
+        original_url,
+        TargetFs::host(),
+    );
     ProbeInfo {
         effective_url: last.url.clone(),
         status: last.status.as_u16(),
@@ -216,9 +232,10 @@ fn info(head: Option<&Seen>, get: Option<&Seen>) -> ProbeInfo {
         resumable,
         etag: text(header::ETAG),
         last_modified: text(header::LAST_MODIFIED),
-        content_type: text(header::CONTENT_TYPE),
-        content_disposition: text(header::CONTENT_DISPOSITION),
+        content_type,
+        content_disposition,
         digest,
+        suggested_name,
     }
 }
 

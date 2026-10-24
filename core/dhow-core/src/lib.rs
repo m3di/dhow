@@ -2,6 +2,7 @@
 
 pub mod http;
 pub mod logging;
+pub mod naming;
 pub mod probe;
 pub mod storage;
 

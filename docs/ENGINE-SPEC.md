@@ -62,19 +62,23 @@ If both requests fail, `Add` MAY still proceed in **blind mode**: single connect
 
 ## 3. Naming
 
-Compute `suggested_name` in this order; stop at the first non-empty result:
+Compute `suggested_name` in this order; stop at the first candidate that is non-empty **after sanitizing**:
 
-1. `Content-Disposition` `filename*` parameter (RFC 8187: charset, percent-decoding; only `UTF-8` and `ISO-8859-1` accepted).
-2. `Content-Disposition` `filename` parameter (RFC 6266; strip quotes and paths).
-3. Last non-empty path segment of `effective_url`, percent-decoded.
+1. `Content-Disposition` `filename*` parameter (RFC 8187: charset, percent-decoding; only `UTF-8` and `ISO-8859-1` accepted; a malformed value is skipped).
+2. `Content-Disposition` `filename` parameter (RFC 6266; strip quotes and paths). In quoted strings a backslash escapes only `"` and `\`, so unescaped Windows paths (`"C:\dir\f.exe"`) are still path-stripped. Header bytes are decoded as UTF-8, else ISO-8859-1.
+3. Last non-empty path segment of `effective_url`, percent-decoded (a stray `%` is literal; bytes that aren't UTF-8 are read as ISO-8859-1).
 4. Last non-empty path segment of the original URL, percent-decoded.
 5. `hostname` + `-download`.
 
 Then:
 
-- If the result has no extension and `Content-Type` maps to a known extension (`mime_guess`, with a curated override table for `application/octet-stream` → none), append it.
-- Sanitize for the **target OS** (the shell passes `TargetFs`): strip control chars and `/`; on Windows additionally `\ : * ? " < > |`, trailing dots/spaces, and reserved names (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`). Truncate to 255 bytes *of the stem*, keeping the extension.
-- On collision in `directory`: `name.ext` → `name (2).ext` → `name (3).ext`. Collision check includes existing `.part` files.
+- An **extension** is 1–10 ASCII alphanumerics after the last dot of a non-empty stem, or one of `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.tar.zst` (treated as one).
+- If the result has no extension and `Content-Type` maps to a known extension, append it. A curated table (`naming/mime.rs`) wins; `mime_guess` is used only when it knows exactly one extension (its first-of-many is alphabetical: `image/jpeg` → `jfif`). Opaque types (`application/octet-stream` and friends) map to none.
+- Sanitize for the **target filesystem** (the shell passes `TargetFs`): strip control chars and `/`, surrounding whitespace and leading dots (a download never becomes a hidden file); on Windows (also FAT/exFAT/SMB volumes) additionally `\ : * ? " < > |` and trailing dots/spaces, and prefix reserved device names with `_` (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`, case-insensitive, with any extension: `con.txt` → `_con.txt`).
+- Truncate the stem (at a char boundary, keeping the extension) so the **whole name, including any collision suffix, is at most 246 bytes**: 255 minus `.dhow.tmp`, the longest suffix the engine appends (§5.3).
+- On collision in `directory`: `name.ext` → `name (2).ext` → `name (3).ext`. Comparison is case-insensitive (macOS and Windows volumes are) and also against existing `.part` and `.dhow` files.
+
+`ProbeInfo.suggested_name` is the sanitized name for the host filesystem *without* collision handling (the probe doesn't know the target directory); `Add` applies the request's `TargetFs` and the collision rule, and §8 applies the collision rule again at rename.
 
 Naming MUST be a pure function `(ProbeInfo, original_url, TargetFs, existing_names) -> String` with a table-driven test suite.
 
