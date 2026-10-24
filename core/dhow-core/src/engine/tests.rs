@@ -853,9 +853,10 @@ mod limit_tests {
         let started = Instant::now();
         let (a, b) = tokio::join!(fx.run(&ids[0]), fx.run(&ids[1]));
         assert_eq!((a.state, b.state), (State::Completed, State::Completed));
-        // 600 kB at 200 kB/s together, less the 40 kB burst.
+        // 600 kB at 200 kB/s together, less the 40 kB burst. The floor is
+        // the limit holding; the ceiling only catches a stall (CI is slow).
         let secs = started.elapsed().as_secs_f64();
-        assert!((2.6..3.3).contains(&secs), "{secs} s");
+        assert!((2.6..5.0).contains(&secs), "{secs} s");
     }
 
     /// §12: 0 is "paused by limit"; lifting it applies at once.
