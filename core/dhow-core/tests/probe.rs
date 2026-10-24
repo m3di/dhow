@@ -226,7 +226,7 @@ async fn rejects_non_http_schemes_and_bad_headers() {
 }
 
 #[tokio::test]
-async fn reports_content_disposition() {
+async fn reports_content_disposition_and_suggested_name() {
     let server = TestServer::start().unwrap();
     let knob = header_knob("Content-Disposition", "attachment; filename=\"a b.zip\"");
     let info = run(&server, &format!("/blob/10?{knob}")).await.unwrap();
@@ -234,6 +234,23 @@ async fn reports_content_disposition() {
         info.content_disposition.as_deref(),
         Some("attachment; filename=\"a b.zip\"")
     );
+    assert_eq!(info.suggested_name, "a b.zip");
+}
+
+#[tokio::test]
+async fn raw_utf8_disposition_is_decoded() {
+    let server = TestServer::start().unwrap();
+    let knob = header_knob("Content-Disposition", "attachment; filename=\"گزارش.pdf\"");
+    let info = run(&server, &format!("/blob/10?{knob}")).await.unwrap();
+    assert_eq!(info.suggested_name, "گزارش.pdf");
+}
+
+#[tokio::test]
+async fn suggested_name_comes_from_the_redirect_target() {
+    let server = TestServer::start().unwrap();
+    let info = run(&server, "/blob/10?redirect=1").await.unwrap();
+    // No Content-Disposition, so the effective URL's last segment names it.
+    assert_eq!(info.suggested_name, "10");
 }
 
 #[tokio::test]
