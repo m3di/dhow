@@ -1,5 +1,6 @@
 //! Dhow engine. See `docs/ARCHITECTURE.md` and `docs/ENGINE-SPEC.md`.
 
+pub mod download;
 pub mod http;
 pub mod journal;
 pub mod logging;

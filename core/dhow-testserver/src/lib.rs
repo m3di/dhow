@@ -20,6 +20,11 @@
 //! | `truncate=<n>` | every body is cut after `n` bytes by closing the connection |
 //! | `stall_after=<n>` | every body stops after `n` bytes; the connection stays open |
 //! | `extra_delay=<ms>` | flush and wait before sending the `extra` bytes, so they arrive in a separate read |
+//! | `cut_first=<n>` | only the first `GET` of this URL is cut after `n` bytes |
+//! | `change_after=<n>` | after `n` `GET`s of this URL it is a different file: new content and `ETag` |
+//! | `lie_after=<n>` | after `n` `GET`s the content changes but the `ETag` doesn't (a lying server) |
+//! | `validators=none\|weak` | no `ETag`/`Last-Modified` at all, or only a weak `ETag` |
+//! | `change_each=1` | every `GET` serves a different file (`HEAD` shows the next one) |
 //! | `ignore_range_after=<n>` | honor `Range` on the first `n` `GET`s of this URL, then ignore it |
 //! | `extra=<n>` | `n` garbage bytes after the body, counted in `Content-Length` (not `Content-Range`) |
 //!
@@ -213,6 +218,18 @@ struct Knobs {
     extra: u64,
     ignore_range_after: Option<u32>,
     extra_delay: Option<u64>,
+    cut_first: Option<u64>,
+    change_after: Option<u32>,
+    lie_after: Option<u32>,
+    change_each: bool,
+    validators: Validators,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Validators {
+    Strong,
+    Weak,
+    None,
 }
 
 fn knobs(query: &[(String, String)]) -> Option<Knobs> {
@@ -232,6 +249,11 @@ fn knobs(query: &[(String, String)]) -> Option<Knobs> {
         extra: 0,
         ignore_range_after: None,
         extra_delay: None,
+        cut_first: None,
+        change_after: None,
+        lie_after: None,
+        change_each: false,
+        validators: Validators::Strong,
     };
     for (name, value) in query {
         match (name.as_str(), value.as_str()) {
@@ -259,6 +281,12 @@ fn knobs(query: &[(String, String)]) -> Option<Knobs> {
             ("extra", v) => k.extra = v.parse().ok()?,
             ("ignore_range_after", v) => k.ignore_range_after = Some(v.parse().ok()?),
             ("extra_delay", v) => k.extra_delay = Some(v.parse().ok()?),
+            ("cut_first", v) => k.cut_first = Some(v.parse().ok()?),
+            ("change_after", v) => k.change_after = Some(v.parse().ok()?),
+            ("lie_after", v) => k.lie_after = Some(v.parse().ok()?),
+            ("change_each", "1") => k.change_each = true,
+            ("validators", "weak") => k.validators = Validators::Weak,
+            ("validators", "none") => k.validators = Validators::None,
             _ => return None,
         }
     }
@@ -315,7 +343,29 @@ async fn respond(stream: &mut TcpStream, req: &Request, counts: &Counts) -> io::
         }
     }
 
-    let etag = format!("\"{:x}-{size:x}\"", k.seed);
+    // GETs of this URL before this request; HEAD looks without counting.
+    let gets_before = {
+        let mut counts = counts.lock().unwrap();
+        let n = counts.entry(format!("gets:{}", req.target)).or_default();
+        let before = *n;
+        if !is_head {
+            *n += 1;
+        }
+        before
+    };
+    let mut seed = k.seed;
+    if k.change_after.is_some_and(|n| gets_before >= n) {
+        seed ^= 0x1000;
+    }
+    if k.change_each {
+        seed = seed.wrapping_add(u64::from(gets_before));
+    }
+    let content_seed = if k.lie_after.is_some_and(|n| gets_before >= n) {
+        seed ^ 0x2000
+    } else {
+        seed
+    };
+    let etag = format!("\"{seed:x}-{size:x}\"");
     let range_allowed = match k.ignore_range_after {
         Some(n) if !is_head => {
             let mut counts = counts.lock().unwrap();
@@ -327,24 +377,29 @@ async fn respond(stream: &mut TcpStream, req: &Request, counts: &Counts) -> io::
         }
         _ => true,
     };
+    // If-Range only ever matches a strong validator (RFC 9110 §13.1.5).
     let honor_range = range_allowed
         && matches!(k.ranges, Ranges::Bytes | Ranges::Hidden)
-        && req
-            .header("if-range")
-            .is_none_or(|v| v == etag || v == LAST_MODIFIED);
+        && req.header("if-range").is_none_or(|v| {
+            k.validators == Validators::Strong && (v == etag || v == LAST_MODIFIED)
+        });
     let range = match req.header("range").filter(|_| honor_range) {
         Some(v) => http::parse_range(v, size),
         None => None,
     };
 
-    let mut headers = vec![
-        ("ETag".to_owned(), etag),
-        ("Last-Modified".to_owned(), LAST_MODIFIED.to_owned()),
-        (
-            "Content-Type".to_owned(),
-            "application/octet-stream".to_owned(),
-        ),
-    ];
+    let mut headers = vec![(
+        "Content-Type".to_owned(),
+        "application/octet-stream".to_owned(),
+    )];
+    match k.validators {
+        Validators::Strong => {
+            headers.push(("ETag".to_owned(), etag));
+            headers.push(("Last-Modified".to_owned(), LAST_MODIFIED.to_owned()));
+        }
+        Validators::Weak => headers.push(("ETag".to_owned(), format!("W/{etag}"))),
+        Validators::None => {}
+    }
     match k.ranges {
         Ranges::Bytes => headers.push(("Accept-Ranges".to_owned(), "bytes".to_owned())),
         Ranges::None => headers.push(("Accept-Ranges".to_owned(), "none".to_owned())),
@@ -392,13 +447,17 @@ async fn respond(stream: &mut TcpStream, req: &Request, counts: &Counts) -> io::
         return Ok(keep);
     }
 
-    let cut = [k.truncate, k.stall_after].into_iter().flatten().min();
+    let first_cut = k.cut_first.filter(|_| gets_before == 0);
+    let cut = [k.truncate, k.stall_after, first_cut]
+        .into_iter()
+        .flatten()
+        .min();
     let stop = cut.map_or(body.end, |n| body.end.min(body.start + n));
     let mut buf = vec![0; BODY_BUF];
     let mut pos = body.start;
     while pos < stop {
         let n = (stop - pos).min(BODY_BUF as u64) as usize;
-        blob::fill(k.seed, pos, &mut buf[..n]);
+        blob::fill(content_seed, pos, &mut buf[..n]);
         stream.write_all(&buf[..n]).await?;
         pos += n as u64;
     }

@@ -51,6 +51,30 @@ impl RangeSet {
         self.ranges.get(i).is_some_and(|x| x.start < r.end) && r.start < r.end
     }
 
+    /// The parts of `[0, total)` not covered, in order.
+    pub fn gaps(&self, total: u64) -> Vec<Range<u64>> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        for r in &self.ranges {
+            if r.start >= total {
+                break;
+            }
+            if r.start > at {
+                out.push(at..r.start);
+            }
+            at = at.max(r.end);
+        }
+        if at < total {
+            out.push(at..total);
+        }
+        out
+    }
+
+    /// The covered range ending exactly at `at`, if any.
+    pub fn ending_at(&self, at: u64) -> Option<&Range<u64>> {
+        self.ranges.iter().find(|r| r.end == at)
+    }
+
     /// Exactly `[0, total)`: the I7 completion condition.
     pub fn is_exactly(&self, total: u64) -> bool {
         match self.ranges.as_slice() {
@@ -96,6 +120,17 @@ mod tests {
         assert!(!s.intersects(&(20..30)));
         assert!(!s.intersects(&(40..50)));
         assert!(!s.intersects(&(15..15)));
+    }
+
+    #[test]
+    fn gaps_and_ending_at() {
+        let s = set(&[10..20, 30..40]);
+        assert_eq!(s.gaps(50), [0..10, 20..30, 40..50]);
+        assert_eq!(s.gaps(35), [0..10, 20..30]);
+        assert_eq!(set(&[0..50]).gaps(50), Vec::<Range<u64>>::new());
+        assert_eq!(RangeSet::new().gaps(5), [0..5]);
+        assert_eq!(s.ending_at(20), Some(&(10..20)));
+        assert_eq!(s.ending_at(15), None);
     }
 
     #[test]

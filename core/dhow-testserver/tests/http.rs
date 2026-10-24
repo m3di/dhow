@@ -365,3 +365,69 @@ fn stall_after_stops_sending_but_keeps_the_connection() {
     let split = got.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
     assert_eq!(&got[split..], &blob::bytes(0, 0..100)[..]);
 }
+
+#[test]
+fn cut_first_cuts_only_the_first_get() {
+    let server = TestServer::start().unwrap();
+    let (_, body) = raw_body(&server, "/blob/1000?cut_first=100", "");
+    assert_eq!(body.len(), 100);
+    let (_, body) = raw_body(&server, "/blob/1000?cut_first=100", "");
+    assert_eq!(body, blob::bytes(0, 0..1000));
+}
+
+#[test]
+fn change_after_switches_content_and_etag() {
+    let server = TestServer::start().unwrap();
+    let path = "/blob/100?change_after=1";
+    assert_eq!(head(&server, path).header("etag"), Some("\"0-64\""));
+    let first = get(&server, path, "");
+    assert_eq!(first.body, blob::bytes(0, 0..100));
+    assert_eq!(head(&server, path).header("etag"), Some("\"1000-64\""));
+    let second = get(&server, path, "");
+    assert_eq!(second.header("etag"), Some("\"1000-64\""));
+    assert_eq!(second.body, blob::bytes(0x1000, 0..100));
+}
+
+#[test]
+fn lie_after_switches_content_but_not_etag() {
+    let server = TestServer::start().unwrap();
+    let path = "/blob/100?lie_after=1";
+    get(&server, path, "");
+    let second = get(&server, path, "");
+    assert_eq!(second.header("etag"), Some("\"0-64\""));
+    assert_eq!(second.body, blob::bytes(0x2000, 0..100));
+}
+
+#[test]
+fn change_each_serves_a_new_file_every_get() {
+    let server = TestServer::start().unwrap();
+    let path = "/blob/10?change_each=1";
+    let etags: Vec<_> = (0..3)
+        .map(|_| get(&server, path, "").header("etag").unwrap().to_owned())
+        .collect();
+    assert_eq!(etags, ["\"0-a\"", "\"1-a\"", "\"2-a\""]);
+    assert_eq!(
+        head(&server, path).header("etag"),
+        Some("\"3-a\""),
+        "HEAD shows the next"
+    );
+}
+
+#[test]
+fn validators_knob() {
+    let server = TestServer::start().unwrap();
+    let r = get(&server, "/blob/10?validators=none", "");
+    assert_eq!((r.header("etag"), r.header("last-modified")), (None, None));
+    let r = get(&server, "/blob/10?validators=weak", "");
+    assert_eq!(
+        (r.header("etag"), r.header("last-modified")),
+        (Some("W/\"0-a\""), None)
+    );
+    // A weak validator never satisfies If-Range.
+    let r = get(
+        &server,
+        "/blob/10?validators=weak",
+        "Range: bytes=0-0\r\nIf-Range: \"0-a\"\r\n",
+    );
+    assert_eq!(r.status, 200);
+}

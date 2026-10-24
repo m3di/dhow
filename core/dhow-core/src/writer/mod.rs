@@ -307,6 +307,27 @@ impl Writer {
     }
 }
 
+/// Reads exactly `len` bytes at `offset`. For the coordinator, before a
+/// writer owns the file (I9: reading is not writing).
+pub fn read_at(file: &File, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0; len];
+    #[cfg(unix)]
+    std::os::unix::fs::FileExt::read_exact_at(file, &mut buf, offset)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0;
+        while done < len {
+            let n = file.seek_read(&mut buf[done..], offset + done as u64)?;
+            if n == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            done += n;
+        }
+    }
+    Ok(buf)
+}
+
 #[cfg(unix)]
 fn write_at(file: &File, offset: u64, data: &[u8]) -> io::Result<()> {
     std::os::unix::fs::FileExt::write_all_at(file, data, offset)
