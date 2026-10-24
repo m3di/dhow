@@ -1,8 +1,10 @@
 //! ENGINE-SPEC §15 conformance tests, through the `dhow` CLI.
 //!
-//! Not here yet: T-I6 (bytes past a chunk's end needs several connections,
-//! M2) and the multi-connection / scheduling rows (M2+). T-I2 is covered by
-//! the random kill -9 runs in `kill9.rs` and by the writer's unit tests.
+//! Elsewhere: T-I6 and the 10-download M2 exit run in `multi.rs`, T-11 in
+//! `schedules.rs`, T-12 in `limits.rs`; T-4.3, T-9b, T-10, T-10b and T-idle
+//! in `dhow-core/tests` (they need the engine's internals or its runtime).
+//! T-I2 is covered by the random kill -9 runs in `kill9.rs` and by the
+//! writer's unit tests.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;

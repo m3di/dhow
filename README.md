@@ -42,7 +42,7 @@ All shells sit on `dhow-core`, a Rust library that owns downloading, queuing, sc
 
 ## Status
 
-Pre-alpha. The engine and CLI come first; see `docs/ROADMAP.md`.
+Pre-alpha. The engine and CLI come first; see `docs/ROADMAP.md`. Done so far (M0–M2): bulletproof single and multi-connection downloads (journal, resume, kill -9 safe), the connection budget and ramp-up, queues, schedules, speed limits, speed history. No GUI yet.
 
 ### Try the CLI
 
@@ -53,7 +53,7 @@ cd core && cargo build --release
 ./target/release/dhow resume <id-or-prefix>
 ```
 
-`add --queue` only records a download; `dhow watch` runs everything queued. Output is one JSON event per line.
+`add --queue` only records a download; `dhow watch` runs everything queued. `dhow queue …` manages queues and their schedules (`--window "mon-fri 22:00-06:00"`), `dhow limit <id> 500K` and `dhow settings --global-limit 2M` set speed limits, `dhow history` shows speed samples. Output is one JSON event per line.
 
 ## Contributing
 

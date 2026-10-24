@@ -199,7 +199,8 @@ On `get_download` / `list_downloads`, if `final_path` no longer exists and a tok
 - Each active download also has one writer thread (ENGINE-SPEC I9) fed by a bounded channel: `pwrite`/`fsync` block, and on macOS `F_FULLFSYNC` can take tens of milliseconds, which must not stall runtime workers. The thread waits with a deadline only while uncommitted bytes exist and exits when the download's handles drop.
 - No `interval` timers survive the last active download. Schedule wake-ups use a single `sleep_until(next_schedule_edge)` (`Engine::next_edge`) that is dropped and recreated only when schedules change. If no schedule exists, no sleep exists. Everything else that can change what runs (a download finishing, a queue edited, a pause requested) wakes the runner directly; nothing polls.
 - Speed sampling runs inside the coordinator task; it dies with the download.
-- The idle test: after all downloads complete, `tokio::runtime::Handle::metrics().num_alive_tasks()` must be 0 (modulo the event channel) and RSS must not grow over 60 s.
+- The HTTP client exists only while something uses it (a probe or a running download) and is dropped with its connection pool when the last user finishes: pooled keep-alive connections and the pool's idle sweep are tasks. Connections are reused while anything runs; the next download after an idle period opens new ones.
+- The idle test (T-idle, `dhow-core/tests/idle.rs`): after all downloads complete, `tokio::runtime::Handle::metrics().num_alive_tasks()` must be 0 (modulo the event channel), no event is emitted and RSS must not grow over 60 s.
 
 ## 8. Network awareness
 

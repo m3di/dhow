@@ -2,6 +2,8 @@
 
 Milestones are sequential. A milestone is done when every item is merged with tests and the exit criterion passes. Items are numbered for PR titles (`M1.3: …`).
 
+Done: M0, M1, M2. Next: M3.
+
 ## M0 — Repo & skeleton
 
 - M0.1 Cargo workspace with `dhow-core`, `dhow-cli`, `dhow-testserver`, `dhow-ffi` (empty), CI running fmt, clippy and tests on a Linux runner.
