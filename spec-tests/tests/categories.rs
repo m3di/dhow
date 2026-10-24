@@ -12,10 +12,14 @@ fn categories_and_storage_breakdown() {
         out.events()[0]["extra_extensions"],
         serde_json::json!({ "data": ["mkv", "qqq"] })
     );
-    assert!(
-        !sb.dhow(["settings", "--extensions", "films=x"])
-            .status
-            .success()
+    // A bad value anywhere applies none of them.
+    for bad in ["films=x", "video=a/b"] {
+        let out = sb.dhow(["settings", "--extensions", "code=zzz", "--extensions", bad]);
+        assert!(!out.status.success(), "{bad}");
+    }
+    assert_eq!(
+        sb.dhow(["settings"]).events()[0]["extra_extensions"],
+        serde_json::json!({ "data": ["mkv", "qqq"] })
     );
 
     let audio = header_knob("Content-Type", "audio/mpeg");

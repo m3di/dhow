@@ -1050,11 +1050,31 @@ mod category_tests {
                 .set_extra_extensions(Category::Video, &["a/b".into()]),
             Err(EngineError::InvalidSetting(_))
         ));
-        assert!(matches!(
-            fx.engine
-                .set_extra_extensions(Category::Other, &["x".into()]),
-            Err(EngineError::InvalidSetting(_))
-        ));
+        // `Other` takes a built-in back out of its category.
+        fx.engine
+            .set_extra_extensions(Category::Other, &["bin".into()])
+            .unwrap();
+        let bin = add("/blob/10".into(), Some("firmware.bin"));
+        assert_eq!(bin.await.unwrap().category, Category::Other);
+    }
+
+    /// The second gets ` (2)` inside the user's extension
+    /// (`src (2).tar.lz`); the category comes from the name before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_name_collision_keeps_the_category() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        fx.engine
+            .set_extra_extensions(Category::Data, &["safetensors".into(), "tar.lz".into()])
+            .unwrap();
+        for name in ["model.safetensors", "src.tar.lz"] {
+            let path = format!("/blob/10?{}", disposition(name));
+            let first = fx.engine.add(fx.request(&server, &path)).await.unwrap();
+            let second = fx.engine.add(fx.request(&server, &path)).await.unwrap();
+            assert_ne!(first.final_path, second.final_path);
+            assert_eq!(first.category, Category::Data, "{name}");
+            assert_eq!(second.category, Category::Data, "{name}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

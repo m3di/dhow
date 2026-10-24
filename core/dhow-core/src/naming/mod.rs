@@ -127,7 +127,7 @@ pub fn deduplicate<S: AsRef<str>>(name: &str, existing: &[S]) -> String {
 
 /// `(stem, extension-with-dot)`. An extension is 1–10 ASCII alphanumerics
 /// after the last dot of a non-empty stem, or one of the compound ones.
-fn split(name: &str) -> (&str, &str) {
+pub(crate) fn split(name: &str) -> (&str, &str) {
     let lower = name.to_ascii_lowercase();
     for ext in COMPOUND_EXTENSIONS {
         if lower.len() > ext.len() && lower.ends_with(ext) {

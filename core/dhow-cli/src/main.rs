@@ -13,7 +13,7 @@ use dhow_core::engine::queues::{OnComplete, QueueSpec};
 use dhow_core::engine::{AddRequest, Engine, EngineError, EngineEvent, Snapshot, State};
 use dhow_core::http::{Header, Url};
 use dhow_core::logging;
-use dhow_core::naming::{Category, TargetFs};
+use dhow_core::naming::{Category, TargetFs, normalize_extension};
 use dhow_core::schedule::{Action, Schedule, Window};
 use dhow_core::storage::Db;
 use futures_util::StreamExt;
@@ -478,12 +478,17 @@ async fn run(
             headroom,
             extensions,
         } => {
-            for v in extensions {
-                let (category, exts) = parse_extensions(&v)?;
+            // All parsed before any is applied.
+            let global_limit = global_limit.map(|v| parse_rate(&v)).transpose()?;
+            let extensions = extensions
+                .iter()
+                .map(|v| parse_extensions(v))
+                .collect::<Res<Vec<_>>>()?;
+            for (category, exts) in extensions {
                 engine.set_extra_extensions(category, &exts)?;
             }
-            if let Some(v) = global_limit {
-                engine.set_global_limit(parse_rate(&v)?)?;
+            if let Some(rate) = global_limit {
+                engine.set_global_limit(rate)?;
             }
             if let Some(p) = headroom {
                 engine.set_headroom(p)?;
@@ -546,8 +551,8 @@ fn parse_extensions(v: &str) -> Res<(Category, Vec<String>)> {
         .split(',')
         .map(str::trim)
         .filter(|e| !e.is_empty())
-        .map(str::to_owned)
-        .collect();
+        .map(|e| normalize_extension(e).ok_or_else(|| format!("{e:?} is not a file extension")))
+        .collect::<Result<_, _>>()?;
     Ok((category, exts))
 }
 

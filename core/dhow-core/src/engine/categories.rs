@@ -3,6 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
+use rusqlite::{OptionalExtension, params};
+
 use super::{DownloadId, Engine, EngineError};
 use crate::naming::{Category, ExtraExtensions, normalize_extension};
 
@@ -25,17 +27,13 @@ impl Engine {
     }
 
     /// Replaces `category`'s extra extensions (empty clears them). An
-    /// extension belongs to one category, so it leaves any other.
+    /// extension belongs to one category, so it leaves any other; `Other`
+    /// takes built-ins back out of theirs.
     pub fn set_extra_extensions(
         &self,
         category: Category,
         extensions: &[String],
     ) -> Result<ExtraExtensions, EngineError> {
-        if category == Category::Other {
-            return Err(EngineError::InvalidSetting(
-                "extensions not in any category are already other",
-            ));
-        }
         let mut exts = extensions
             .iter()
             .map(|e| normalize_extension(e))
@@ -43,13 +41,32 @@ impl Engine {
             .ok_or(EngineError::InvalidSetting("not a file extension"))?;
         exts.sort();
         exts.dedup();
-        let mut extra = self.extra_extensions()?;
+        let db = self.db();
+        let tx = db.conn().unchecked_transaction()?;
+        let stored: Option<String> = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                [EXTRA_KEY],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let mut extra: ExtraExtensions = stored
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default();
         for list in extra.values_mut() {
             list.retain(|e| !exts.contains(e));
         }
         extra.insert(category, exts);
         extra.retain(|_, list| !list.is_empty());
-        self.put_setting(EXTRA_KEY, &extra)?;
+        tx.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            params![
+                EXTRA_KEY,
+                serde_json::to_string(&extra).expect("settings serialize")
+            ],
+        )?;
+        tx.commit()?;
         Ok(extra)
     }
 

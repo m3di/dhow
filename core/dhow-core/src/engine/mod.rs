@@ -237,7 +237,7 @@ pub struct Snapshot {
     pub position: i64,
     /// Bytes/s; `Some(0)`: paused by limit (§12).
     pub speed_limit: Option<u64>,
-    /// From the final name, set at `Add` (§13.1).
+    /// Set at `Add` from the chosen name (§13.1).
     pub category: Category,
 }
 
@@ -343,14 +343,15 @@ impl Engine {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         taken.extend(self.reserved_names(&req.directory)?);
-        let name = naming::deduplicate(&base, &taken);
-        // Completion only ever adds ` (n)` before the extension, so this
-        // holds for the name the file finally gets.
+        // From the name before ` (n)` is added: that goes before what
+        // naming calls the extension, which can be inside a longer one a
+        // user added (`model (2).tar.lz`).
         let category = naming::categorize(
-            &name,
+            &base,
             info.content_type.as_deref(),
             &self.extra_extensions()?,
         );
+        let name = naming::deduplicate(&base, &taken);
         let final_path = req.directory.join(&name);
         let part_path = req.directory.join(format!("{name}.part"));
 
