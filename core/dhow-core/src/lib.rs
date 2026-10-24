@@ -8,6 +8,7 @@ pub mod journal;
 pub mod limit;
 pub mod logging;
 pub mod naming;
+pub mod platform;
 pub mod probe;
 pub mod rangeset;
 pub mod schedule;

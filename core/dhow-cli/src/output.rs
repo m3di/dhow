@@ -9,6 +9,7 @@ use dhow_core::engine::queues::QueueSnapshot;
 use dhow_core::engine::speed::SpeedSample;
 use dhow_core::engine::{EngineEvent, Snapshot, WarningKind};
 use dhow_core::naming::ExtraExtensions;
+use dhow_core::platform::{InterfaceKind, NetworkInfo, ProxyConfig, ProxyMode, redact_proxy_url};
 use dhow_core::probe::Resumable;
 use serde_json::{Value, json};
 
@@ -145,5 +146,34 @@ pub fn queue(q: &QueueSnapshot) -> Value {
         "run_state": q.run_state.as_str(),
         "run_state_until": q.run_state_until,
         "active": q.active_at(&jiff::Zoned::now()),
+    })
+}
+
+pub fn network(n: &NetworkInfo) -> Value {
+    json!({
+        "event": "network",
+        "interface": match n.interface_kind {
+            InterfaceKind::Wifi => "wifi",
+            InterfaceKind::Ethernet => "ethernet",
+            InterfaceKind::Cellular => "cellular",
+            InterfaceKind::Vpn => "vpn",
+            InterfaceKind::Unknown => "unknown",
+        },
+        "vpn_active": n.vpn_active,
+        "system_proxy": n.system_proxy.as_ref().map(proxy),
+        "proxy_in_use": match &n.proxy_in_use {
+            ProxyMode::System => json!("system"),
+            ProxyMode::None => json!("none"),
+            ProxyMode::Custom(c) => proxy(c),
+        },
+    })
+}
+
+/// Credentials and query strings in proxy URLs are not printed.
+fn proxy(c: &ProxyConfig) -> Value {
+    let url = |u: &Option<dhow_core::http::Url>| u.as_ref().map(redact_proxy_url);
+    json!({
+        "http": url(&c.http), "https": url(&c.https), "all": url(&c.all),
+        "no_proxy": c.no_proxy, "pac": url(&c.pac),
     })
 }

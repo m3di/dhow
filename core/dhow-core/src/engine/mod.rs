@@ -32,6 +32,7 @@ use crate::download::{
 use crate::http::{self, Header};
 use crate::journal::format;
 use crate::naming::{self, Category, TargetFs};
+use crate::platform::{AdapterError, NetworkInfo, NoopAdapter, PlatformAdapter, ProxyMode};
 use crate::probe::{self, ProbeError, Resumable};
 use crate::speed::{Ema, rollup_cutoff};
 use crate::storage::{DEFAULT_QUEUE_ID, Db, StorageError};
@@ -291,11 +292,22 @@ pub struct Engine {
     shared: Shared,
     buckets: Mutex<limits::Buckets>,
     speed: Mutex<speed::SpeedBook>,
+    platform: Arc<dyn PlatformAdapter>,
 }
 
 impl Engine {
-    /// Opens (or creates) `dhow.sqlite` in `data_dir`.
+    /// Opens (or creates) `dhow.sqlite` in `data_dir`, with no platform
+    /// adapter.
     pub fn open(data_dir: &Path, config: DownloadConfig) -> Result<Self, EngineError> {
+        Self::open_with(data_dir, config, Arc::new(NoopAdapter))
+    }
+
+    /// [`Engine::open`] with the shell's adapter (ARCHITECTURE §4).
+    pub fn open_with(
+        data_dir: &Path,
+        config: DownloadConfig,
+        platform: Arc<dyn PlatformAdapter>,
+    ) -> Result<Self, EngineError> {
         let db = Db::open(&data_dir.join("dhow.sqlite"))?;
         let engine = Self {
             db: Arc::new(Mutex::new(db)),
@@ -304,11 +316,22 @@ impl Engine {
             shared: Shared::new(config.budget),
             buckets: Mutex::default(),
             speed: Mutex::default(),
+            platform,
         };
         engine.refresh_limits()?;
         // Leftovers of earlier runs whose hour has since ended.
         engine.roll_up(rollup_cutoff(now_ms()))?;
         Ok(engine)
+    }
+
+    /// The adapter's view of the network plus the proxy the HTTP client
+    /// actually uses (ARCHITECTURE §8). Asks on every call; nothing is
+    /// watched here.
+    pub fn network_info(&self) -> Result<NetworkInfo, AdapterError> {
+        let mut info = self.platform.network_info()?;
+        // `http::client` uses no proxy until M3.4 adds the setting.
+        info.proxy_in_use = ProxyMode::None;
+        Ok(info)
     }
 
     fn db(&self) -> MutexGuard<'_, Db> {
@@ -585,14 +608,12 @@ impl Engine {
                 self.sample(id, &progress, on_event);
             }
         };
-        self.sampling(true)?;
+        let sampling = self.sampling();
         let result = tokio::select! {
             r = fetch => r,
             _ = sampler => unreachable!("samples forever"),
         };
-        if let Err(e) = self.sampling(false) {
-            tracing::warn!(id, error = %e, "could not record speed samples");
-        }
+        drop(sampling);
         self.drop_buckets(id);
         let done = match result {
             Ok(done) => done,
