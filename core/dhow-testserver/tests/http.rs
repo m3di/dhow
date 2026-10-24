@@ -342,6 +342,17 @@ fn extra_appends_garbage_counted_in_length_only() {
 }
 
 #[test]
+fn extra_mid_spares_the_range_that_ends_the_file() {
+    let server = TestServer::start().unwrap();
+    let (r, body) = raw_body(&server, "/blob/100?extra_mid=20", "Range: bytes=10-19\r\n");
+    assert_eq!(r.header("content-length"), Some("30"));
+    assert_eq!(&body[10..], &[0xEE; 20][..]);
+    let (r, body) = raw_body(&server, "/blob/100?extra_mid=20", "Range: bytes=90-99\r\n");
+    assert_eq!(r.header("content-length"), Some("10"));
+    assert_eq!(body, blob::bytes(0, 90..100));
+}
+
+#[test]
 fn stall_after_stops_sending_but_keeps_the_connection() {
     let server = TestServer::start().unwrap();
     let mut conn = TcpStream::connect(server.addr()).unwrap();

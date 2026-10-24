@@ -30,6 +30,7 @@
 //! | `change_each=1` | every `GET` serves a different file (`HEAD` shows the next one) |
 //! | `ignore_range_after=<n>` | honor `Range` on the first `n` `GET`s of this URL, then ignore it |
 //! | `extra=<n>` | `n` garbage bytes after the body, counted in `Content-Length` (not `Content-Range`) |
+//! | `extra_mid=<n>` | the same, but only after ranges that end before the file does (several connections, T-I6) |
 //!
 //! Unknown knobs are a 400, so a misspelled knob fails the test instead of
 //! silently testing the happy path.
@@ -227,6 +228,7 @@ struct Knobs {
     truncate: Option<u64>,
     stall_after: Option<u64>,
     extra: u64,
+    extra_mid: u64,
     ignore_range_after: Option<u32>,
     extra_delay: Option<u64>,
     cut_first: Option<u64>,
@@ -261,6 +263,7 @@ fn knobs(query: &[(String, String)]) -> Option<Knobs> {
         truncate: None,
         stall_after: None,
         extra: 0,
+        extra_mid: 0,
         ignore_range_after: None,
         extra_delay: None,
         cut_first: None,
@@ -296,6 +299,7 @@ fn knobs(query: &[(String, String)]) -> Option<Knobs> {
             ("truncate", v) => k.truncate = Some(v.parse().ok()?),
             ("stall_after", v) => k.stall_after = Some(v.parse().ok()?),
             ("extra", v) => k.extra = v.parse().ok()?,
+            ("extra_mid", v) => k.extra_mid = v.parse().ok()?,
             ("ignore_range_after", v) => k.ignore_range_after = Some(v.parse().ok()?),
             ("extra_delay", v) => k.extra_delay = Some(v.parse().ok()?),
             ("cut_first", v) => k.cut_first = Some(v.parse().ok()?),
@@ -451,6 +455,8 @@ async fn respond(stream: &mut TcpStream, req: &Request, counts: &Counts) -> io::
     let keep = keep && (with_length || is_head);
     let extra = if is_head || status.starts_with("416") {
         0
+    } else if body.end < size {
+        k.extra + k.extra_mid
     } else {
         k.extra
     };

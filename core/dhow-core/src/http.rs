@@ -28,6 +28,44 @@ pub fn client() -> Result<Client, reqwest::Error> {
         .build()
 }
 
+/// The client, built on first use and dropped with its connection pool when
+/// the last user is done: pooled keep-alive connections and the pool's idle
+/// sweep are tasks, and nothing may run when no transfer does (ARCHITECTURE
+/// §7). Connections are reused while anything is running.
+#[derive(Debug, Default)]
+pub struct ClientSlot {
+    inner: std::sync::Mutex<(Option<Client>, usize)>,
+}
+
+impl ClientSlot {
+    pub fn lease(&self) -> Result<Lease<'_>, reqwest::Error> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let client = match &inner.0 {
+            Some(c) => c.clone(),
+            None => inner.0.insert(client()?).clone(),
+        };
+        inner.1 += 1;
+        Ok(Lease { slot: self, client })
+    }
+}
+
+/// A [`ClientSlot`]'s client, in use.
+#[derive(Debug)]
+pub struct Lease<'a> {
+    slot: &'a ClientSlot,
+    pub client: Client,
+}
+
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.slot.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.1 -= 1;
+        if inner.1 == 0 {
+            inner.0 = None;
+        }
+    }
+}
+
 /// Adds the user's headers plus `Accept-Encoding: identity`: a compressed
 /// response would make byte ranges meaningless. `Range`, `If-Range` and
 /// `Accept-Encoding` belong to the engine, so user values for them are

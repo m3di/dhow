@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use reqwest::{Client, Url};
+use reqwest::Url;
 use rusqlite::{OptionalExtension, Row, params};
 use tokio::sync::watch;
 
@@ -274,7 +274,7 @@ impl From<rusqlite::Error> for EngineError {
 
 pub struct Engine {
     db: Arc<Mutex<Db>>,
-    client: Client,
+    client: http::ClientSlot,
     config: DownloadConfig,
     /// The connection budget, link knowledge and global speed limit all
     /// downloads in this process share (§10, §12).
@@ -287,10 +287,9 @@ impl Engine {
     /// Opens (or creates) `dhow.sqlite` in `data_dir`.
     pub fn open(data_dir: &Path, config: DownloadConfig) -> Result<Self, EngineError> {
         let db = Db::open(&data_dir.join("dhow.sqlite"))?;
-        let client = http::client().map_err(io::Error::other)?;
         let engine = Self {
             db: Arc::new(Mutex::new(db)),
-            client,
+            client: http::ClientSlot::default(),
             config,
             shared: Shared::new(config.budget),
             buckets: Mutex::default(),
@@ -322,7 +321,9 @@ impl Engine {
             .clone()
             .unwrap_or_else(|| DEFAULT_QUEUE_ID.to_owned());
         self.queue(&queue_id)?;
-        let info = probe::probe(&self.client, &req.url, &req.headers, self.config.probe).await?;
+        let lease = self.client.lease().map_err(io::Error::other)?;
+        let info = probe::probe(&lease.client, &req.url, &req.headers, self.config.probe).await?;
+        drop(lease);
         let base = match &req.filename {
             Some(name) => naming::sanitize(name, req.target_fs)
                 .ok_or_else(|| EngineError::InvalidName(name.clone()))?,
@@ -532,9 +533,10 @@ impl Engine {
         };
         let progress = Mutex::new(Progress::new(snap.total_size));
         let dl_event = |e: DownloadEvent| self.on_download_event(id, e, &progress, on_event);
+        let lease = self.client.lease().map_err(io::Error::other)?;
         let fetch = download::download(
             &req,
-            &self.client,
+            &lease.client,
             &self.config,
             &self.shared,
             &dl_event,
