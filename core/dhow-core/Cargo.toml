@@ -8,6 +8,8 @@ publish.workspace = true
 
 [dependencies]
 base64.workspace = true
+blake3.workspace = true
+crc32fast.workspace = true
 dirs.workspace = true
 mime_guess.workspace = true
 reqwest.workspace = true
