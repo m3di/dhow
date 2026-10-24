@@ -249,13 +249,13 @@ The `Writer` batches: it issues `pwrite` immediately, but `fdatasync` + `range_c
 2. Writer: final `fdatasync`, then append a `checkpoint`.
 3. Digest check if applicable (I8).
 4. Close the handle. On Windows, release the share lock.
-5. `rename(<final>.part, <final>)` — atomic on the same volume. If the final name was taken since `Add` (another download finished with the same name), apply the collision rule (§3) at this moment, not earlier.
+5. `rename(<final>.part, <final>)` — atomic on the same volume, and **never replacing** an existing file (`renameat2(RENAME_NOREPLACE)` on Linux/Android, `renameatx_np(RENAME_EXCL)` on Apple, else hard link + unlink; a plain `rename` would destroy a file that appeared after the name was chosen). If the final name was taken since `Add` (another download finished with the same name), apply the collision rule (§3) at this moment, not earlier, ignoring this download's own `.part` and `.dhow`; if the rename then finds the name taken, take the next one. The chosen name is recorded (DB `final_path`) *before* each rename attempt, so recovery after a crash knows which name was used.
 6. `fsync` the directory (POSIX).
 7. Delete the sidecar.
 8. Create a file token via the adapter (`ARCHITECTURE §6`) and store it.
 9. Emit `StateChanged → Completed`, `Renamed`.
 
-Steps 5–7 are the only non-idempotent moment. If the process dies between 5 and 7, the next open finds `<final>` present and a stale sidecar: the sidecar is deleted and the download is marked complete (the rename is the commit point).
+Steps 5–7 are the only non-idempotent moment. If the process dies between 5 and 7, the next open finds `<final>` present, no `.part`, and a stale sidecar: the sidecar is deleted and the download is marked complete (the rename is the commit point). If `.part` is still there, the rename didn't happen and completion simply runs again. A `DigestMismatch` leaves `.part` and `.dhow` in place for inspection; nothing appears at the final name (I1).
 
 ---
 
