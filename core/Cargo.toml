@@ -1,0 +1,13 @@
+[workspace]
+resolver = "3"
+members = ["dhow-core", "dhow-cli", "dhow-testserver", "dhow-ffi"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.dependencies]
+dhow-core = { path = "dhow-core" }
+clap = { version = "4", features = ["derive"] }
