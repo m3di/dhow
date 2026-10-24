@@ -597,7 +597,15 @@ impl Engine {
         // commit point; finish the bookkeeping.
         if snap.state == State::Completing && complete::recover(&part, &sidecar, &snap.final_path)?
         {
-            let token = tokens::create(self.platform.as_ref(), id, &snap.final_path);
+            let (platform, owned_id, path) = (
+                self.platform.clone(),
+                id.to_owned(),
+                snap.final_path.clone(),
+            );
+            let token =
+                tokio::task::spawn_blocking(move || tokens::create(&*platform, &owned_id, &path))
+                    .await
+                    .map_err(io::Error::other)?;
             self.store_token(id, token);
             self.transition(id, State::Completed, None, on_event)?;
             on_event(EngineEvent::Renamed {

@@ -40,9 +40,10 @@ impl Engine {
 
     /// `snap`, or, if it is completed, its file is gone and its token
     /// resolves to an existing file, the download moved there: `final_path`
-    /// updated, the category derived again if the name changed (§13.1),
-    /// `Renamed`, then regrouped (§13.2). A file the adapter can't find, or
-    /// a failing adapter, leaves it missing.
+    /// updated (and the token, if the adapter refreshed it), the category
+    /// derived again if the name changed (§13.1), `Renamed`, then regrouped
+    /// (§13.2). A file the adapter reports gone loses its token; a failing
+    /// adapter is asked again next time. Either way the file is missing.
     pub(super) fn located(
         &self,
         snap: Snapshot,
@@ -60,29 +61,43 @@ impl Engine {
             return Ok(snap);
         };
         let id = &snap.id;
-        let path = match self.platform.file_token_resolve(&FileToken(token)) {
-            Ok(Some(p)) if p != snap.final_path && p.is_file() => p,
-            Ok(_) | Err(AdapterError::Unsupported) => return Ok(snap),
+        let old = path_str(&snap.final_path);
+        let resolved = match self.platform.file_token_resolve(&FileToken(token)) {
+            Ok(Some(r)) if r.path != snap.final_path && r.path.is_file() => r,
+            Ok(Some(_)) | Err(AdapterError::Unsupported) => return Ok(snap),
+            Ok(None) => {
+                self.db().conn().execute(
+                    "UPDATE downloads SET file_token = NULL WHERE id = ?1 AND final_path = ?2",
+                    params![id, old],
+                )?;
+                return self.stored(id);
+            }
             Err(AdapterError::Failed(e)) => {
                 tracing::warn!(id, error = %e, "could not resolve a file token");
                 return Ok(snap);
             }
         };
+        let path = resolved.path;
+        // A name without a known extension keeps what `Add` found, maybe
+        // from the `Content-Type`.
         let category = match path.file_name() {
             Some(name) if Some(name) != snap.final_path.file_name() => {
-                naming::categorize(&name.to_string_lossy(), None, &self.extra_extensions()?)
+                naming::categorize_name(&name.to_string_lossy(), &self.extra_extensions()?)
+                    .unwrap_or(snap.category)
             }
             _ => snap.category,
         };
         // Unless another query (maybe in another process) got there first.
         let moved = self.db().conn().execute(
-            "UPDATE downloads SET final_path = ?2, category = ?3
+            "UPDATE downloads SET final_path = ?2, category = ?3,
+                 file_token = COALESCE(?5, file_token)
              WHERE id = ?1 AND final_path = ?4",
             params![
                 id,
                 path_str(&path),
                 category.as_str(),
-                path_str(&snap.final_path)
+                old,
+                resolved.token.map(|t| t.0)
             ],
         )?;
         if moved == 1 {

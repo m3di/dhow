@@ -136,7 +136,7 @@ Shells implement this trait (via UniFFI callback interface, or C function table 
 pub trait PlatformAdapter: Send + Sync {
     // File identity tracking — see §6
     fn file_token_create(&self, path: &Path) -> Result<Option<FileToken>, AdapterError>;
-    fn file_token_resolve(&self, token: &FileToken) -> Result<Option<PathBuf>, AdapterError>;
+    fn file_token_resolve(&self, token: &FileToken) -> Result<Option<Resolved>, AdapterError>;
 
     // Network — see §8
     fn system_proxy(&self, for_url: &Url) -> Result<ProxyConfig, AdapterError>;
@@ -151,7 +151,7 @@ pub trait PlatformAdapter: Send + Sync {
 }
 ```
 
-In `dhow_core::platform`. `Engine::open_with(data_dir, config, Arc<dyn PlatformAdapter>)` takes it (`Engine::open` uses `NoopAdapter`). The engine calls `keep_awake(true)` when its first transfer starts and `keep_awake(false)` when its last ends (a guard, so also when a `run` future is dropped or panics), with a lock held (an adapter must not call back into the engine). `FileToken` is opaque bytes; `AdapterError` is `Unsupported | Failed(String)`; `BackgroundCapability` defaults to `Unrestricted`.
+In `dhow_core::platform`. `Engine::open_with(data_dir, config, Arc<dyn PlatformAdapter>)` takes it (`Engine::open` uses `NoopAdapter`). The engine calls `keep_awake(true)` when its first transfer starts and `keep_awake(false)` when its last ends (a guard, so also when a `run` future is dropped or panics), with a lock held (an adapter must not call back into the engine). `FileToken` is opaque bytes; `Resolved` is `{ path, token: Option<FileToken> }`, where `token` replaces the stored one when given (macOS re-creates a stale bookmark this way); `AdapterError` is `Unsupported | Failed(String)`; `BackgroundCapability` defaults to `Unrestricted`.
 
 `dhow_core::platform::linux::LinuxAdapter` is the Linux network half (§8), shared by the CLI and the GTK shell; its inputs (environment, `gsettings` output, `kioslaverc`, `/sys/class/net`, `/proc/net/route`) are fields so tests can fake them. Elsewhere the CLI uses `LinuxAdapter::env_only()` until the platform's own adapter exists.
 
@@ -197,7 +197,15 @@ Optional per platform via `PlatformAdapter::file_token_*`.
 
 On `get_download` / `list_downloads`, if `final_path` no longer exists and a token is present, the core asks the adapter to resolve it; on success it updates `final_path` and emits `Renamed`. Resolution happens lazily on query, never on a timer.
 
-The token is created at completion (ENGINE-SPEC §8 step 8, also when completion is finished after a crash) and stored in `downloads.file_token`; an adapter without tokens (`Unsupported`, `Ok(None)`) stores none, and a failure is logged and stores none. Only `Completed` downloads are resolved. Queries are synchronous, so the adapter runs on the caller's thread, with no engine lock held; the core's `get`, `list` and `storage_breakdown` take the same `on_event` callback as commands (until the event channel exists) for the `Renamed` and `GroupChanged` they may cause. A resolved path that exists and differs is the new `final_path` (another directory is fine); the category is derived again if the name changed (§13.1) and the download is regrouped (§13.2). `Ok(None)` (deleted), a path that doesn't exist, or `Failed` (logged at warn) leave the download as it is, its file missing. The update is conditional on the old `final_path`, so two concurrent queries emit `Renamed` once.
+The token is created at completion (ENGINE-SPEC §8 step 8, also when completion is finished after a crash, off the async workers in both cases) and stored in `downloads.file_token`. An adapter without tokens (`Unsupported`, `Ok(None)`) stores none; a failure is logged and stores none. Only `Completed` downloads are resolved. The resolve contract:
+
+- `Ok(Some(Resolved { path, token }))`: the file is at `path`. If that exists and differs, it becomes `final_path` (another directory is fine), a refreshed `token` replaces the stored one, the category is derived again if the name changed (ENGINE-SPEC §13.1), the download is regrouped (§13.2), and `Renamed` is emitted.
+- `Ok(None)`: gone for good. The core drops the token and never asks again. A file moved to the Trash / Recycle Bin MUST be reported this way (shells implement).
+- `Err(Failed)`: can't tell now (e.g. an unmounted volume). Logged at warn, the file counts as missing, and it is asked again on the next query.
+
+The update is conditional on the old `final_path`, so two concurrent queries emit `Renamed` once. The core's `get`, `list` and `storage_breakdown` take the same `on_event` callback as commands (until the event channel exists) for the `Renamed` and `GroupChanged` they may cause.
+
+Queries stat files and may call the adapter synchronously, on the caller's thread and with no engine lock held. Shells must call them off the main thread, and adapters must not hop synchronously to the main thread.
 
 ## 7. Concurrency & idle model
 

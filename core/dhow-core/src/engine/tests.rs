@@ -1452,7 +1452,7 @@ mod token_tests {
 
     use super::*;
     use crate::engine::categories::CategoryUsage;
-    use crate::platform::FileToken;
+    use crate::platform::{FileToken, Resolved};
 
     /// Tokens are indexes into `files`, which the test keeps up to date as
     /// it moves them, as the OS would.
@@ -1461,6 +1461,7 @@ mod token_tests {
         files: StdMutex<Vec<PathBuf>>,
         resolves: AtomicUsize,
         fail: AtomicBool,
+        refresh: AtomicBool,
     }
 
     impl PlatformAdapter for Tracker {
@@ -1472,14 +1473,20 @@ mod token_tests {
             )))
         }
 
-        fn file_token_resolve(&self, token: &FileToken) -> Result<Option<PathBuf>, AdapterError> {
+        fn file_token_resolve(&self, token: &FileToken) -> Result<Option<Resolved>, AdapterError> {
             self.resolves.fetch_add(1, Ordering::SeqCst);
             if self.fail.load(Ordering::SeqCst) {
                 return Err(AdapterError::Failed("boom".into()));
             }
-            let at = u32::from_le_bytes(token.0[..].try_into().unwrap()) as usize;
+            let at = u32::from_le_bytes(token.0[..4].try_into().unwrap()) as usize;
             let path = self.files.lock().unwrap()[at].clone();
-            Ok(path.is_file().then_some(path))
+            // Stale: a fresh token comes back, marked.
+            let token = self.refresh.load(Ordering::SeqCst).then(|| {
+                let mut t = token.0[..4].to_vec();
+                t.push(0xff);
+                FileToken(t)
+            });
+            Ok(path.is_file().then_some(Resolved { path, token }))
         }
     }
 
@@ -1650,6 +1657,71 @@ mod token_tests {
             fx.engine.get(&b.id, &|_| {}).unwrap().final_path,
             b.final_path
         );
+    }
+
+    /// `Ok(None)` is final: the token goes, and later queries don't ask.
+    /// A failure is asked again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deleted_file_is_resolved_once_and_a_failure_again() {
+        let server = TestServer::start().unwrap();
+        let (fx, tracker) = tracked();
+        let gone = fx.completed(&server, "gone.mp4").await;
+        let away = fx.completed(&server, "away.mp4").await;
+        std::fs::remove_file(&gone.final_path).unwrap();
+        for _ in 0..2 {
+            assert_eq!(fx.engine.get(&gone.id, &|_| {}).unwrap(), gone);
+        }
+        assert_eq!(tracker.resolves(), 1);
+        assert_eq!(fx.token(&gone.id), None);
+
+        tracker.move_file(&away.final_path, &fx.downloads.join("away2.mp4"));
+        tracker.fail.store(true, Ordering::SeqCst);
+        for _ in 0..2 {
+            assert_eq!(fx.engine.get(&away.id, &|_| {}).unwrap(), away);
+        }
+        assert_eq!(tracker.resolves(), 3);
+        assert!(fx.token(&away.id).is_some());
+    }
+
+    /// Two queries holding the same stale row: one `Renamed`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn racing_queries_rename_once_and_store_a_refreshed_token() {
+        let server = TestServer::start().unwrap();
+        let (fx, tracker) = tracked();
+        let done = fx.completed(&server, "x.mkv").await;
+        let stale = fx.engine.stored(&done.id).unwrap();
+        let moved = fx.downloads.join("y.mkv");
+        tracker.move_file(&done.final_path, &moved);
+        tracker.refresh.store(true, Ordering::SeqCst);
+        let on_event = fx.sink();
+        for _ in 0..2 {
+            let snap = fx.engine.located(stale.clone(), &on_event).unwrap();
+            assert_eq!(snap.final_path, moved);
+        }
+        let renamed = fx
+            .taken()
+            .into_iter()
+            .filter(|e| matches!(e, EngineEvent::Renamed { .. }))
+            .count();
+        assert_eq!(renamed, 1);
+        assert_eq!(fx.token(&done.id).unwrap().last(), Some(&0xff));
+    }
+
+    /// §13.1: a new name without a known extension keeps the category,
+    /// here from the `Content-Type`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_name_without_a_known_extension_keeps_the_category() {
+        let server = TestServer::start().unwrap();
+        let (fx, tracker) = tracked();
+        let mut req = fx.request(&server, "/blob/1000?header=Content-Type%3A%20video%2Fmp4");
+        req.filename = Some("clip".into());
+        let added = fx.engine.add(req, &|_| {}).await.unwrap();
+        assert_eq!(added.category, Category::Video);
+        let done = fx.run(&added.id).await;
+        let moved = fx.downloads.join("clip-old");
+        tracker.move_file(&done.final_path, &moved);
+        let snap = fx.engine.get(&done.id, &|_| {}).unwrap();
+        assert_eq!((snap.final_path, snap.category), (moved, Category::Video));
     }
 
     /// §8: the token is also created when completion is finished after a
