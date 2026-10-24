@@ -138,7 +138,10 @@ fn range_starts(server: &TestServer) -> Vec<u64> {
 async fn ramps_up_and_completes_bit_exact() {
     let server = TestServer::start().unwrap();
     let env = Env::new(&server, "/blob/4000000?seed=7&throttle=1000000");
-    let run = env.run(&config(100), &Shared::default()).await;
+    // Never saturated (see T-10): this is about ramping and splitting.
+    let mut config = config(100);
+    config.ramp.min_gain = -1.0;
+    let run = env.run(&config, &Shared::default()).await;
     run.result.as_ref().unwrap();
     assert_eq!(env.part_hash(), blob::digest(7, 4 * MB));
     assert!(

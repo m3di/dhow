@@ -418,7 +418,7 @@ All run against `dhow-testserver` through `dhow-cli`. Each maps to a section abo
 | T-4.3 | one connection throttled to 1 KiB/s, others fast | work stealing splits its chunk; completion time within 1.5× of ideal |
 | T-9a | 10 consecutive resets on one connection | `Failed(Transient)`; `Retry` completes |
 | T-9b | server ignores `Range` after honoring it once | downgrade to 1 connection, completes, `Warning` emitted |
-| T-10 | 10 downloads, budget 16, per-host 4 | oldest reaches 4 first; connection counts over time match the ramp model |
+| T-10 | 10 downloads started together, budget 16, per-host 4 | the 6 slots left after the first connections are what the two oldest claim: they ramp to 4 while the other 8 stay at 1 until one of the two gives a connection back; never more than 16 in all or 4 per host. Newcomers arriving with the budget spent still get a connection |
 | T-10b | `n = 8`, each connection 500 kB/s, link saturates at 2 MB/s (4 connections) | ramp-up stops at 4 ± 1; the next download starts at that ceiling |
 | T-11 | schedule window ends during transfer (`StartAndStopOutside`) | paused with committed journal; resumed at next start |
 | T-12 | global limit 100 KiB/s, 3 downloads | aggregate within ±10% over 10 s |
