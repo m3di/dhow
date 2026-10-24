@@ -101,14 +101,17 @@ struct Job {
 }
 
 /// Runs `jobs` concurrently through one shared budget, starting them
-/// `stagger` apart (in age order), ramping up every `window`. Asserts every
-/// file bit-exact.
+/// `stagger` apart (in age order), ramping up every `window`. With
+/// `newcomers_from: Some(k)`, download `k` and younger start only once the
+/// budget is spent. Asserts every file bit-exact.
 async fn run_all(
     jobs: Vec<Job>,
     budget: BudgetConfig,
     stagger: Duration,
     window: Duration,
+    newcomers_from: Option<usize>,
 ) -> Timeline {
+    let global = budget.global;
     let shared = Arc::new(Shared::new(budget));
     let timeline = Arc::new(Mutex::new(Timeline::new(jobs.len())));
     let dir = tempfile::tempdir().unwrap();
@@ -127,6 +130,11 @@ async fn run_all(
         };
         tasks.push(tokio::spawn(async move {
             tokio::time::sleep(stagger * i as u32).await;
+            if newcomers_from.is_some_and(|k| i >= k) {
+                while timeline.lock().unwrap().now.iter().sum::<u32>() < global {
+                    tokio::time::sleep(ms(10)).await;
+                }
+            }
             let (_keep, stop) = watch::channel(false);
             let on_event = move |e: DownloadEvent| timeline.lock().unwrap().record(i, &e);
             let client = http::client().unwrap();
@@ -183,7 +191,7 @@ async fn ten_downloads_share_a_budget_of_sixteen_oldest_first() {
     let servers: Vec<TestServer> = (0..10).map(|_| TestServer::start().unwrap()).collect();
     // A window well beyond start-up: all ten hold a connection before any
     // of them ramps.
-    let t = run_all(ten_jobs(&servers), T10, Duration::ZERO, ms(200)).await;
+    let t = run_all(ten_jobs(&servers), T10, Duration::ZERO, ms(200), None).await;
     assert_caps(&t);
 
     let mut now = [0; 10];
@@ -203,14 +211,13 @@ async fn ten_downloads_share_a_budget_of_sixteen_oldest_first() {
     assert_eq!(now[..2], [4, 4], "the two oldest ramp first");
 }
 
-/// §10.3 newcomers: arriving one by one while the budget is spent, each
-/// still gets a connection, from the youngest download with spares.
+/// §10.3 newcomers: arriving once the four oldest have spent the budget,
+/// each still gets a connection, from the youngest download with spares.
 #[tokio::test(flavor = "multi_thread")]
 async fn newcomers_get_a_slot_when_the_budget_is_spent() {
     let servers: Vec<TestServer> = (0..10).map(|_| TestServer::start().unwrap()).collect();
-    let t = run_all(ten_jobs(&servers), T10, ms(60), ms(100)).await;
+    let t = run_all(ten_jobs(&servers), T10, ms(60), ms(100), Some(4)).await;
     assert_caps(&t);
-    assert!(t.waited.iter().any(|&w| w), "the budget was never spent");
     assert_eq!(t.max_holding, 10, "newcomers starved");
 }
 
@@ -243,7 +250,7 @@ async fn per_host_cap_is_shared_by_downloads_to_one_server() {
         per_host: 4,
         min_for_new: 1,
     };
-    let t = run_all(jobs, budget, ms(400), ms(100)).await;
+    let t = run_all(jobs, budget, ms(400), ms(100), None).await;
     assert!(t.max_total <= 4, "per-host cap exceeded: {}", t.max_total);
     assert_eq!(t.max_holding, 3, "all three ran at once");
 }
@@ -265,7 +272,7 @@ async fn a_full_host_makes_newcomers_wait() {
         per_host: 1,
         min_for_new: 1,
     };
-    let t = run_all(jobs, budget, ms(50), ms(100)).await;
+    let t = run_all(jobs, budget, ms(50), ms(100), None).await;
     assert_eq!(t.max_total, 1, "never two connections to the host");
     assert_eq!(t.waited, [false, true]);
 }
