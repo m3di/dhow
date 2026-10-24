@@ -11,6 +11,7 @@ pub mod naming;
 pub mod probe;
 pub mod rangeset;
 pub mod schedule;
+pub mod speed;
 pub mod storage;
 pub mod transfer;
 pub mod writer;

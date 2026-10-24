@@ -141,6 +141,9 @@ enum Command {
     /// Limit a download's speed: bytes/s with an optional K, M or G
     /// (×1024), `0` to pause it by limit, `none` to lift it
     Limit { id: String, rate: String },
+    /// Speed samples of a download, or of all together: hourly rows, then
+    /// the last minutes second by second
+    History { id: Option<String> },
     /// Show or change the global speed limit and headroom
     Settings {
         /// Limit for all downloads together (see `dhow limit`)
@@ -447,6 +450,13 @@ async fn run(
             let snap = engine.set_speed_limit(&id, parse_rate(&rate)?)?;
             output::emit(output::snapshot("download", &snap));
             lock::poke_runners(&data_dir);
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::History { id } => {
+            let id = id.map(|i| engine.resolve(&i)).transpose()?;
+            for s in engine.speed_history(id.as_deref())? {
+                output::emit(output::sample(id.as_deref(), &s));
+            }
             Ok(ExitCode::SUCCESS)
         }
         Command::Settings {

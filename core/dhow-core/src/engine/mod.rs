@@ -9,6 +9,7 @@
 
 pub mod limits;
 pub mod queues;
+pub mod speed;
 #[cfg(test)]
 mod tests;
 
@@ -30,12 +31,14 @@ use crate::http::{self, Header};
 use crate::journal::format;
 use crate::naming::{self, TargetFs};
 use crate::probe::{self, ProbeError, Resumable};
+use crate::speed::{Ema, rollup_cutoff};
 use crate::storage::{DEFAULT_QUEUE_ID, Db, StorageError};
 use crate::transfer::{ConnEvent, TransferError};
 use crate::writer::WriterError;
 
 /// Progress events at most this often per download (ARCHITECTURE §3.3).
 const PROGRESS_EVERY: Duration = Duration::from_millis(250);
+const SAMPLE_EVERY: Duration = Duration::from_secs(1);
 
 pub type DownloadId = String;
 
@@ -167,6 +170,10 @@ pub enum EngineEvent {
         downloaded: u64,
         total: Option<u64>,
         connections: u32,
+        /// 5-sample EMA of the 1 s samples (§14).
+        speed_bps: u64,
+        /// `None`: unknown size, under 3 samples or under 1 KiB/s.
+        eta_secs: Option<u64>,
     },
     /// Started over from zero; the shell says why.
     Reset {
@@ -273,6 +280,7 @@ pub struct Engine {
     /// downloads in this process share (§10, §12).
     shared: Shared,
     buckets: Mutex<limits::Buckets>,
+    speed: Mutex<speed::SpeedBook>,
 }
 
 impl Engine {
@@ -286,13 +294,20 @@ impl Engine {
             config,
             shared: Shared::new(config.budget),
             buckets: Mutex::default(),
+            speed: Mutex::default(),
         };
         engine.refresh_limits()?;
+        // Leftovers of earlier runs whose hour has since ended.
+        engine.roll_up(rollup_cutoff(now_ms()))?;
         Ok(engine)
     }
 
     fn db(&self) -> MutexGuard<'_, Db> {
         self.db.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn speed(&self) -> MutexGuard<'_, speed::SpeedBook> {
+        self.speed.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn buckets(&self) -> MutexGuard<'_, limits::Buckets> {
@@ -517,15 +532,32 @@ impl Engine {
         };
         let progress = Mutex::new(Progress::new(snap.total_size));
         let dl_event = |e: DownloadEvent| self.on_download_event(id, e, &progress, on_event);
-        let result = download::download(
+        let fetch = download::download(
             &req,
             &self.client,
             &self.config,
             &self.shared,
             &dl_event,
             stop,
-        )
-        .await;
+        );
+        // Once a second while it runs, and only then (§14, §3.3).
+        let sampler = async {
+            let mut tick =
+                tokio::time::interval_at(tokio::time::Instant::now() + SAMPLE_EVERY, SAMPLE_EVERY);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                self.sample(id, &progress, on_event);
+            }
+        };
+        self.sampling(true)?;
+        let result = tokio::select! {
+            r = fetch => r,
+            _ = sampler => unreachable!("samples forever"),
+        };
+        if let Err(e) = self.sampling(false) {
+            tracing::warn!(id, error = %e, "could not record speed samples");
+        }
         self.drop_buckets(id);
         let done = match result {
             Ok(done) => done,
@@ -621,6 +653,23 @@ impl Engine {
         self.get(id)
     }
 
+    fn sample(
+        &self,
+        id: &str,
+        progress: &Mutex<Progress>,
+        on_event: &(dyn Fn(EngineEvent) + Send + Sync),
+    ) {
+        let bps = {
+            let mut p = progress.lock().unwrap();
+            let bps = p.take_sample();
+            p.flush(id, on_event);
+            bps
+        };
+        if let Err(e) = self.record_sample(id, now_ms(), bps) {
+            tracing::warn!(id, error = %e, "could not record a speed sample");
+        }
+    }
+
     fn on_download_event(
         &self,
         id: &str,
@@ -645,6 +694,7 @@ impl Engine {
             }
             DownloadEvent::Connection(ConnEvent::Received(n)) => {
                 p.downloaded += n;
+                p.received += n;
                 if p.last.elapsed() >= PROGRESS_EVERY {
                     p.flush(id, on_event);
                 }
@@ -760,7 +810,12 @@ struct Progress {
     total: Option<u64>,
     connections: u32,
     last: Instant,
-    sent: Option<(u64, u32)>,
+    sent: Option<(u64, u32, u64, Option<u64>)>,
+    /// Bytes received this run (unlike `downloaded`, not reset).
+    received: u64,
+    /// `received` and when at the last sample.
+    sampled: (u64, Instant),
+    ema: Ema,
 }
 
 impl Progress {
@@ -771,20 +826,44 @@ impl Progress {
             connections: 0,
             last: Instant::now(),
             sent: None,
+            received: 0,
+            sampled: (0, Instant::now()),
+            ema: Ema::default(),
         }
     }
 
+    /// Bytes/s since the last sample, into the EMA.
+    fn take_sample(&mut self) -> u64 {
+        let now = Instant::now();
+        let (before, at) = self.sampled;
+        let secs = now.duration_since(at).as_secs_f64();
+        let bps = if secs > 0.0 {
+            (self.received - before) as f64 / secs
+        } else {
+            0.0
+        };
+        self.sampled = (self.received, now);
+        self.ema.push(bps);
+        bps.round() as u64
+    }
+
     fn flush(&mut self, id: &str, on_event: &(dyn Fn(EngineEvent) + Send + Sync)) {
-        if self.sent == Some((self.downloaded, self.connections)) {
+        let speed_bps = self.ema.speed();
+        let remaining = self.total.map(|t| t.saturating_sub(self.downloaded));
+        let eta_secs = self.ema.eta(remaining);
+        let now = (self.downloaded, self.connections, speed_bps, eta_secs);
+        if self.sent == Some(now) {
             return;
         }
         self.last = Instant::now();
-        self.sent = Some((self.downloaded, self.connections));
+        self.sent = Some(now);
         on_event(EngineEvent::Progress {
             id: id.to_owned(),
             downloaded: self.downloaded,
             total: self.total,
             connections: self.connections,
+            speed_bps,
+            eta_secs,
         });
     }
 }

@@ -891,3 +891,104 @@ mod limit_tests {
         );
     }
 }
+
+mod speed_tests {
+    use super::*;
+    use crate::engine::speed::SpeedSample;
+    use crate::speed::HOUR_MS;
+
+    impl Engine {
+        fn record_sample_row(&self, id: Option<&str>, at: i64, bps: u64) {
+            self.db()
+                .conn()
+                .execute(
+                    "INSERT INTO speed_samples VALUES (?1, 1, ?2, ?3)",
+                    params![id, at, bps as i64],
+                )
+                .unwrap();
+        }
+    }
+
+    fn progress(fx: &Fx) -> Vec<(u64, Option<u64>, u64)> {
+        fx.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::Progress {
+                    downloaded,
+                    speed_bps,
+                    eta_secs,
+                    ..
+                } => Some((*speed_bps, *eta_secs, *downloaded)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// §14: one sample a second while it runs, a 5-sample EMA, an ETA from
+    /// the third sample on; the global aggregate alongside.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn samples_ema_and_eta() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let mut req = fx.request(&server, "/blob/1000000?throttle=200000");
+        req.connections = Some(1);
+        let id = fx.engine.add(req).await.unwrap().id;
+        assert_eq!(fx.run(&id).await.state, State::Completed);
+
+        let samples = fx.engine.speed_history(Some(&id)).unwrap();
+        assert!((4..=6).contains(&samples.len()), "{samples:?}");
+        assert!(samples.iter().all(|s| s.period_secs == 1));
+        // Whole seconds at about the throttle (the first includes the probe).
+        for s in &samples[1..samples.len() - 1] {
+            assert!((160_000..240_000).contains(&s.bytes_per_sec), "{samples:?}");
+        }
+        let global = fx.engine.speed_history(None).unwrap();
+        let sum = |v: &[SpeedSample]| v.iter().map(|s| s.bytes_per_sec).sum::<u64>();
+        assert_eq!(sum(&global), sum(&samples), "one download: same total");
+
+        let p = progress(&fx);
+        let with_speed: Vec<_> = p.iter().filter(|(s, ..)| *s > 0).collect();
+        assert!(!with_speed.is_empty(), "{p:?}");
+        // ETA appears only once three samples exist, and then fits.
+        let first_eta = p.iter().position(|(_, eta, _)| eta.is_some()).unwrap();
+        let (speed, eta, downloaded) = p[first_eta];
+        assert!(
+            (150_000..250_000).contains(&speed),
+            "{speed} B/s at the first ETA"
+        );
+        let expected = (1_000_000 - downloaded).div_ceil(speed);
+        assert_eq!(eta, Some(expected));
+        assert!(
+            downloaded >= 400_000,
+            "ETA before 3 s of data: {downloaded}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn old_samples_roll_up_into_hours() {
+        let fx = Fx::new();
+        let h = HOUR_MS;
+        // Two samples in one old hour, one in the next.
+        for (at, bps) in [(5 * h + 10_000, 100), (5 * h + 20_000, 300), (6 * h, 50)] {
+            fx.engine.record_sample_row(None, at, bps);
+        }
+        fx.engine.roll_up(6 * h).unwrap();
+        assert_eq!(
+            fx.engine.speed_history(None).unwrap(),
+            [
+                SpeedSample {
+                    at: 5 * h,
+                    period_secs: 3600,
+                    bytes_per_sec: 200,
+                },
+                SpeedSample {
+                    at: 6 * h,
+                    period_secs: 1,
+                    bytes_per_sec: 50,
+                },
+            ]
+        );
+    }
+}

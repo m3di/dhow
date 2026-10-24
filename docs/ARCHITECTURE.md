@@ -162,7 +162,7 @@ Tables (abridged, the migrations are the truth):
 - `ranges` — download_id, start, end, state (`pending|active|committed`) — **mirror** of the sidecar journal, for queries only; the sidecar is authoritative (§5.2)
 - `queues` — id, name, max_concurrent, schedule (json), speed_limit, on_complete, is_default. The default queue is created by migration 1 with a fixed id and a NULL name (the shell localizes it); a trigger prevents deleting it.
 - `groups` — id, name, auto (bool)
-- `speed_samples` — download_id (NULL = global aggregate), period_secs, at, bytes_per_sec — ring-buffered, 10-minute retention at 1 s, hourly rollups beyond
+- `speed_samples` — download_id (NULL = global aggregate), period_secs, at, bytes_per_sec — ring-buffered, 10-minute retention at 1 s (until the hour ends), hourly rollups beyond (ENGINE-SPEC §14)
 - `settings` — key, value (json). Keys so far: `global_speed_limit` (bytes/s or null), `headroom_percent`.
 
 ### 5.2 Sidecar journal (`<name>.ext.dhow`)
