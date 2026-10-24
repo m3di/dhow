@@ -65,18 +65,26 @@ impl Env {
         &self,
         config: &DownloadConfig,
     ) -> (Result<Downloaded, DownloadError>, Vec<DownloadEvent>) {
-        let (_keep, stop) = watch::channel(false);
-        self.run_until(config, stop).await
+        self.run_until(config, watch::channel(false).0, |_| false)
+            .await
     }
 
+    /// Runs with `stop`, setting it once `stop_when` sees an event.
     async fn run_until(
         &self,
         config: &DownloadConfig,
-        stop: watch::Receiver<bool>,
+        stop: watch::Sender<bool>,
+        stop_when: impl Fn(&DownloadEvent) -> bool + Send + Sync + 'static,
     ) -> (Result<Downloaded, DownloadError>, Vec<DownloadEvent>) {
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = events.clone();
-        let on_event = move |e: DownloadEvent| sink.lock().unwrap().push(e);
+        let rx = stop.subscribe();
+        let on_event = move |e: DownloadEvent| {
+            if stop_when(&e) {
+                stop.send_replace(true);
+            }
+            sink.lock().unwrap().push(e);
+        };
         let client = http::client().unwrap();
         let result = tokio::time::timeout(
             Duration::from_secs(30),
@@ -86,7 +94,7 @@ impl Env {
                 config,
                 &Shared::default(),
                 &on_event,
-                &stop,
+                &rx,
             ),
         )
         .await
@@ -399,14 +407,13 @@ async fn rerun_of_complete_download_fetches_nothing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn stop_commits_and_resume_continues() {
     let server = TestServer::start().unwrap();
-    let env = Env::new(&server, "/blob/1000000?throttle=2000000");
-    let (tx, rx) = watch::channel(false);
-    let pause = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        tx.send(true).unwrap();
-    });
-    let (result, _) = env.run_until(&config(10), rx).await;
-    pause.await.unwrap();
+    let env = Env::new(&server, "/blob/1000000?throttle=1000000");
+    // Stopped once bytes flow, with about a second of data still to come.
+    let received =
+        |e: &DownloadEvent| matches!(e, DownloadEvent::Connection(ConnEvent::Received(_)));
+    let (result, _) = env
+        .run_until(&config(10), watch::channel(false).0, received)
+        .await;
     assert!(matches!(result, Err(DownloadError::Stopped)), "{result:?}");
     let saved = env.committed_on_disk();
     assert!(saved > 0 && saved < SIZE, "{saved}");
@@ -420,8 +427,9 @@ async fn stop_commits_and_resume_continues() {
 async fn stop_before_start_does_nothing() {
     let server = TestServer::start().unwrap();
     let env = Env::new(&server, "/blob/1000");
-    let (_tx, rx) = watch::channel(true);
-    let (result, events) = env.run_until(&config(10), rx).await;
+    let (result, events) = env
+        .run_until(&config(10), watch::channel(true).0, |_| false)
+        .await;
     assert!(matches!(result, Err(DownloadError::Stopped)));
     assert!(events.is_empty());
     assert!(server.requests().is_empty());

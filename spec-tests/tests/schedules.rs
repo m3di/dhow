@@ -44,23 +44,26 @@ fn transitions(events: &[Value], id: &str) -> Vec<String> {
 fn t_11_window_end_pauses_and_next_start_resumes() {
     let server = TestServer::start().unwrap();
     let sb = Sandbox::new();
-    queue(
-        &sb,
-        &[
-            "--window",
-            &window(-60, 3),
-            "--window",
-            &window(6, 3600),
-            "--action",
-            "stop-outside",
-        ],
-    );
+    queue(&sb, &[]);
     let path = format!("/blob/3000000?seed=4&throttle=400000&{}", named("t.bin"));
     let id = sb
         .add(&server, &path, &["--queue", "--to", "Q", "-c", "1"])
         .id();
-
-    let started = Instant::now();
+    // The windows go on last, so only `watch` starting up comes between
+    // them and the first one's end (2–3 s away).
+    let computed = Instant::now();
+    sb.dhow([
+        "queue",
+        "set",
+        "Q",
+        "--window",
+        &window(-60, 3),
+        "--window",
+        &window(6, 3600),
+        "--action",
+        "stop-outside",
+    ])
+    .assert_success();
     let out = sb.dhow(["watch"]);
     out.assert_success();
     let events = out.events();
@@ -77,9 +80,8 @@ fn t_11_window_end_pauses_and_next_start_resumes() {
         "{events:#?}"
     );
     assert!(
-        // Whole-second window times, computed before the setup above: the
-        // second window opens 5–6 s after that, ≥ 4 s after `started`.
-        started.elapsed() >= Duration::from_secs(4),
+        // Whole-second window times: the second opens 5–6 s after `computed`.
+        computed.elapsed() >= Duration::from_secs(5),
         "waited for the next window"
     );
     // The second run started from what the first committed.
@@ -101,11 +103,22 @@ fn t_11_window_end_pauses_and_next_start_resumes() {
 fn start_windows_let_running_downloads_finish() {
     let server = TestServer::start().unwrap();
     let sb = Sandbox::new();
-    queue(&sb, &["--window", &window(-60, 2), "--action", "start"]);
+    queue(&sb, &[]);
     let path = format!("/blob/2000000?throttle=500000&{}", named("s.bin"));
     let id = sb
         .add(&server, &path, &["--queue", "--to", "Q", "-c", "1"])
         .id();
+    // Ends 2–3 s from now; the download takes 4 s.
+    sb.dhow([
+        "queue",
+        "set",
+        "Q",
+        "--window",
+        &window(-60, 3),
+        "--action",
+        "start",
+    ])
+    .assert_success();
     let out = sb.dhow(["watch"]);
     out.assert_success();
     assert_eq!(
@@ -120,16 +133,16 @@ fn start_windows_let_running_downloads_finish() {
 fn watch_sleeps_until_the_window_opens() {
     let server = TestServer::start().unwrap();
     let sb = Sandbox::new();
+    let computed = Instant::now();
     queue(&sb, &["--window", &window(4, 3600)]);
     let id = sb
         .add(&server, "/blob/1000", &["--queue", "--to", "Q"])
         .id();
-    let started = Instant::now();
     let out = sb.dhow(["watch"]);
     out.assert_success();
-    let elapsed = started.elapsed();
-    // Opens 3–4 s after the window was computed, before the setup above.
-    assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
+    // Opens 3–4 s after `computed`, however long the setup took.
+    let elapsed = computed.elapsed();
+    assert!(elapsed >= Duration::from_secs(3), "{elapsed:?}");
     assert_eq!(
         transitions(&out.events(), &id).last().map(String::as_str),
         Some("completed")

@@ -31,8 +31,12 @@ fn config(window_ms: u64) -> DownloadConfig {
                 retry_after_cap: Duration::from_secs(1),
             },
         },
+        // No timed commits: each fsync holds every connection behind the
+        // writer, and on a slow disk (100–270 ms on CI) the backlog it
+        // leaves lands in some ramp-up window. Splits, stops and the end
+        // still commit.
         writer: WriterConfig {
-            commit_interval: Duration::from_millis(100),
+            commit_interval: Duration::from_secs(60),
             commit_bytes: 8 * 1024 * 1024,
         },
         ramp: RampConfig {
@@ -85,19 +89,25 @@ impl Env {
     }
 
     async fn run(&self, config: &DownloadConfig, shared: &Shared) -> Run {
-        let (_keep, stop) = watch::channel(false);
-        self.run_until(config, shared, stop).await
+        self.run_until(config, shared, |_| false).await
     }
 
+    /// Runs until done, or stops it once `stop_when` sees an event.
     async fn run_until(
         &self,
         config: &DownloadConfig,
         shared: &Shared,
-        stop: watch::Receiver<bool>,
+        stop_when: impl Fn(&DownloadEvent) -> bool + Send + Sync + 'static,
     ) -> Run {
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = events.clone();
-        let on_event = move |e: DownloadEvent| sink.lock().unwrap().push(e);
+        let (tx, stop) = watch::channel(false);
+        let on_event = move |e: DownloadEvent| {
+            if stop_when(&e) {
+                tx.send_replace(true);
+            }
+            sink.lock().unwrap().push(e);
+        };
         let client = http::client().unwrap();
         let started = Instant::now();
         let result = tokio::time::timeout(
@@ -239,13 +249,13 @@ async fn server_that_stops_ranging_downgrades_to_one_connection() {
 async fn resume_after_a_multi_connection_stop() {
     let server = TestServer::start().unwrap();
     let env = Env::new(&server, "/blob/4000000?seed=5&throttle=1000000");
-    let (tx, stop) = watch::channel(false);
-    let stopper = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(900)).await;
-        tx.send(true).unwrap();
-    });
-    let run = env.run_until(&config(100), &Shared::default(), stop).await;
-    stopper.await.unwrap();
+    // Stopped once ramp-up (never saturated) opens a fourth connection:
+    // the second has had two ramp steps to write, so the journal holds
+    // several ranges, however slow the start was.
+    let mut config = config(100);
+    config.ramp.min_gain = -1.0;
+    let fourth = |e: &DownloadEvent| matches!(e, DownloadEvent::Connections(n) if *n >= 4);
+    let run = env.run_until(&config, &Shared::default(), fourth).await;
     assert!(
         matches!(run.result, Err(DownloadError::Stopped)),
         "{:?}",
@@ -255,7 +265,7 @@ async fn resume_after_a_multi_connection_stop() {
     assert!(committed.ranges().len() >= 2, "{committed:?}");
 
     let before = server.requests().len();
-    let run = env.run(&config(100), &Shared::default()).await;
+    let run = env.run(&config, &Shared::default()).await;
     run.result.as_ref().unwrap();
     assert_eq!(env.part_hash(), blob::digest(5, 4 * MB));
     let resumed: Vec<u64> = server.requests()[before..]
@@ -318,9 +328,11 @@ async fn a_download_limit_paces_it_without_fooling_ramp_up() {
     let run = env.run(&config(200), &shared).await;
     run.result.as_ref().unwrap();
     assert_eq!(env.part_hash(), blob::digest(0, 600_000));
-    // 600 kB at 200 kB/s, less the 40 kB initial burst: 2.8 s.
+    // 600 kB at 200 kB/s, less the 40 kB initial burst: 2.8 s. The floor
+    // is the limit holding; the ceiling catches pacing well under it, not
+    // set-up and fsyncs (up to a second on CI).
     let secs = run.elapsed.as_secs_f64();
-    assert!((2.6..3.3).contains(&secs), "{secs} s");
+    assert!((2.6..4.0).contains(&secs), "{secs} s");
     assert_eq!(run.max_connections(), 1);
     assert_eq!(shared.link.ceiling(), None, "a limit is not the link");
 }
@@ -341,8 +353,9 @@ async fn the_global_limit_is_shared() {
     ra.result.unwrap();
     rb.result.unwrap();
     assert_eq!(b.part_hash(), blob::digest(1, 300_000));
+    // As above: 2.8 s.
     let secs = started.elapsed().as_secs_f64();
-    assert!((2.6..3.3).contains(&secs), "{secs} s");
+    assert!((2.6..4.0).contains(&secs), "{secs} s");
 }
 
 /// §10.6 (issue #8): with 50 % headroom, once ramp-up has found the link
@@ -359,8 +372,11 @@ async fn headroom_leaves_part_of_the_link_free() {
     let run = env.run(&config(300), &shared).await;
     run.result.as_ref().unwrap();
     assert_eq!(env.part_hash(), blob::digest(0, 4 * MB));
+    // A window can't see more than the link carried since the connection
+    // before it opened (settle + window, 4/3 of one): bytes held up by the
+    // split's fsync arrive late, all at once.
     let peak = shared.global.peak().expect("peak measured") as f64;
-    assert!((800_000.0..1_200_000.0).contains(&peak), "peak {peak}");
+    assert!((800_000.0..1_400_000.0).contains(&peak), "peak {peak}");
     let cap = shared.global.rate().expect("capped after ramp-up") as f64;
     assert!((cap / peak - 0.5).abs() < 0.01, "cap {cap}, peak {peak}");
     // Unlimited it takes about 4 s; at half the link after ramp-up, longer.
