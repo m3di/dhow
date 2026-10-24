@@ -137,7 +137,10 @@ impl Engine {
         Ok(rate.map(|r| r as u64))
     }
 
-    fn setting<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>, EngineError> {
+    pub(super) fn setting<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>, EngineError> {
         let json: Option<String> = self
             .db()
             .conn()

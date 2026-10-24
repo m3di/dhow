@@ -2,10 +2,12 @@
 //! scripts and spec-tests read the same thing a person does.
 
 use dhow_core::download::ResetReason;
+use dhow_core::engine::categories::CategoryUsage;
 use dhow_core::engine::limits::LimitSettings;
 use dhow_core::engine::queues::QueueSnapshot;
 use dhow_core::engine::speed::SpeedSample;
 use dhow_core::engine::{EngineEvent, Snapshot, WarningKind};
+use dhow_core::naming::ExtraExtensions;
 use dhow_core::probe::Resumable;
 use serde_json::{Value, json};
 
@@ -83,6 +85,14 @@ pub fn snapshot(event: &str, s: &Snapshot) -> Value {
         "queue": s.queue_id,
         "position": s.position,
         "speed_limit": s.speed_limit,
+        "category": s.category.as_str(),
+    })
+}
+
+pub fn storage(u: &CategoryUsage) -> Value {
+    json!({
+        "event": "storage", "category": u.category.as_str(), "bytes": u.bytes,
+        "files": u.files, "missing": u.missing,
     })
 }
 
@@ -93,11 +103,12 @@ pub fn sample(id: Option<&str>, s: &SpeedSample) -> Value {
     })
 }
 
-pub fn settings(s: &LimitSettings) -> Value {
+pub fn settings(s: &LimitSettings, extra: &ExtraExtensions) -> Value {
     json!({
         "event": "settings",
         "global_speed_limit": s.global,
         "headroom_percent": s.headroom_percent,
+        "extra_extensions": extra,
     })
 }
 

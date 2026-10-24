@@ -76,7 +76,7 @@ pub enum Command {
     // get_download(id) -> DownloadSnapshot
     // list_downloads(filter) -> Vec<DownloadSnapshot>
     // list_queues() -> Vec<QueueSnapshot>
-    // storage_breakdown() -> Vec<(Category, u64)>
+    // storage_breakdown() -> Vec<CategoryUsage>              // { category, bytes, files, missing: Vec<DownloadId> }
     // speed_history(id, window) -> Vec<SpeedSample>
     // network_info() -> NetworkInfo
     // settings() -> Settings

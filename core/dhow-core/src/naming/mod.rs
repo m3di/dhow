@@ -1,5 +1,7 @@
-//! File naming (ENGINE-SPEC §3). Pure functions, no I/O.
+//! File naming (ENGINE-SPEC §3) and categories (§13.1). Pure functions,
+//! no I/O.
 
+mod category;
 mod disposition;
 mod mime;
 #[cfg(test)]
@@ -10,6 +12,8 @@ use std::collections::HashSet;
 use reqwest::Url;
 
 use crate::probe::ProbeInfo;
+
+pub use category::{Category, ExtraExtensions, categorize, normalize_extension};
 
 /// Longest final name in bytes: 255 minus the longest suffix the engine adds
 /// (`.dhow.tmp` during sidecar compaction, §5.3). UTF-8 bytes never undercount
@@ -123,7 +127,7 @@ pub fn deduplicate<S: AsRef<str>>(name: &str, existing: &[S]) -> String {
 
 /// `(stem, extension-with-dot)`. An extension is 1–10 ASCII alphanumerics
 /// after the last dot of a non-empty stem, or one of the compound ones.
-fn split(name: &str) -> (&str, &str) {
+pub(crate) fn split(name: &str) -> (&str, &str) {
     let lower = name.to_ascii_lowercase();
     for ext in COMPOUND_EXTENSIONS {
         if lower.len() > ext.len() && lower.ends_with(ext) {

@@ -367,8 +367,14 @@ Changing a limit takes effect within 200 ms: waiting connections are woken at on
 
 ### 13.1 Category
 
-Derived at probe time from extension first, `Content-Type` second:
-`Video | Audio | Image | Document | Archive | Software | Code | Data | Other`. The mapping table lives in `dhow-core/src/naming/categories.toml`, user-extensible via settings (`extra_extensions: {Category: [ext]}`). `storage_breakdown()` sums `total_size` of `Completed` downloads by category and reports whether the file still exists (via path or token).
+Derived at `Add` from the file name's extension first, `Content-Type` second:
+`Video | Audio | Image | Document | Archive | Software | Code | Data | Other`. The mapping table lives in `dhow-core/src/naming/categories.toml`, user-extensible via settings (`extra_extensions: {Category: [ext]}`). `storage_breakdown()` sums `total_size` of `Completed` downloads by category and reports whether the file still exists (via path or token). (`ProbeInfo.category`, §2.2, is the same derivation on `suggested_name` at probe time, once a standalone `Probe` exists.)
+
+- At `Add` the name is the one chosen by §3 or the user's `filename`, *before* collision handling: ` (n)` goes before what §3 treats as the extension, which can sit inside a longer extension a user added (`model (2).tar.lz`), so the deduplicated name could categorise differently.
+- On `Renamed` (the file was renamed or moved outside Dhow, found via its token, M3.5) the category is derived again from the new name: `x.mkv` renamed to `x.zip` becomes `Archive`.
+- Extensions match case-insensitively, longest suffix first (`a.tar.gz`: `tar.gz`, then `gz`); at each length the user's extras beat the built-in table. This is a lookup rule only; §3's stem/extension split (used for ` (n)` and §13.2) is unchanged. An extension is in at most one category; adding it to one removes it from the others. Adding it to `Other` takes a built-in out of its category.
+- No known extension: the `Content-Type`'s usual extension (§3's table) is looked up the same way, then its top-level type (`video/*`, `audio/*`, `image/*`); otherwise `Other`.
+- Per category, `storage_breakdown()` gives the bytes and count of completed downloads whose file still exists, and the ids of those whose file is gone (not counted in the bytes). Categories with neither are omitted.
 
 ### 13.2 Automatic grouping
 
