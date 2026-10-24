@@ -2,6 +2,7 @@
 //! scripts and spec-tests read the same thing a person does.
 
 use dhow_core::download::ResetReason;
+use dhow_core::engine::limits::LimitSettings;
 use dhow_core::engine::queues::QueueSnapshot;
 use dhow_core::engine::{EngineEvent, Snapshot, WarningKind};
 use dhow_core::probe::Resumable;
@@ -78,6 +79,15 @@ pub fn snapshot(event: &str, s: &Snapshot) -> Value {
         "identity_weak": s.identity_weak,
         "queue": s.queue_id,
         "position": s.position,
+        "speed_limit": s.speed_limit,
+    })
+}
+
+pub fn settings(s: &LimitSettings) -> Value {
+    json!({
+        "event": "settings",
+        "global_speed_limit": s.global,
+        "headroom_percent": s.headroom_percent,
     })
 }
 

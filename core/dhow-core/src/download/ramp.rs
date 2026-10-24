@@ -116,15 +116,31 @@ pub fn split_point(
     }
 }
 
+/// What ramp-up reads at each check: running totals.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sample {
+    /// This download's bytes.
+    pub bytes: u64,
+    /// Times its limiter made a connection wait.
+    pub waits: u64,
+    /// Every download's bytes (the process-wide aggregate).
+    pub aggregate: u64,
+}
+
 /// The ramp-up decision of §4.4 (issue #8): after opening connection `k`,
 /// let it settle, measure aggregate throughput for a window, and keep going
 /// only if it rose by `min_gain` over what `k - 1` connections did. A
-/// stalled download (no bytes in a window) doesn't ramp.
+/// stalled download (no bytes in a window) doesn't ramp, and neither does a
+/// limited one (§12): a window in which a speed limit made a connection
+/// wait measures the limit, not the link, so it is measured again.
 #[derive(Debug)]
 pub struct Ramp {
     phase: Phase,
     /// Throughput measured before the last connection opened.
     previous: Option<f64>,
+    /// Aggregate throughput of the last full window (headroom's peak,
+    /// §10.6), until taken.
+    aggregate: Option<f64>,
     pub next_check: Instant,
     pub done: bool,
 }
@@ -138,7 +154,7 @@ enum Phase {
     Blocked,
     Measuring {
         from: Instant,
-        bytes: u64,
+        start: Sample,
     },
 }
 
@@ -156,33 +172,35 @@ impl Ramp {
         Self {
             phase: Phase::Settling,
             previous: None,
+            aggregate: None,
             next_check: now + settle(config),
             done: false,
         }
     }
 
-    /// Called at `next_check` with the download's total received bytes.
-    pub fn check(&mut self, now: Instant, bytes: u64, config: &RampConfig) -> Step {
+    /// Called at `next_check`.
+    pub fn check(&mut self, now: Instant, sample: Sample, config: &RampConfig) -> Step {
         let (from, start) = match self.phase {
-            Phase::Settling => {
-                self.phase = Phase::Measuring { from: now, bytes };
-                self.next_check = now + config.window;
+            Phase::Measuring { from, start } if start.waits == sample.waits => (from, start),
+            // Settled; or a limit made it wait, so it measured the limit:
+            // measure again.
+            Phase::Settling | Phase::Measuring { .. } => {
+                self.measure(now, sample, config);
                 return Step::Wait;
             }
-            Phase::Measuring { from, bytes } => (from, bytes),
             Phase::Blocked => {
                 self.phase = Phase::Settling;
                 self.next_check = now + settle(config);
                 return Step::Open;
             }
         };
-        let delta = bytes.saturating_sub(start);
+        let delta = sample.bytes.saturating_sub(start.bytes);
         let elapsed = now.saturating_duration_since(from).as_secs_f64();
         if delta == 0 || elapsed <= 0.0 {
-            self.phase = Phase::Measuring { from: now, bytes };
-            self.next_check = now + config.window;
+            self.measure(now, sample, config);
             return Step::Wait;
         }
+        self.aggregate = Some(sample.aggregate.saturating_sub(start.aggregate) as f64 / elapsed);
         let rate = delta as f64 / elapsed;
         if let Some(previous) = self.previous
             && rate < previous * (1.0 + config.min_gain)
@@ -194,6 +212,22 @@ impl Ramp {
         self.phase = Phase::Settling;
         self.next_check = now + settle(config);
         Step::Open
+    }
+
+    fn measure(&mut self, now: Instant, start: Sample, config: &RampConfig) {
+        self.phase = Phase::Measuring { from: now, start };
+        self.next_check = now + config.window;
+    }
+
+    /// The aggregate throughput of the last window measured, once.
+    pub fn take_aggregate(&mut self) -> Option<f64> {
+        self.aggregate.take()
+    }
+
+    /// Settling or measuring: what it sees is the link's answer to more
+    /// connections (headroom learns the peak then, §10.6).
+    pub fn probing(&self) -> bool {
+        !self.done && !matches!(self.phase, Phase::Blocked)
     }
 
     /// The budget refused the connection `check` asked for: ask again in a
@@ -218,6 +252,14 @@ mod tests {
     use super::*;
 
     const MIB: u64 = 1024 * 1024;
+
+    fn s(bytes: u64, waits: u64) -> Sample {
+        Sample {
+            bytes,
+            waits,
+            aggregate: bytes * 2,
+        }
+    }
 
     #[test]
     fn limit_follows_4_1() {
@@ -305,15 +347,40 @@ mod tests {
         let mut r = Ramp::new(t0, &c);
         assert_eq!(r.next_check, at(1), "settles a third of a window first");
         // Measure 1 → 4 s with one connection: 1 MB/s. Open a second.
-        assert!(matches!(r.check(at(1), 0, &c), Step::Wait));
-        assert!(matches!(r.check(at(4), 3_000_000, &c), Step::Open));
+        assert!(matches!(r.check(at(1), s(0, 0), &c), Step::Wait));
+        assert!(matches!(r.check(at(4), s(3_000_000, 0), &c), Step::Open));
         // Settle, then 2 MB/s: open a third.
-        assert!(matches!(r.check(at(5), 4_000_000, &c), Step::Wait));
-        assert!(matches!(r.check(at(8), 10_000_000, &c), Step::Open));
+        assert!(matches!(r.check(at(5), s(4_000_000, 0), &c), Step::Wait));
+        assert!(matches!(r.check(at(8), s(10_000_000, 0), &c), Step::Open));
         // 2.1 MB/s: under +10 %, saturated.
-        assert!(matches!(r.check(at(9), 12_000_000, &c), Step::Wait));
-        assert!(matches!(r.check(at(12), 18_300_000, &c), Step::Saturated));
+        assert!(matches!(r.check(at(9), s(12_000_000, 0), &c), Step::Wait));
+        assert!(matches!(
+            r.check(at(12), s(18_300_000, 0), &c),
+            Step::Saturated
+        ));
         assert!(r.done);
+        // Every download's bytes over the last window: headroom's peak.
+        assert_eq!(r.take_aggregate(), Some(4_200_000.0));
+        assert_eq!(r.take_aggregate(), None);
+    }
+
+    #[test]
+    fn a_limited_window_is_measured_again() {
+        let c = RampConfig::default();
+        let t0 = Instant::now();
+        let mut r = Ramp::new(t0, &c);
+        let m = t0 + settle(&c);
+        r.check(m, s(0, 0), &c);
+        assert!(matches!(r.check(m + c.window, s(1_000, 0), &c), Step::Open));
+        let m = m + c.window + settle(&c);
+        r.check(m, s(1_000, 0), &c);
+        // No faster with two, but a limit made it wait: neither saturated
+        // nor a reason to open more.
+        assert!(matches!(r.check(m + c.window, s(2_000, 3), &c), Step::Wait));
+        assert!(!r.done);
+        // The limit lifted: measured for real.
+        let m = m + c.window * 2;
+        assert!(matches!(r.check(m, s(10_000, 3), &c), Step::Open));
     }
 
     #[test]
@@ -322,11 +389,14 @@ mod tests {
         let t0 = Instant::now();
         let mut r = Ramp::new(t0, &c);
         let measuring = t0 + settle(&c);
-        r.check(measuring, 0, &c);
+        r.check(measuring, s(0, 0), &c);
         // Nothing arrived in the window: wait.
-        assert!(matches!(r.check(measuring + c.window, 0, &c), Step::Wait));
+        assert!(matches!(
+            r.check(measuring + c.window, s(0, 0), &c),
+            Step::Wait
+        ));
         // A trickle is enough to try another connection.
         let later = measuring + c.window * 2;
-        assert!(matches!(r.check(later, 1024, &c), Step::Open));
+        assert!(matches!(r.check(later, s(1024, 0), &c), Step::Open));
     }
 }

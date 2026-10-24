@@ -105,6 +105,9 @@ enum Command {
         /// Queue (name or id) [default: the default queue]
         #[arg(long)]
         to: Option<String>,
+        /// Speed limit for this download, see `dhow limit`
+        #[arg(long)]
+        limit: Option<String>,
     },
     /// Run a paused, failed or interrupted download here until it finishes
     Resume { id: String },
@@ -135,6 +138,19 @@ enum Command {
         #[arg(long)]
         before: Option<String>,
     },
+    /// Limit a download's speed: bytes/s with an optional K, M or G
+    /// (×1024), `0` to pause it by limit, `none` to lift it
+    Limit { id: String, rate: String },
+    /// Show or change the global speed limit and headroom
+    Settings {
+        /// Limit for all downloads together (see `dhow limit`)
+        #[arg(long)]
+        global_limit: Option<String>,
+        /// Percent of the observed peak to leave free for everything else
+        /// on the link (0–99)
+        #[arg(long)]
+        headroom: Option<u8>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -156,6 +172,9 @@ enum QueueCommand {
         /// end) or `stop-outside` (also pause at the end)
         #[arg(long, default_value = "start")]
         action: String,
+        /// Speed limit for the queue's downloads together, see `dhow limit`
+        #[arg(long)]
+        limit: Option<String>,
     },
     /// List queues
     Ls,
@@ -176,6 +195,9 @@ enum QueueCommand {
         /// Remove the schedule
         #[arg(long, conflicts_with = "windows")]
         no_schedule: bool,
+        /// Speed limit (`none` lifts it), see `dhow limit`
+        #[arg(long)]
+        limit: Option<String>,
     },
     /// Start a queue now, whatever its schedule says, until its next edge
     Start { queue: String },
@@ -258,6 +280,7 @@ async fn run(
             paused,
             connections,
             to,
+            limit,
         } => {
             let target_queue = to.map(|q| engine.resolve_queue(&q)).transpose()?;
             let directory = std::path::absolute(dir.unwrap_or_else(|| PathBuf::from(".")))?;
@@ -272,6 +295,7 @@ async fn run(
                 paused,
                 connections,
                 queue: target_queue,
+                speed_limit: limit.as_deref().map(parse_rate).transpose()?.flatten(),
                 target_fs: TargetFs::host(),
             };
             let added = engine.add(req).await?;
@@ -328,11 +352,12 @@ async fn run(
                     on_complete,
                     windows,
                     action,
+                    limit,
                 } => {
                     let spec = QueueSpec {
                         name,
                         max_concurrent: max,
-                        speed_limit: None,
+                        speed_limit: limit.as_deref().map(parse_rate).transpose()?.flatten(),
                         schedule: parse_schedule(&windows, &action)?,
                         on_complete: parse_on_complete(&on_complete)?,
                     };
@@ -352,6 +377,7 @@ async fn run(
                     windows,
                     action,
                     no_schedule,
+                    limit,
                 } => {
                     let id = engine.resolve_queue(&queue)?;
                     let current = engine.queue(&id)?;
@@ -369,7 +395,10 @@ async fn run(
                     let spec = QueueSpec {
                         name: name.or(current.name).unwrap_or_else(|| "default".into()),
                         max_concurrent: max.unwrap_or(current.max_concurrent),
-                        speed_limit: current.speed_limit,
+                        speed_limit: match limit {
+                            Some(v) => parse_rate(&v)?,
+                            None => current.speed_limit,
+                        },
                         schedule,
                         on_complete: match on_complete {
                             Some(v) => parse_on_complete(&v)?,
@@ -413,6 +442,27 @@ async fn run(
             lock::poke_runners(&data_dir);
             Ok(ExitCode::SUCCESS)
         }
+        Command::Limit { id, rate } => {
+            let id = engine.resolve(&id)?;
+            let snap = engine.set_speed_limit(&id, parse_rate(&rate)?)?;
+            output::emit(output::snapshot("download", &snap));
+            lock::poke_runners(&data_dir);
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Settings {
+            global_limit,
+            headroom,
+        } => {
+            if let Some(v) = global_limit {
+                engine.set_global_limit(parse_rate(&v)?)?;
+            }
+            if let Some(p) = headroom {
+                engine.set_headroom(p)?;
+            }
+            output::emit(output::settings(&engine.limit_settings()?));
+            lock::poke_runners(&data_dir);
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Reorder { id, before } => {
             let id = engine.resolve(&id)?;
             let before = before.map(|b| engine.resolve(&b)).transpose()?;
@@ -424,6 +474,33 @@ async fn run(
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// Bytes/s: a number with an optional `K`, `M` or `G` (×1024, a trailing
+/// `B` or `iB` allowed), or `none`.
+fn parse_rate(v: &str) -> Res<Option<u64>> {
+    let t = v.trim().to_ascii_lowercase();
+    if matches!(t.as_str(), "none" | "off" | "unlimited") {
+        return Ok(None);
+    }
+    let t = t
+        .strip_suffix("ib")
+        .or_else(|| t.strip_suffix('b'))
+        .unwrap_or(&t);
+    let (num, unit) = match t.char_indices().last() {
+        Some((i, 'k')) => (&t[..i], 1u64 << 10),
+        Some((i, 'm')) => (&t[..i], 1 << 20),
+        Some((i, 'g')) => (&t[..i], 1 << 30),
+        _ => (t, 1),
+    };
+    let n: f64 = num
+        .trim()
+        .parse()
+        .map_err(|_| format!("{v:?} is not a rate (e.g. 500K, 2M, none)"))?;
+    if !n.is_finite() || n < 0.0 {
+        return Err(format!("{v:?} is not a rate (e.g. 500K, 2M, none)").into());
+    }
+    Ok(Some((n * unit as f64).round() as u64))
 }
 
 fn parse_action(v: &str) -> Res<Action> {
@@ -484,6 +561,8 @@ async fn runner(
         let poked = poke.notified();
         tokio::pin!(poked);
         poked.as_mut().enable();
+        // A limit another `dhow` changed (§12).
+        engine.refresh_limits()?;
 
         if *stop.borrow() && !stopping {
             stopping = true;
@@ -653,4 +732,24 @@ fn parse_header(raw: &str) -> Res<Header> {
         name: name.trim().to_owned(),
         value: value.trim().to_owned(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_rate;
+
+    #[test]
+    fn rates() {
+        assert_eq!(parse_rate("500").unwrap(), Some(500));
+        assert_eq!(parse_rate("0").unwrap(), Some(0));
+        assert_eq!(parse_rate("500K").unwrap(), Some(512_000));
+        assert_eq!(parse_rate("1.5m").unwrap(), Some(1_572_864));
+        assert_eq!(parse_rate("2MiB").unwrap(), Some(2 << 20));
+        assert_eq!(parse_rate("100kb").unwrap(), Some(102_400));
+        assert_eq!(parse_rate("1G").unwrap(), Some(1 << 30));
+        assert_eq!(parse_rate("none").unwrap(), None);
+        assert!(parse_rate("fast").is_err());
+        assert!(parse_rate("-1K").is_err());
+        assert!(parse_rate("").is_err());
+    }
 }

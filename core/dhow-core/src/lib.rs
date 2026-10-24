@@ -5,6 +5,7 @@ pub mod download;
 pub mod engine;
 pub mod http;
 pub mod journal;
+pub mod limit;
 pub mod logging;
 pub mod naming;
 pub mod probe;

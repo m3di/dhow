@@ -202,6 +202,7 @@ impl Engine {
                 spec.on_complete.as_str()
             ],
         )?;
+        self.refresh_limits()?;
         self.queue(id)
     }
 

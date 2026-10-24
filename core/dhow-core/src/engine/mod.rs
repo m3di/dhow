@@ -7,6 +7,7 @@
 //! decision (the CLI runs one in the foreground); the caller also makes
 //! sure no two processes run the same download.
 
+pub mod limits;
 pub mod queues;
 #[cfg(test)]
 mod tests;
@@ -202,6 +203,9 @@ pub struct AddRequest {
     pub connections: Option<u8>,
     /// `None`: the default queue.
     pub queue: Option<queues::QueueId>,
+    /// Bytes/s for this download; `None`: only its queue's and the global
+    /// limit apply (§12).
+    pub speed_limit: Option<u64>,
     pub target_fs: TargetFs,
 }
 
@@ -223,6 +227,8 @@ pub struct Snapshot {
     pub queue_id: queues::QueueId,
     /// Order within its queue.
     pub position: i64,
+    /// Bytes/s; `Some(0)`: paused by limit (§12).
+    pub speed_limit: Option<u64>,
 }
 
 impl Snapshot {
@@ -249,6 +255,8 @@ pub enum EngineError {
     DefaultQueue,
     #[error("{0}")]
     InvalidQueue(&'static str),
+    #[error("{0}")]
+    InvalidSetting(&'static str),
 }
 
 impl From<rusqlite::Error> for EngineError {
@@ -261,9 +269,10 @@ pub struct Engine {
     db: Arc<Mutex<Db>>,
     client: Client,
     config: DownloadConfig,
-    /// The connection budget and link knowledge all downloads in this
-    /// process share (§10).
+    /// The connection budget, link knowledge and global speed limit all
+    /// downloads in this process share (§10, §12).
     shared: Shared,
+    buckets: Mutex<limits::Buckets>,
 }
 
 impl Engine {
@@ -271,16 +280,23 @@ impl Engine {
     pub fn open(data_dir: &Path, config: DownloadConfig) -> Result<Self, EngineError> {
         let db = Db::open(&data_dir.join("dhow.sqlite"))?;
         let client = http::client().map_err(io::Error::other)?;
-        Ok(Self {
+        let engine = Self {
             db: Arc::new(Mutex::new(db)),
             client,
             config,
             shared: Shared::new(config.budget),
-        })
+            buckets: Mutex::default(),
+        };
+        engine.refresh_limits()?;
+        Ok(engine)
     }
 
     fn db(&self) -> MutexGuard<'_, Db> {
         self.db.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn buckets(&self) -> MutexGuard<'_, limits::Buckets> {
+        self.buckets.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Probes and records a download (§2, §3). Doesn't start it. Fails
@@ -338,9 +354,9 @@ impl Engine {
         db.conn().execute(
             "INSERT INTO downloads (id, url, headers, final_path, part_path, state, fail_reason,
                  queue_id, position, category, created_at, total_size, etag, last_modified,
-                 digest, resumable, connections)
+                 digest, resumable, connections, speed_limit)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'other', ?10, ?11, ?12, ?13, ?14, ?15,
-                 ?16)",
+                 ?16, ?17)",
             params![
                 id,
                 req.url.as_str(),
@@ -358,6 +374,7 @@ impl Engine {
                 info.digest.as_ref().map(digest_text),
                 resumable_str(info.resumable),
                 req.connections.map(|n| n.max(1)),
+                req.speed_limit.map(|r| r as i64),
             ],
         )?;
         drop(db);
@@ -496,6 +513,7 @@ impl Engine {
             sidecar: sidecar.clone(),
             connections: self.connections(id)?,
             started_at: self.started_at(id)?,
+            limits: self.take_buckets(id, &snap.queue_id)?,
         };
         let progress = Mutex::new(Progress::new(snap.total_size));
         let dl_event = |e: DownloadEvent| self.on_download_event(id, e, &progress, on_event);
@@ -508,6 +526,7 @@ impl Engine {
             stop,
         )
         .await;
+        self.drop_buckets(id);
         let done = match result {
             Ok(done) => done,
             Err(DownloadError::Stopped) => {
@@ -801,7 +820,8 @@ fn fail_reason(e: &DownloadError) -> FailReason {
 }
 
 const SELECT: &str = "SELECT id, url, final_path, part_path, state, fail_reason, total_size,
-    resumable, size_unverified, identity_weak, created_at, queue_id, position FROM downloads";
+    resumable, size_unverified, identity_weak, created_at, queue_id, position, speed_limit
+    FROM downloads";
 
 fn snapshot(r: &Row) -> rusqlite::Result<Snapshot> {
     let state: String = r.get(4)?;
@@ -840,6 +860,7 @@ fn snapshot(r: &Row) -> rusqlite::Result<Snapshot> {
         created_at: r.get(10)?,
         queue_id: r.get(11)?,
         position: r.get(12)?,
+        speed_limit: r.get::<_, Option<i64>>(13)?.map(|v| v as u64),
     })
 }
 

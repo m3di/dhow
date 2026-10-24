@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use dhow_core::http;
 use dhow_core::journal::{Header, Journal, format};
+use dhow_core::limit::Limiter;
 use dhow_core::probe::Resumable;
 use dhow_core::rangeset::RangeSet;
 use dhow_core::transfer::{
@@ -92,6 +93,7 @@ async fn download(server: &TestServer, spec: Spec<'_>) -> Run {
         total: spec.total,
         resumable: spec.resumable,
         validator: spec.validator,
+        limiter: Arc::new(Limiter::unlimited()),
     };
     let events = Arc::new(Mutex::new(Vec::new()));
     let sink = events.clone();

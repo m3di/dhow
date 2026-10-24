@@ -22,6 +22,7 @@ use tokio::sync::{Notify, watch};
 
 use crate::http::Header;
 use crate::journal::{Header as JournalHeader, Journal, JournalError, format};
+use crate::limit::{Bucket, GlobalLimit, Limiter};
 use crate::probe::{self, ProbeError, ProbeInfo, ProbeOptions, Resumable};
 use crate::rangeset::RangeSet;
 use crate::transfer::{
@@ -31,7 +32,7 @@ use crate::transfer::{
 use crate::writer::actor::{self, Outcome, WriterGone, WriterHandle};
 use crate::writer::{self, ChunkId, Writer, WriterConfig, WriterError};
 use budget::{Budget, BudgetConfig, Ticket};
-use ramp::{LinkState, Ramp, RampConfig, Step};
+use ramp::{LinkState, Ramp, RampConfig, Sample, Step};
 
 pub struct Request {
     pub url: Url,
@@ -43,22 +44,43 @@ pub struct Request {
     /// When it first started (unix ms): older downloads get connections
     /// first (§10.3). `None`: now.
     pub started_at: Option<i64>,
+    /// Speed limits besides the global one: its queue's and its own (§12).
+    pub limits: Vec<Arc<Bucket>>,
 }
 
 /// What all downloads in a process share: the connection budget (§10.1–
-/// 10.3) and what is known about the link (§10.A).
-#[derive(Debug, Default)]
+/// 10.3), what is known about the link (§10.A) and the global speed limit
+/// (§12).
+#[derive(Debug)]
 pub struct Shared {
     pub link: LinkState,
     pub budget: Arc<Budget>,
+    pub global: Arc<GlobalLimit>,
+    /// Woken by every limit change; buckets made for this process's
+    /// downloads must share it ([`Shared::bucket`]).
+    limits_changed: Arc<Notify>,
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self::new(BudgetConfig::default())
+    }
 }
 
 impl Shared {
     pub fn new(budget: BudgetConfig) -> Self {
+        let limits_changed = Arc::new(Notify::new());
         Self {
             link: LinkState::default(),
             budget: Arc::new(Budget::new(budget)),
+            global: Arc::new(GlobalLimit::new(limits_changed.clone())),
+            limits_changed,
         }
+    }
+
+    /// A queue's or a download's speed limit.
+    pub fn bucket(&self, rate: Option<u64>) -> Arc<Bucket> {
+        Arc::new(Bucket::new(rate, self.limits_changed.clone()))
     }
 }
 
@@ -195,16 +217,7 @@ pub async fn download(
         });
         let (file, journal) = prepare(req, &info, force.take(), on_event)?;
         let fetched = fetch(
-            req,
-            client,
-            config,
-            &shared.link,
-            ticket,
-            &info,
-            file,
-            journal,
-            on_event,
-            stop,
+            req, client, config, shared, ticket, &info, file, journal, on_event, stop,
         )
         .await;
         ticket.release_all();
@@ -325,7 +338,7 @@ async fn fetch(
     req: &Request,
     client: &Client,
     config: &DownloadConfig,
-    link: &LinkState,
+    shared: &Shared,
     ticket: &Ticket,
     info: &ProbeInfo,
     file: File,
@@ -361,6 +374,7 @@ async fn fetch(
     }
 
     let validator = transfer::validator(info.etag.as_deref(), info.last_modified.as_deref());
+    let limiter = Arc::new(Limiter::new(shared.global.clone(), req.limits.clone()));
     let src = Source {
         client: client.clone(),
         url: req.url.clone(),
@@ -368,7 +382,9 @@ async fn fetch(
         total,
         resumable: info.resumable,
         validator: validator.clone(),
+        limiter: limiter.clone(),
     };
+    let link = &shared.link;
     let can_range = info.resumable != Resumable::No && total.is_some();
     let rc = &config.ramp;
     let limit = ramp::connection_limit(total, can_range, req.connections, rc, link);
@@ -405,6 +421,8 @@ async fn fetch(
     let mut running = FuturesUnordered::new();
     let mut ramp = Ramp::new(Instant::now(), rc);
     ramp.done = limit <= 1;
+    // Headroom's cap is lifted while this download ramps up (§10.6).
+    let mut learner = shared.global.learner();
     let mut connections = 0;
     let mut content_length_seen = true;
     let outcome: Result<(), Option<TransferError>> = 'run: loop {
@@ -459,6 +477,7 @@ async fn fetch(
         }
         let single_now = single.load(Ordering::Relaxed);
         let can_ramp = !ramp.done && !single_now && open < limit;
+        learner.set(can_ramp && ramp.probing());
         if let Some(until) = backoff_until.lock().unwrap().take() {
             ramp.pause_until(until);
         }
@@ -523,7 +542,16 @@ async fn fetch(
             }
             _ = tokio::time::sleep_until(next_check.into()), if can_ramp => {
                 let now = Instant::now();
-                match ramp.check(now, received.load(Ordering::Relaxed), rc) {
+                let sample = Sample {
+                    bytes: received.load(Ordering::Relaxed),
+                    waits: limiter.waits(),
+                    aggregate: shared.global.total(),
+                };
+                let step = ramp.check(now, sample, rc);
+                if let Some(rate) = ramp.take_aggregate() {
+                    shared.global.offer_peak(rate);
+                }
+                match step {
                     Step::Wait => {}
                     // The budget decides whether ramp-up may have it.
                     Step::Open if !ticket.try_grow() => ramp.blocked(now, rc),
@@ -555,6 +583,7 @@ async fn fetch(
     };
     // Connections borrow the writer handle; they go first.
     drop(running);
+    drop(learner);
     if connections > 0 {
         on_event(DownloadEvent::Connections(0));
     }

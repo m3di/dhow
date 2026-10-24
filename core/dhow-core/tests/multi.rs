@@ -79,6 +79,7 @@ impl Env {
             sidecar: dir.path().join("f.dhow"),
             connections: None,
             started_at: None,
+            limits: vec![],
         };
         Self { _dir: dir, req }
     }
@@ -301,4 +302,65 @@ async fn per_download_connection_limit() {
     run.result.as_ref().unwrap();
     assert_eq!(run.max_connections(), 2);
     assert_eq!(env.part_hash(), blob::digest(0, 4 * MB));
+}
+
+/// §12: a download's own limit paces it, and ramp-up doesn't take the limit
+/// for a saturated link: no extra connections, nothing recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_download_limit_paces_it_without_fooling_ramp_up() {
+    let server = TestServer::start().unwrap();
+    let shared = Shared::default();
+    let mut env = Env::new(&server, "/blob/600000");
+    env.req.limits = vec![shared.bucket(Some(200_000))];
+    let run = env.run(&config(200), &shared).await;
+    run.result.as_ref().unwrap();
+    assert_eq!(env.part_hash(), blob::digest(0, 600_000));
+    // 600 kB at 200 kB/s, less the 40 kB initial burst: 2.8 s.
+    let secs = run.elapsed.as_secs_f64();
+    assert!((2.6..3.3).contains(&secs), "{secs} s");
+    assert_eq!(run.max_connections(), 1);
+    assert_eq!(shared.link.ceiling(), None, "a limit is not the link");
+}
+
+/// §12: the global limit is one bucket for every download.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_global_limit_is_shared() {
+    let server = TestServer::start().unwrap();
+    let shared = Shared::default();
+    shared.global.set_user(Some(200_000));
+    let (a, b) = (
+        Env::new(&server, "/blob/300000"),
+        Env::new(&server, "/blob/300000?seed=1"),
+    );
+    let config = config(200);
+    let started = Instant::now();
+    let (ra, rb) = tokio::join!(a.run(&config, &shared), b.run(&config, &shared));
+    ra.result.unwrap();
+    rb.result.unwrap();
+    assert_eq!(b.part_hash(), blob::digest(1, 300_000));
+    let secs = started.elapsed().as_secs_f64();
+    assert!((2.6..3.3).contains(&secs), "{secs} s");
+}
+
+/// §10.6 (issue #8): with 50 % headroom, once ramp-up has found the link
+/// (1 MB/s, saturating at 4 connections) the download keeps to half of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn headroom_leaves_part_of_the_link_free() {
+    let server = TestServer::start().unwrap();
+    let shared = Shared::new(BudgetConfig {
+        per_host: 16,
+        ..BudgetConfig::default()
+    });
+    shared.global.set_headroom(50);
+    let env = Env::new(&server, "/blob/4000000?throttle=250000&link=1000000");
+    let run = env.run(&config(300), &shared).await;
+    run.result.as_ref().unwrap();
+    assert_eq!(env.part_hash(), blob::digest(0, 4 * MB));
+    let peak = shared.global.peak().expect("peak measured") as f64;
+    assert!((800_000.0..1_200_000.0).contains(&peak), "peak {peak}");
+    let cap = shared.global.rate().expect("capped after ramp-up") as f64;
+    assert!((cap / peak - 0.5).abs() < 0.01, "cap {cap}, peak {peak}");
+    // Unlimited it takes about 4 s; at half the link after ramp-up, longer.
+    let secs = run.elapsed.as_secs_f64();
+    assert!(secs > 5.5, "{secs} s");
 }

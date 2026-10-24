@@ -116,6 +116,7 @@ async fn run_all(jobs: Vec<Job>, budget: BudgetConfig, stagger: Duration) -> Tim
             sidecar: dir.path().join(format!("{i}.dhow")),
             connections: None,
             started_at: Some(base_ms + i as i64),
+            limits: vec![],
         };
         tasks.push(tokio::spawn(async move {
             tokio::time::sleep(stagger * i as u32).await;
