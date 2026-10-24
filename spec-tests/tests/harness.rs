@@ -12,6 +12,13 @@ fn cli_runs_in_sandbox() {
 }
 
 #[test]
+fn cli_logs_into_sandbox() {
+    let sandbox = Sandbox::new();
+    sandbox.dhow(std::iter::empty::<&str>()).assert_success();
+    assert_eq!(std::fs::read_dir(sandbox.log_dir()).unwrap().count(), 1);
+}
+
+#[test]
 fn cli_failure_is_reported() {
     assert!(!Sandbox::new().dhow(["--no-such-flag"]).status.success());
 }

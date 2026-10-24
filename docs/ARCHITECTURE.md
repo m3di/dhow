@@ -168,6 +168,14 @@ Lives next to the `.part` file. Authoritative record of what has been committed 
 
 Why both: the DB answers "what do I have" cheaply across thousands of downloads; the sidecar makes each download self-describing and keeps the fsync discipline local to the data it protects.
 
+### 5.3 Logs
+
+`tracing` events, written by `dhow_core::logging::init(dir, filter)` as JSON lines to `dhow.<date>.log`, rotated daily, 7 kept. Library code never installs a subscriber; the embedding process (CLI, Linux shell, FFI) calls `init` once. Writes are synchronous so the lines before a crash are on disk.
+
+Default dirs: macOS `~/Library/Logs/Dhow`, Linux `$XDG_STATE_HOME/dhow/logs`, Windows `%LOCALAPPDATA%\Dhow\logs`. iOS/Android shells pass a sandbox path. CLI: `--log-dir`/`DHOW_LOG_DIR`, `--log`/`DHOW_LOG` (EnvFilter syntax, default `warn,dhow=info`).
+
+Request headers (cookies, auth) and URL query strings may carry credentials and MUST NOT be logged.
+
 ## 6. Moved-file tracking
 
 Optional per platform via `PlatformAdapter::file_token_*`.
