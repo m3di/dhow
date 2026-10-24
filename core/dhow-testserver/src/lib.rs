@@ -57,7 +57,7 @@ use std::thread::JoinHandle;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 use http::{RangeSpec, Request};
 
@@ -90,6 +90,8 @@ struct Shared {
     counts: Mutex<HashMap<String, u32>>,
     /// When the shared link is next free, per target.
     links: Mutex<HashMap<String, std::time::Instant>>,
+    /// `true` while [`TestServer::hold`] holds `GET` bodies back.
+    hold: Option<watch::Receiver<bool>>,
 }
 
 type Counts = Arc<Shared>;
@@ -99,6 +101,7 @@ type Counts = Arc<Shared>;
 pub struct TestServer {
     addr: SocketAddr,
     log: Log,
+    hold: watch::Sender<bool>,
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -113,12 +116,13 @@ impl TestServer {
             .build()?;
         let log = Log::default();
         let (shutdown, stop) = oneshot::channel();
+        let (hold, held) = watch::channel(false);
         let thread_log = log.clone();
         let thread = std::thread::spawn(move || {
             runtime.block_on(async move {
                 let listener = TcpListener::from_std(listener).expect("adopt listener");
                 tokio::select! {
-                    _ = serve_logged(listener, thread_log) => {}
+                    _ = serve_logged(listener, thread_log, Some(held)) => {}
                     _ = stop => {}
                 }
             })
@@ -126,6 +130,7 @@ impl TestServer {
         Ok(Self {
             addr,
             log,
+            hold,
             shutdown: Some(shutdown),
             thread: Some(thread),
         })
@@ -138,6 +143,16 @@ impl TestServer {
     /// `path` must start with `/`, e.g. `server.url("/blob/1024?seed=1")`.
     pub fn url(&self, path: &str) -> String {
         format!("http://{}{path}", self.addr)
+    }
+
+    /// Holds back every `GET` body (its headers are sent) until
+    /// [`release`](Self::release): connections open, nothing flows.
+    pub fn hold(&self) {
+        self.hold.send_replace(true);
+    }
+
+    pub fn release(&self) {
+        self.hold.send_replace(false);
     }
 
     /// Every request received so far, in arrival order.
@@ -158,11 +173,18 @@ impl Drop for TestServer {
 }
 
 pub async fn serve(listener: TcpListener) -> io::Result<()> {
-    serve_logged(listener, Log::default()).await
+    serve_logged(listener, Log::default(), None).await
 }
 
-async fn serve_logged(listener: TcpListener, log: Log) -> io::Result<()> {
-    let counts = Counts::default();
+async fn serve_logged(
+    listener: TcpListener,
+    log: Log,
+    hold: Option<watch::Receiver<bool>>,
+) -> io::Result<()> {
+    let counts = Counts::new(Shared {
+        hold,
+        ..Shared::default()
+    });
     loop {
         let (stream, _) = listener.accept().await?;
         let (log, counts) = (log.clone(), counts.clone());
@@ -485,6 +507,10 @@ async fn respond(stream: &mut TcpStream, req: &Request, counts: &Counts) -> io::
     write_head(stream, status, &headers, keep).await?;
     if is_head {
         return Ok(keep);
+    }
+    if let Some(mut hold) = counts.hold.clone() {
+        stream.flush().await?;
+        let _ = hold.wait_for(|held| !*held).await;
     }
 
     let first_cut = k.cut_first.filter(|_| gets_before == 0);

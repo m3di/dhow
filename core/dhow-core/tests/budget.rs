@@ -102,20 +102,25 @@ struct Job {
 
 /// Runs `jobs` concurrently through one shared budget, starting them
 /// `stagger` apart (in age order), ramping up every `window`. With
-/// `newcomers_from: Some(k)`, download `k` and younger start only once the
-/// budget is spent. Asserts every file bit-exact.
+/// `newcomers: Some((k, n))`, download `k` and younger start only once `n`
+/// connections are open. `held` servers send nothing until every download
+/// has its first connection (no bytes, no ramp-up). Asserts every file
+/// bit-exact.
 async fn run_all(
     jobs: Vec<Job>,
     budget: BudgetConfig,
     stagger: Duration,
     window: Duration,
-    newcomers_from: Option<usize>,
+    newcomers: Option<(usize, u32)>,
+    held: &[TestServer],
 ) -> Timeline {
-    let global = budget.global;
     let shared = Arc::new(Shared::new(budget));
     let timeline = Arc::new(Mutex::new(Timeline::new(jobs.len())));
     let dir = tempfile::tempdir().unwrap();
     let base_ms = 1_000_000;
+    for s in held {
+        s.hold();
+    }
     let mut tasks = Vec::new();
     for (i, job) in jobs.into_iter().enumerate() {
         let (shared, timeline) = (shared.clone(), timeline.clone());
@@ -130,8 +135,8 @@ async fn run_all(
         };
         tasks.push(tokio::spawn(async move {
             tokio::time::sleep(stagger * i as u32).await;
-            if newcomers_from.is_some_and(|k| i >= k) {
-                while timeline.lock().unwrap().now.iter().sum::<u32>() < global {
+            if let Some((_, open)) = newcomers.filter(|&(k, _)| i >= k) {
+                while timeline.lock().unwrap().now.iter().sum::<u32>() < open {
                     tokio::time::sleep(ms(10)).await;
                 }
             }
@@ -147,6 +152,19 @@ async fn run_all(
                 "download {i}"
             );
         }));
+    }
+    if !held.is_empty() {
+        let all_started = async {
+            while timeline.lock().unwrap().now.contains(&0) {
+                tokio::time::sleep(ms(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(60), all_started)
+            .await
+            .expect("downloads never all started");
+        for s in held {
+            s.release();
+        }
     }
     for t in tasks {
         tokio::time::timeout(Duration::from_secs(60), t)
@@ -189,9 +207,18 @@ fn ten_jobs(servers: &[TestServer]) -> Vec<Job> {
 #[tokio::test(flavor = "multi_thread")]
 async fn ten_downloads_share_a_budget_of_sixteen_oldest_first() {
     let servers: Vec<TestServer> = (0..10).map(|_| TestServer::start().unwrap()).collect();
-    // A window well beyond start-up: all ten hold a connection before any
-    // of them ramps.
-    let t = run_all(ten_jobs(&servers), T10, Duration::ZERO, ms(200), None).await;
+    // Bytes flow only once all ten hold a connection, so none can ramp
+    // before (a slow start on CI let a younger one grow into the room
+    // latecomers hadn't taken yet).
+    let t = run_all(
+        ten_jobs(&servers),
+        T10,
+        Duration::ZERO,
+        ms(200),
+        None,
+        &servers,
+    )
+    .await;
     assert_caps(&t);
 
     let mut now = [0; 10];
@@ -216,7 +243,16 @@ async fn ten_downloads_share_a_budget_of_sixteen_oldest_first() {
 #[tokio::test(flavor = "multi_thread")]
 async fn newcomers_get_a_slot_when_the_budget_is_spent() {
     let servers: Vec<TestServer> = (0..10).map(|_| TestServer::start().unwrap()).collect();
-    let t = run_all(ten_jobs(&servers), T10, ms(60), ms(100), Some(4)).await;
+    // The four oldest take 2.25 s at full speed, so all ten overlap
+    // however slowly the newcomers start (at 1.5 s one sometimes finished
+    // first on CI). Not longer: their tails' ordinary releases would then
+    // seat the newcomers even without the guarantee.
+    let mut jobs = ten_jobs(&servers);
+    for (i, job) in jobs.iter_mut().enumerate().take(4) {
+        job.size = 4_500_000;
+        job.url = servers[i].url(&format!("/blob/4500000?seed={i}&throttle=500000"));
+    }
+    let t = run_all(jobs, T10, ms(60), ms(100), Some((4, T10.global)), &[]).await;
     assert_caps(&t);
     assert_eq!(t.max_holding, 10, "newcomers starved");
 }
@@ -250,7 +286,7 @@ async fn per_host_cap_is_shared_by_downloads_to_one_server() {
         per_host: 4,
         min_for_new: 1,
     };
-    let t = run_all(jobs, budget, ms(400), ms(100), None).await;
+    let t = run_all(jobs, budget, ms(400), ms(100), None, &[]).await;
     assert!(t.max_total <= 4, "per-host cap exceeded: {}", t.max_total);
     assert_eq!(t.max_holding, 3, "all three ran at once");
 }
@@ -262,7 +298,7 @@ async fn a_full_host_makes_newcomers_wait() {
     let size = 500_000;
     let jobs = (0..2)
         .map(|i| Job {
-            url: server.url(&format!("/blob/{size}?seed={i}&throttle=1000000")),
+            url: server.url(&format!("/blob/{size}?seed={i}&throttle=500000")),
             seed: i,
             size,
         })
@@ -272,7 +308,8 @@ async fn a_full_host_makes_newcomers_wait() {
         per_host: 1,
         min_for_new: 1,
     };
-    let t = run_all(jobs, budget, ms(50), ms(100), None).await;
+    // The second arrives once the first holds the host's one slot.
+    let t = run_all(jobs, budget, ms(0), ms(100), Some((1, 1)), &[]).await;
     assert_eq!(t.max_total, 1, "never two connections to the host");
     assert_eq!(t.waited, [false, true]);
 }

@@ -461,14 +461,16 @@ fn throttle_slows_the_body() {
 #[test]
 fn throttle_first_slows_only_the_first_get() {
     let server = TestServer::start().unwrap();
-    let path = "/blob/200000?throttle_first=1000000";
+    // The first takes 1 s, so a scheduling stall in the second (200 ms
+    // seen on CI) doesn't look like throttling.
+    let path = "/blob/200000?throttle_first=200000";
     let started = std::time::Instant::now();
     get(&server, path, "");
     let first = started.elapsed();
     let started = std::time::Instant::now();
     assert_eq!(get(&server, path, "").body, blob::bytes(0, 0..200_000));
     let second = started.elapsed();
-    assert!(first >= std::time::Duration::from_millis(150), "{first:?}");
+    assert!(first >= std::time::Duration::from_millis(900), "{first:?}");
     assert!(second < first / 2, "{first:?} vs {second:?}");
 }
 

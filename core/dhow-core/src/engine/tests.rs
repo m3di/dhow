@@ -223,18 +223,20 @@ async fn stop_pauses_and_run_again_finishes() {
     let added = fx
         .engine
         .add(
-            fx.request(&server, "/blob/1000000?throttle=2000000"),
+            fx.request(&server, "/blob/1000000?throttle=1000000"),
             &|_| {},
         )
         .await
         .unwrap();
+    // Stopped once bytes flow, whenever that is, with about a second of
+    // data still to come.
     let (tx, stop) = watch::channel(false);
-    let pause = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        tx.send(true).unwrap();
-    });
-    let paused = fx.engine.run(&added.id, &|_| {}, &stop).await.unwrap();
-    pause.await.unwrap();
+    let on_event = move |e: EngineEvent| {
+        if matches!(e, EngineEvent::Progress { downloaded, .. } if downloaded > 0) {
+            tx.send_replace(true);
+        }
+    };
+    let paused = fx.engine.run(&added.id, &on_event, &stop).await.unwrap();
     assert_eq!(paused.state, State::Paused);
     assert!(paused.downloaded > 0 && paused.downloaded < 1_000_000);
     let done = fx.run(&added.id).await;
@@ -359,7 +361,7 @@ async fn budget_wait_is_a_visible_state() {
     let a = fx
         .engine
         .add(
-            fx.request(&server, "/blob/400000?seed=1&throttle=1000000"),
+            fx.request(&server, "/blob/400000?seed=1&throttle=400000"),
             &|_| {},
         )
         .await
@@ -375,9 +377,16 @@ async fn budget_wait_is_a_visible_state() {
     let seen_waiting = Arc::new(StdMutex::new(false));
     let engine = &fx.engine;
     let (_keep, stop) = watch::channel(false);
-    let first = engine.run(&a.id, &|_| {}, &stop);
+    // b starts once a has the slot (bytes flowing), not on a timer.
+    let (a_flows, mut flowing) = watch::channel(false);
+    let on_a = move |e: EngineEvent| {
+        if matches!(e, EngineEvent::Progress { downloaded, .. } if downloaded > 0) {
+            a_flows.send_replace(true);
+        }
+    };
+    let first = engine.run(&a.id, &on_a, &stop);
     let second = async {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        flowing.wait_for(|f| *f).await.unwrap();
         let flag = seen_waiting.clone();
         let b_id = b.id.clone();
         let on_event = move |e: EngineEvent| {
