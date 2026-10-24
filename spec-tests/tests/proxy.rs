@@ -1,7 +1,7 @@
 //! The proxy setting through the CLI (ARCHITECTURE §8). A second test
 //! server stands in for the proxy: it answers absolute-form requests itself.
 
-use spec_tests::{Sandbox, TestServer, assert_blob, named};
+use spec_tests::{Sandbox, SocksProxy, TestServer, assert_blob, named};
 
 fn proxied(proxy: &TestServer) -> usize {
     proxy
@@ -70,9 +70,22 @@ fn the_system_proxy_is_used_by_default() {
 }
 
 #[test]
+fn a_socks5_proxy_relays_downloads() {
+    let origin = TestServer::start().unwrap();
+    let socks = SocksProxy::start(Some(("u", "s3cret"))).unwrap();
+    let sb = Sandbox::new();
+    let url = format!("socks5://u:s3cret@{}", socks.addr());
+    sb.dhow(["settings", "--proxy", &url]).assert_success();
+    let path = format!("/blob/50000?seed=4&{}", named("d.bin"));
+    sb.add(&origin, &path, &[]).assert_success();
+    assert_blob(&sb.dl().join("d.bin"), 4, 50000);
+    assert!(!socks.connects().is_empty(), "went direct");
+}
+
+#[test]
 fn unusable_proxies_are_rejected() {
     let sb = Sandbox::new();
-    for bad in ["socks5://127.0.0.1:1080", "ftp://p.test", "http://"] {
+    for bad in ["socks4://127.0.0.1:1080", "ftp://p.test", "http://"] {
         let out = sb.dhow(["settings", "--proxy", bad]);
         assert!(!out.status.success(), "{bad} accepted");
     }

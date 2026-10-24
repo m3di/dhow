@@ -36,13 +36,18 @@
 //! sends it to a forward proxy) is served as if for its path, so a second
 //! server can stand in for a proxy: it answers for the origin, and its
 //! [`TestServer::requests`] show the absolute targets and any
-//! `Proxy-Authorization`.
+//! `Proxy-Authorization`. HTTPS through such a proxy is exercised only up
+//! to its `CONNECT` request (answered 405). [`SocksProxy`] is a real SOCKS5
+//! relay (no auth or username/password, `CONNECT` only).
 //!
 //! Unknown knobs are a 400, so a misspelled knob fails the test instead of
 //! silently testing the happy path.
 
 pub mod blob;
 mod http;
+pub mod socks;
+
+pub use socks::SocksProxy;
 
 use std::collections::HashMap;
 use std::io;

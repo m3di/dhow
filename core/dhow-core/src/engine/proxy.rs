@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{Engine, EngineError};
 use crate::http::{self, Lease, Route};
-use crate::platform::{ProxyConfig, ProxyMode};
+use crate::platform::{AdapterError, ProxyConfig, ProxyMode};
 
 const PROXY_KEY: &str = "proxy_mode";
 
@@ -54,8 +54,9 @@ impl Engine {
         })
     }
 
-    /// A `Custom` mode needs at least one `http://` or `https://` proxy
-    /// and no PAC script (the core doesn't run PAC).
+    /// A `Custom` mode needs at least one `http://`, `https://`,
+    /// `socks5://` or `socks5h://` proxy and no PAC script (the core
+    /// doesn't run PAC).
     pub fn set_proxy_mode(&self, mode: ProxyMode) -> Result<ProxyMode, EngineError> {
         let stored = match &mode {
             ProxyMode::System => Stored::System,
@@ -68,13 +69,12 @@ impl Engine {
                 if urls.iter().all(|u| u.is_none()) {
                     return Err(EngineError::InvalidSetting("a custom proxy needs a URL"));
                 }
-                if urls
-                    .iter()
-                    .flat_map(|u| u.as_ref())
-                    .any(|u| !matches!(u.scheme(), "http" | "https") || u.host().is_none())
-                {
+                if urls.iter().flat_map(|u| u.as_ref()).any(|u| {
+                    !matches!(u.scheme(), "http" | "https" | "socks5" | "socks5h")
+                        || u.host().is_none()
+                }) {
                     return Err(EngineError::InvalidSetting(
-                        "proxies are http:// or https:// URLs",
+                        "proxies are http, https, socks5 or socks5h URLs",
                     ));
                 }
                 let s = |u: &Option<Url>| u.as_ref().map(Url::to_string);
@@ -103,14 +103,27 @@ impl Engine {
     /// A client for requests to `url` under the current setting. The
     /// system proxy is asked on every lease, off the async workers: the
     /// adapter may block (ARCHITECTURE §8). A changed answer builds a new
-    /// client for the leases from then on.
+    /// client for the leases from then on. When the adapter fails, the
+    /// last answer it gave stands: an unknown proxy is not a direct one.
     pub(super) async fn lease(&self, url: &Url) -> Result<Lease<'_>, EngineError> {
         let mode = self.proxy_mode()?;
         let system = match mode {
             ProxyMode::System => {
                 let (platform, url) = (self.platform.clone(), url.clone());
                 let asked = tokio::task::spawn_blocking(move || platform.system_proxy(&url));
-                Some(asked.await.map_err(io::Error::other)?)
+                let answer = asked.await.map_err(io::Error::other)?;
+                let mut last = self.last_system.lock().unwrap_or_else(|e| e.into_inner());
+                Some(match (answer, &*last) {
+                    (Ok(c), _) => {
+                        *last = Some(c.clone());
+                        Ok(c)
+                    }
+                    (Err(AdapterError::Failed(e)), Some(known)) => {
+                        tracing::warn!(error = %e, "system proxy unknown, keeping the last one");
+                        Ok(known.clone())
+                    }
+                    (Err(e), _) => Err(e),
+                })
             }
             _ => None,
         };

@@ -169,7 +169,8 @@ enum Command {
         #[arg(long = "extensions", value_name = "CATEGORY=EXTS")]
         extensions: Vec<String>,
         /// `system` (the OS setting, the default), `none` (direct) or a
-        /// proxy URL for every request (`http://[user:pass@]host:port`)
+        /// proxy URL for every request (`http://`, `https://`, `socks5://` or
+        /// `socks5h://`, `[user:pass@]host:port`)
         #[arg(long, value_name = "system|none|URL")]
         proxy: Option<String>,
     },

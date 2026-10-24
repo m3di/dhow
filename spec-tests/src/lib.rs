@@ -14,7 +14,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub use dhow_testserver::{TestServer, blob};
+pub use dhow_testserver::{SocksProxy, TestServer, blob};
 pub use serde_json::Value;
 
 pub const CLI_TIMEOUT: Duration = Duration::from_secs(30);

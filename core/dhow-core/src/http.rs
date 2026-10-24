@@ -32,7 +32,8 @@ pub fn client_via(proxy: &ProxyConfig) -> Result<Client, reqwest::Error> {
         .connect_timeout(Duration::from_secs(15))
         .read_timeout(Duration::from_secs(30))
         .no_proxy();
-    let bypass = || NoProxy::from_string(&proxy.no_proxy.join(","));
+    let list = bypass_list(&proxy.no_proxy);
+    let bypass = || NoProxy::from_string(&list);
     // Scheme-specific first: reqwest takes the first that matches.
     if let Some(url) = &proxy.http {
         builder = builder.proxy(Proxy::http(url.clone())?.no_proxy(bypass()));
@@ -47,6 +48,16 @@ pub fn client_via(proxy: &ProxyConfig) -> Result<Client, reqwest::Error> {
         tracing::warn!(pac = %redact_proxy_url(pac), "proxy auto-config is not evaluated");
     }
     builder.build()
+}
+
+/// `no_proxy` as reqwest reads it: it knows `example.com`,
+/// `.example.com` and `*`, so GNOME's `*.example.com` becomes the second.
+fn bypass_list(hosts: &[String]) -> String {
+    let host = |h: &String| match h.strip_prefix("*.") {
+        Some(domain) => format!(".{domain}"),
+        None => h.clone(),
+    };
+    hosts.iter().map(host).collect::<Vec<_>>().join(",")
 }
 
 /// What a client is built for: the mode to report and the proxies it uses.
@@ -112,6 +123,8 @@ impl ClientSlot {
     /// The current client if it was built for `route`, else a new one that
     /// later leases get. Leases of the old one keep it until they end: a
     /// running download finishes on the proxy it started with (§8).
+    /// One current route: per-URL answers (PAC, once an adapter evaluates
+    /// it) that alternate would rebuild the client each time.
     pub fn lease(&self, route: Route) -> Result<Lease<'_>, reqwest::Error> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let client = match &inner.current {
@@ -185,6 +198,15 @@ mod tests {
     fn redact_drops_credentials() {
         let url = Url::parse("https://user:pw@example.com:8443/a/b.zip?token=s3cret#frag").unwrap();
         assert_eq!(redact(&url), "https://example.com:8443/a/b.zip");
+    }
+
+    #[test]
+    fn wildcard_domains_bypass_as_suffixes() {
+        let hosts = ["*.corp.test", "localhost", ".lan", "*", "10.0.0.0/8"].map(String::from);
+        assert_eq!(
+            bypass_list(&hosts),
+            ".corp.test,localhost,.lan,*,10.0.0.0/8"
+        );
     }
 
     #[test]

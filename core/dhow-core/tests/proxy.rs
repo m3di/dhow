@@ -10,7 +10,7 @@ use dhow_core::naming::TargetFs;
 use dhow_core::platform::{
     AdapterError, InterfaceKind, NetworkInfo, PlatformAdapter, ProxyConfig, ProxyMode,
 };
-use dhow_testserver::TestServer;
+use dhow_testserver::{SocksProxy, TestServer};
 use reqwest::Url;
 use tokio::sync::watch;
 
@@ -115,14 +115,14 @@ async fn a_change_while_running_applies_to_the_next_lease() {
 }
 
 #[test]
-fn custom_needs_an_http_proxy() {
+fn custom_needs_a_usable_proxy() {
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::open(dir.path(), DownloadConfig::default()).unwrap();
     let url = |u: &str| Url::parse(u).ok();
     for bad in [
         ProxyConfig::default(),
         ProxyConfig {
-            all: url("socks5://p.test:1080"),
+            all: url("socks4://p.test:1080"),
             ..ProxyConfig::default()
         },
         ProxyConfig {
@@ -204,4 +204,116 @@ async fn system_uses_the_adapters_proxy_and_its_bypass_list() {
     // `None` overrides the system.
     engine.set_proxy_mode(ProxyMode::None).unwrap();
     assert_eq!(engine.network_info().unwrap().proxy_in_use, ProxyMode::None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn socks5_proxies_relay_with_and_without_auth() {
+    let origin = TestServer::start().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(&dir.path().join("data"), DownloadConfig::default()).unwrap();
+    let target = origin.addr().to_string();
+
+    let open = SocksProxy::start(None).unwrap();
+    let all = Url::parse(&format!("socks5://{}", open.addr())).ok();
+    engine
+        .set_proxy_mode(ProxyMode::Custom(Box::new(ProxyConfig {
+            all,
+            ..ProxyConfig::default()
+        })))
+        .unwrap();
+    fetch(&engine, &origin, dir.path(), 1).await;
+    let connects = open.connects();
+    assert!(
+        !connects.is_empty()
+            && connects
+                .iter()
+                .all(|c| c.target == target && c.user.is_none())
+    );
+
+    let authed = SocksProxy::start(Some(("u", "s3cret"))).unwrap();
+    let all = Url::parse(&format!("socks5h://u:s3cret@{}", authed.addr())).ok();
+    engine
+        .set_proxy_mode(ProxyMode::Custom(Box::new(ProxyConfig {
+            all,
+            ..ProxyConfig::default()
+        })))
+        .unwrap();
+    fetch(&engine, &origin, dir.path(), 2).await;
+    let connects = authed.connects();
+    assert!(!connects.is_empty(), "not relayed");
+    assert!(
+        connects.iter().all(|c| c.user.as_deref() == Some("u")),
+        "{connects:?}"
+    );
+    // Origin-form requests: the origin saw them, through the relay.
+    assert!(origin.requests().iter().all(|r| r.target.starts_with('/')));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_socks_only_system_proxy_is_used() {
+    let origin = TestServer::start().unwrap();
+    let socks = SocksProxy::start(None).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // As from `all_proxy`, GNOME's socks keys or KDE's `socksProxy`.
+    let fake = Arc::new(Fake {
+        proxy: ProxyConfig {
+            all: Url::parse(&format!("socks5://{}", socks.addr())).ok(),
+            ..ProxyConfig::default()
+        },
+        asked: Mutex::default(),
+    });
+    let engine =
+        Engine::open_with(&dir.path().join("data"), DownloadConfig::default(), fake).unwrap();
+    fetch(&engine, &origin, dir.path(), 1).await;
+    assert!(!socks.connects().is_empty(), "went direct");
+}
+
+/// A system proxy that answers until told to fail.
+struct Flaky {
+    proxy: ProxyConfig,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl PlatformAdapter for Flaky {
+    fn system_proxy(&self, _for_url: &Url) -> Result<ProxyConfig, AdapterError> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(AdapterError::Failed("gsettings did not answer".into()));
+        }
+        Ok(self.proxy.clone())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_adapter_keeps_the_last_known_proxy() {
+    let origin = TestServer::start().unwrap();
+    let proxy = TestServer::start().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let flaky = Arc::new(Flaky {
+        proxy: ProxyConfig {
+            http: Url::parse(&format!("http://{}", proxy.addr())).ok(),
+            ..ProxyConfig::default()
+        },
+        fail: true.into(),
+    });
+    let engine = Engine::open_with(
+        &dir.path().join("data"),
+        DownloadConfig::default(),
+        flaky.clone(),
+    )
+    .unwrap();
+    // Nothing known yet: direct, with a warning.
+    fetch(&engine, &origin, dir.path(), 1).await;
+    assert_eq!(proxied(&proxy), 0);
+    let direct = origin.requests().len();
+
+    flaky.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    fetch(&engine, &origin, dir.path(), 2).await;
+    let via = proxied(&proxy);
+    assert!(via > 0);
+
+    // Failing again, after idle dropped the client: still the proxy.
+    flaky.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    fetch(&engine, &origin, dir.path(), 3).await;
+    assert!(proxied(&proxy) > via, "went direct");
+    assert_eq!(origin.requests().len(), direct);
 }
