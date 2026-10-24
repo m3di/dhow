@@ -34,12 +34,17 @@ pub(super) struct SpeedBook {
 impl Engine {
     pub(super) fn sampling(&self, on: bool) -> Result<(), EngineError> {
         let mut book = self.speed();
+        // Under the lock, so on/off reach the adapter in order.
         if on {
             book.running += 1;
+            if book.running == 1 {
+                self.platform.keep_awake(true);
+            }
             return Ok(());
         }
         book.running -= 1;
         if book.running == 0 {
+            self.platform.keep_awake(false);
             let all = std::mem::take(&mut book.pending);
             drop(book);
             self.write_global(all)?;

@@ -14,6 +14,8 @@ use dhow_core::engine::{AddRequest, Engine, EngineError, EngineEvent, Snapshot, 
 use dhow_core::http::{Header, Url};
 use dhow_core::logging;
 use dhow_core::naming::{Category, TargetFs, normalize_extension};
+use dhow_core::platform::PlatformAdapter;
+use dhow_core::platform::linux::LinuxAdapter;
 use dhow_core::schedule::{Action, Schedule, Window};
 use dhow_core::storage::Db;
 use futures_util::StreamExt;
@@ -167,6 +169,8 @@ enum Command {
         #[arg(long = "extensions", value_name = "CATEGORY=EXTS")]
         extensions: Vec<String>,
     },
+    /// Interface kind, VPN, the system proxy and the proxy in use
+    Network,
 }
 
 #[derive(Subcommand)]
@@ -274,6 +278,16 @@ fn main() -> ExitCode {
     }
 }
 
+/// Until the macOS adapter exists (M4.3), other platforms get the
+/// environment's proxy and nothing else.
+fn platform() -> Arc<dyn PlatformAdapter> {
+    if cfg!(target_os = "linux") {
+        Arc::new(LinuxAdapter::host())
+    } else {
+        Arc::new(LinuxAdapter::env_only())
+    }
+}
+
 fn fail(e: &dyn std::error::Error) -> ExitCode {
     eprintln!("dhow: {e}");
     ExitCode::FAILURE
@@ -292,7 +306,7 @@ async fn run(
         .ok_or("no data directory; pass --data-dir")?;
     // Before any lock is taken: a lock's PID must always be safe to poke.
     let poke = poke_on_signal();
-    let engine = Engine::open(&data_dir, config)?;
+    let engine = Engine::open_with(&data_dir, config, platform())?;
     let stop = stop_on_signal();
     let print = |e: &_| output::emit(output::event(e));
     let on_event = |e: dhow_core::engine::EngineEvent| print(&e);
@@ -369,6 +383,10 @@ async fn run(
             };
             let snap = engine.cancel(&id, delete_partial, &on_event)?;
             output::emit(output::snapshot("download", &snap));
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Network => {
+            output::emit(output::network(&engine.network_info()?));
             Ok(ExitCode::SUCCESS)
         }
         Command::Ls => {
