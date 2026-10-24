@@ -49,6 +49,7 @@ impl Fx {
             filename: None,
             paused: false,
             connections: None,
+            queue: None,
             target_fs: TargetFs::Posix,
         }
     }
@@ -358,4 +359,196 @@ async fn budget_wait_is_a_visible_state() {
     assert_eq!(ra.unwrap().state, State::Completed);
     assert_eq!(rb.unwrap().state, State::Completed);
     assert!(*seen_waiting.lock().unwrap(), "b waited for the budget");
+}
+
+mod queue_tests {
+    use super::*;
+    use crate::engine::queues::{OnComplete, QueueSpec};
+    use crate::storage::DEFAULT_QUEUE_ID;
+
+    fn spec(name: &str, max: u32) -> QueueSpec {
+        QueueSpec {
+            name: name.into(),
+            max_concurrent: max,
+            ..QueueSpec::default()
+        }
+    }
+
+    async fn add_to(fx: &Fx, server: &TestServer, queue: Option<&str>) -> Snapshot {
+        let mut req = fx.request(server, "/blob/10");
+        req.queue = queue.map(str::to_owned);
+        fx.engine.add(req).await.unwrap()
+    }
+
+    fn order(fx: &Fx, queue: &str) -> Vec<String> {
+        fx.engine
+            .list()
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.queue_id == queue)
+            .map(|s| s.id)
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queue_crud() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let night = fx.engine.create_queue(&spec("Night", 2)).unwrap();
+        assert_eq!(
+            (
+                night.name.as_deref(),
+                night.max_concurrent,
+                night.is_default
+            ),
+            (Some("Night"), 2, false)
+        );
+        add_to(&fx, &server, Some(&night.id)).await;
+        let queues = fx.engine.list_queues().unwrap();
+        assert_eq!(queues.len(), 2);
+        assert!(
+            queues[0].is_default && queues[0].name.is_none(),
+            "default first, unnamed"
+        );
+        assert_eq!(queues[1].unfinished, 1);
+        let renamed = fx
+            .engine
+            .update_queue(
+                &night.id,
+                &QueueSpec {
+                    on_complete: OnComplete::Sleep,
+                    ..spec("Late", 1)
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (renamed.name.as_deref(), renamed.on_complete),
+            (Some("Late"), OnComplete::Sleep)
+        );
+        assert!(matches!(
+            fx.engine.create_queue(&spec(" ", 1)),
+            Err(EngineError::InvalidQueue(_))
+        ));
+        assert!(matches!(
+            fx.engine.create_queue(&spec("Zero", 0)),
+            Err(EngineError::InvalidQueue(_))
+        ));
+        assert!(matches!(
+            fx.engine.delete_queue(DEFAULT_QUEUE_ID, &night.id),
+            Err(EngineError::DefaultQueue)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_queue_moves_its_downloads_in_order() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let q = fx.engine.create_queue(&spec("Q", 1)).unwrap();
+        let first_default = add_to(&fx, &server, None).await;
+        let a = add_to(&fx, &server, Some(&q.id)).await;
+        let b = add_to(&fx, &server, Some(&q.id)).await;
+        fx.engine.delete_queue(&q.id, DEFAULT_QUEUE_ID).unwrap();
+        assert_eq!(order(&fx, DEFAULT_QUEUE_ID), [first_default.id, a.id, b.id]);
+        assert!(matches!(
+            fx.engine.queue(&q.id),
+            Err(EngineError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn move_and_reorder() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let a = add_to(&fx, &server, None).await;
+        let b = add_to(&fx, &server, None).await;
+        let c = add_to(&fx, &server, None).await;
+        fx.engine.reorder(&c.id, Some(&a.id)).unwrap();
+        assert_eq!(
+            order(&fx, DEFAULT_QUEUE_ID),
+            [c.id.clone(), a.id.clone(), b.id.clone()]
+        );
+        fx.engine.reorder(&c.id, None).unwrap();
+        assert_eq!(
+            order(&fx, DEFAULT_QUEUE_ID),
+            [a.id.clone(), b.id.clone(), c.id.clone()]
+        );
+
+        let q = fx.engine.create_queue(&spec("Q", 1)).unwrap();
+        let moved = fx.engine.move_to_queue(&a.id, &q.id).unwrap();
+        assert_eq!(moved.queue_id, q.id);
+        assert!(matches!(
+            fx.engine.reorder(&b.id, Some(&a.id)),
+            Err(EngineError::InvalidQueue(_))
+        ));
+        assert!(matches!(
+            fx.engine
+                .add({
+                    let mut r = fx.request(&server, "/blob/10");
+                    r.queue = Some("nope".into());
+                    r
+                })
+                .await,
+            Err(EngineError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_queue_by_name_default_or_prefix() {
+        let fx = Fx::new();
+        let q = fx.engine.create_queue(&spec("Night", 1)).unwrap();
+        assert_eq!(
+            fx.engine.resolve_queue("default").unwrap(),
+            DEFAULT_QUEUE_ID
+        );
+        assert_eq!(fx.engine.resolve_queue("Night").unwrap(), q.id);
+        assert_eq!(fx.engine.resolve_queue(&q.id[..30]).unwrap(), q.id);
+        assert!(matches!(
+            fx.engine.resolve_queue("Day"),
+            Err(EngineError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn next_runnable_respects_queue_order_and_concurrency() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        // Default queue: max_concurrent 3.
+        let d: Vec<Snapshot> =
+            futures_util::future::join_all((0..5).map(|_| add_to(&fx, &server, None))).await;
+        let mut d = d;
+        d.sort_by_key(|s| s.position);
+        let ids: Vec<String> = d.iter().map(|s| s.id.clone()).collect();
+        let night = fx.engine.create_queue(&spec("Night", 1)).unwrap();
+        let n1 = add_to(&fx, &server, Some(&night.id)).await;
+        let _n2 = add_to(&fx, &server, Some(&night.id)).await;
+
+        let runnable = |running: &[&str]| -> Vec<String> {
+            fx.engine
+                .next_runnable(|id| running.contains(&id))
+                .unwrap()
+                .into_iter()
+                .map(|s| s.id)
+                .collect()
+        };
+        assert_eq!(
+            runnable(&[]),
+            [
+                ids[0].clone(),
+                ids[1].clone(),
+                ids[2].clone(),
+                n1.id.clone()
+            ]
+        );
+        // Two running in the default queue leave room for one more.
+        assert_eq!(runnable(&[&ids[0], &ids[1], &n1.id]), [ids[2].clone()]);
+        // Paused and failed don't run; left "active" by a dead process does.
+        fx.engine.pause(&ids[2], &|_| {}).unwrap();
+        fx.engine
+            .transition(&ids[3], State::Failed, Some(FailReason::Transient), &|_| {})
+            .unwrap();
+        fx.engine
+            .transition(&ids[4], State::Active, None, &|_| {})
+            .unwrap();
+        assert_eq!(runnable(&[&ids[0], &ids[1], &n1.id]), [ids[4].clone()]);
+    }
 }

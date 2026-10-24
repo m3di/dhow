@@ -312,7 +312,9 @@ Ramp-up is throughput-aware (§4.4): a download stops adding connections where t
 
 #### 10.4 Queue concurrency
 
-Independently, each queue has `max_concurrent` (default 3). A download in a queue that is at capacity is `Waiting(QueueConcurrency)` regardless of connection budget. Queue order is user-defined (`Reorder`), default FIFO by `created_at`.
+Independently, each queue has `max_concurrent` (default 3). A download in a queue that is at capacity has not started: it stays `Queued` until a slot opens, regardless of connection budget. (`Waiting` is for downloads that have started and wait for the connection budget, §10.3.) Queue order is user-defined (`Reorder`), default FIFO: each download gets the next position in its queue when added or moved there.
+
+Which downloads run is re-evaluated when one finishes, is added, or a queue changes; nothing polls in between. Downloads left `Active`/`Waiting`/`Completing` by a process that died count as wanting to run and are resumed in their queue's order (the caller tells the engine which downloads are really running, e.g. by their run locks).
 
 #### 10.5 Fairness within a round
 
@@ -338,7 +340,8 @@ Schedule {
 - `StartAndStopOutside`: downloads in the queue are paused at `end` (journal commit, connections closed) and resumed at the next `start`.
 - The engine keeps a single `sleep_until(next_edge)` across all queues (`ARCHITECTURE §7`). DST and timezone changes recompute the edge; the adapter's `watch_network` is not involved.
 - `StartQueue`/`StopQueue` override the schedule until the next edge.
-- The **default queue** exists always, cannot be deleted, has no schedule.
+- The **default queue** exists always, cannot be deleted, has no schedule. Its name is NULL until the user renames it (the shell shows a localized one).
+- `DeleteQueue` appends the queue's downloads to `move_items_to` in their order; `MoveToQueue` appends one; `Reorder` places one before another in the same queue, or last.
 
 ---
 
