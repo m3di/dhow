@@ -243,7 +243,7 @@ fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
     headers.get(name)?.to_str().ok()
 }
 
-fn content_length(headers: &HeaderMap) -> Option<u64> {
+pub(crate) fn content_length(headers: &HeaderMap) -> Option<u64> {
     header_str(headers, header::CONTENT_LENGTH)?
         .trim()
         .parse()
@@ -264,7 +264,7 @@ fn accept_ranges(headers: &HeaderMap) -> Option<bool> {
 }
 
 /// `bytes <first>-<last>/<total|*>` → `(first, last, total)`.
-fn content_range(headers: &HeaderMap) -> Option<(u64, u64, Option<u64>)> {
+pub(crate) fn content_range(headers: &HeaderMap) -> Option<(u64, u64, Option<u64>)> {
     let spec = header_str(headers, header::CONTENT_RANGE)?
         .trim()
         .strip_prefix("bytes ")?;

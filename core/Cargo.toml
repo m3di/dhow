@@ -17,8 +17,10 @@ bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 crc32fast = "1"
 dirs = "6"
+fastrand = "2"
 flume = "0.12"
 fs4 = "1"
+httpdate = "1"
 mime_guess = "2"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
