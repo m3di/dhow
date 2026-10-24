@@ -198,10 +198,10 @@ Completion requires the committed set to be exactly `[0, total_size)` with no ga
 If the server sent `Digest`, `Content-Digest` (RFC 9530) or `Content-MD5`, the engine computes the hash over the full part file *in order* after I7 and before rename. Mismatch → `Failed(DigestMismatch)`, part file kept for inspection, not renamed. Supported: sha-256, sha-512, sha-1 (verify only), md5 (verify only).
 
 **I9 — Writes never race.**
-All writes to one part file go through a single `Writer` actor that owns the file handle and serializes `pwrite` + `fdatasync` + journal append. Connection tasks send `(offset, bytes)` messages; they never hold the file handle.
+All writes to one part file go through a single `Writer` actor that owns the file handle and serializes `pwrite` + `fdatasync` + journal append. Connection tasks send `(chunk, offset, bytes)` messages; they never hold the file handle. The writer also enforces I6 itself: a write must start exactly at its chunk's position and end by its chunk's end, and chunks may not overlap each other or committed bytes, so durable data is never overwritten. Any writer error is fatal for the download.
 
 **I10 — Preallocation is honest.**
-Part files are preallocated to `total_size` with `fallocate`/`F_PREALLOCATE`/`SetFileInformationByHandle(FileAllocationInfo)` where supported, else `set_len` (sparse). Insufficient space is detected at `Add` time and fails fast (`Failed(NoSpace)`), not at 99%.
+Part files are preallocated to `total_size` with `fallocate`/`F_PREALLOCATE`/`SetFileInformationByHandle(FileAllocationInfo)` where supported, else `set_len` (sparse, header flag `preallocated` cleared). Insufficient space is detected at `Add` time and fails fast (`Failed(NoSpace)`), not at 99%: available space is checked before the file is created, and an out-of-space error from preallocation is also `NoSpace`. A failed creation leaves no part file.
 
 ---
 
@@ -224,7 +224,7 @@ loop:
   on EOF before end: reconnect with backoff (§9), same chunk, from pos
 ```
 
-The `Writer` batches: it issues `pwrite` immediately, but `fdatasync` + `range_commit` at most every `settings.commit_interval` (default 2 s) **or** every 8 MiB per chunk, whichever first, and always on pause/cancel/shutdown. Uncommitted window on crash is therefore bounded by ~2 s of throughput.
+The `Writer` batches: it issues `pwrite` immediately, but `fdatasync` + `range_commit` (then a journal sync) at most every `settings.commit_interval` (default 2 s) after the oldest uncommitted write **or** once any chunk has 8 MiB uncommitted, whichever first, and always on pause/cancel/shutdown. Uncommitted window on crash is therefore bounded by ~2 s of throughput. With nothing uncommitted the writer has no deadline.
 
 ---
 

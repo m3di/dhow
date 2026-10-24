@@ -193,6 +193,7 @@ On `get_download` / `list_downloads`, if `final_path` no longer exists and a tok
 
 - One `tokio` multi-thread runtime per `Dhow` instance, worker threads = min(4, cores). Threads park when idle; parked threads cost nothing measurable.
 - Each active download is a task tree: one coordinator task + N connection tasks. Pausing cancels the tree; the journal makes that safe at any instant.
+- Each active download also has one writer thread (ENGINE-SPEC I9) fed by a bounded channel: `pwrite`/`fsync` block, and on macOS `F_FULLFSYNC` can take tens of milliseconds, which must not stall runtime workers. The thread waits with a deadline only while uncommitted bytes exist and exits when the download's handles drop.
 - No `interval` timers survive the last active download. Schedule wake-ups use a single `sleep_until(next_schedule_edge)` that is dropped and recreated only when schedules change. If no schedule exists, no sleep exists.
 - Speed sampling runs inside the coordinator task; it dies with the download.
 - The idle test: after all downloads complete, `tokio::runtime::Handle::metrics().num_alive_tasks()` must be 0 (modulo the event channel) and RSS must not grow over 60 s.
