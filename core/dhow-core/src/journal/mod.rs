@@ -194,7 +194,7 @@ fn remove_if_exists(path: &Path) -> io::Result<()> {
 
 /// Makes a directory entry change (create, rename) durable. POSIX only;
 /// Windows has no directory handles to sync and NTFS journals metadata.
-fn sync_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         let dir = match path.parent() {
