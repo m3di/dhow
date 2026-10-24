@@ -45,6 +45,12 @@ impl RangeSet {
         self.ranges.is_empty()
     }
 
+    /// Whether any covered byte lies in `r`.
+    pub fn intersects(&self, r: &Range<u64>) -> bool {
+        let i = self.ranges.partition_point(|x| x.end <= r.start);
+        self.ranges.get(i).is_some_and(|x| x.start < r.end) && r.start < r.end
+    }
+
     /// Exactly `[0, total)`: the I7 completion condition.
     pub fn is_exactly(&self, total: u64) -> bool {
         match self.ranges.as_slice() {
@@ -77,6 +83,19 @@ mod tests {
         assert_eq!(set(&[0..10, 20..30, 40..50, 9..41]).ranges(), [0..50]);
         assert_eq!(set(&[5..6, 0..100]).ranges(), [0..100]);
         assert_eq!(set(&[0..100, 5..6]).ranges(), [0..100]);
+    }
+
+    #[test]
+    fn intersects() {
+        let s = set(&[10..20, 30..40]);
+        assert!(s.intersects(&(15..16)));
+        assert!(s.intersects(&(0..11)));
+        assert!(s.intersects(&(19..31)));
+        assert!(s.intersects(&(0..100)));
+        assert!(!s.intersects(&(0..10)));
+        assert!(!s.intersects(&(20..30)));
+        assert!(!s.intersects(&(40..50)));
+        assert!(!s.intersects(&(15..15)));
     }
 
     #[test]
