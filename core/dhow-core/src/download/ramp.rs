@@ -133,6 +133,9 @@ pub struct Ramp {
 enum Phase {
     /// A connection just opened; its start-up would skew the measurement.
     Settling,
+    /// Ramp-up wanted one more and the budget refused: ask again, without
+    /// re-measuring (the same connections would look like saturation).
+    Blocked,
     Measuring {
         from: Instant,
         bytes: u64,
@@ -167,6 +170,11 @@ impl Ramp {
                 return Step::Wait;
             }
             Phase::Measuring { from, bytes } => (from, bytes),
+            Phase::Blocked => {
+                self.phase = Phase::Settling;
+                self.next_check = now + settle(config);
+                return Step::Open;
+            }
         };
         let delta = bytes.saturating_sub(start);
         let elapsed = now.saturating_duration_since(from).as_secs_f64();
@@ -186,6 +194,13 @@ impl Ramp {
         self.phase = Phase::Settling;
         self.next_check = now + settle(config);
         Step::Open
+    }
+
+    /// The budget refused the connection `check` asked for: ask again in a
+    /// window.
+    pub fn blocked(&mut self, now: Instant, config: &RampConfig) {
+        self.phase = Phase::Blocked;
+        self.next_check = now + config.window;
     }
 
     /// A connection error: hold off for the backoff (§4.4).

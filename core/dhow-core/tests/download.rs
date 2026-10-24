@@ -4,9 +4,9 @@ use std::fs::OpenOptions;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use dhow_core::download::ramp::LinkState;
 use dhow_core::download::{
-    DownloadConfig, DownloadError, DownloadEvent, Downloaded, Request, ResetReason, download,
+    DownloadConfig, DownloadError, DownloadEvent, Downloaded, Request, ResetReason, Shared,
+    download,
 };
 use dhow_core::http;
 use dhow_core::journal::Journal;
@@ -55,6 +55,7 @@ impl Env {
             part: dir.path().join("f.part"),
             sidecar: dir.path().join("f.dhow"),
             connections: None,
+            started_at: None,
         };
         Self { _dir: dir, req }
     }
@@ -82,7 +83,7 @@ impl Env {
                 &self.req,
                 &client,
                 config,
-                &LinkState::default(),
+                &Shared::default(),
                 &on_event,
                 &stop,
             ),

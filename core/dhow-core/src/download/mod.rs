@@ -3,9 +3,10 @@
 //! §4, §5.4, §6 I3–I5, I7, §7, §9). Digest check and the final rename are
 //! the completion gate's (§8).
 
+pub mod budget;
 pub mod ramp;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -17,7 +18,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use reqwest::{Client, Url};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 use crate::http::Header;
 use crate::journal::{Header as JournalHeader, Journal, JournalError, format};
@@ -29,6 +30,7 @@ use crate::transfer::{
 };
 use crate::writer::actor::{self, Outcome, WriterGone, WriterHandle};
 use crate::writer::{self, ChunkId, Writer, WriterConfig, WriterError};
+use budget::{Budget, BudgetConfig, Ticket};
 use ramp::{LinkState, Ramp, RampConfig, Step};
 
 pub struct Request {
@@ -38,6 +40,26 @@ pub struct Request {
     pub sidecar: PathBuf,
     /// Overrides `RampConfig::connections` for this download.
     pub connections: Option<u8>,
+    /// When it first started (unix ms): older downloads get connections
+    /// first (§10.3). `None`: now.
+    pub started_at: Option<i64>,
+}
+
+/// What all downloads in a process share: the connection budget (§10.1–
+/// 10.3) and what is known about the link (§10.A).
+#[derive(Debug, Default)]
+pub struct Shared {
+    pub link: LinkState,
+    pub budget: Arc<Budget>,
+}
+
+impl Shared {
+    pub fn new(budget: BudgetConfig) -> Self {
+        Self {
+            link: LinkState::default(),
+            budget: Arc::new(Budget::new(budget)),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -46,6 +68,8 @@ pub struct DownloadConfig {
     pub transfer: TransferConfig,
     pub writer: WriterConfig,
     pub ramp: RampConfig,
+    /// For the process-wide budget built from this config (see [`Shared`]).
+    pub budget: BudgetConfig,
     /// Restarts from zero allowed in one run before giving up, so a server
     /// whose file changes on every request can't loop forever.
     pub max_resets: u32,
@@ -58,6 +82,7 @@ impl Default for DownloadConfig {
             transfer: TransferConfig::default(),
             writer: WriterConfig::default(),
             ramp: RampConfig::default(),
+            budget: BudgetConfig::default(),
             max_resets: 3,
         }
     }
@@ -85,6 +110,9 @@ pub enum DownloadEvent {
     Reset(ResetReason),
     /// Connections now open.
     Connections(u32),
+    /// `true`: waiting for the connection budget to allow a first
+    /// connection (`Waiting(ConnectionBudget)`); `false`: got it.
+    Waiting(bool),
     /// §9 Protocol: the server stopped honoring `Range` mid-download; the
     /// download continues on one connection.
     Downgraded,
@@ -143,12 +171,13 @@ pub async fn download(
     req: &Request,
     client: &Client,
     config: &DownloadConfig,
-    link: &LinkState,
+    shared: &Shared,
     on_event: &(dyn Fn(DownloadEvent) + Send + Sync),
     stop: &watch::Receiver<bool>,
 ) -> Result<Downloaded, DownloadError> {
     let mut resets = 0;
     let mut force = None;
+    let mut ticket = None;
     loop {
         // Re-probe every start: redirects re-resolve, and the identity to
         // resume against is checked against the server's current one.
@@ -158,12 +187,28 @@ pub async fn download(
             info = probe::probe(client, &req.url, &req.headers, config.probe) => info?,
         };
         on_event(DownloadEvent::Probed(Box::new(info.clone())));
+        let ticket = ticket.get_or_insert_with(|| {
+            let started_at = req.started_at.unwrap_or_else(now_ms);
+            shared
+                .budget
+                .register(started_at, host_key(&info.effective_url))
+        });
         let (file, journal) = prepare(req, &info, force.take(), on_event)?;
-        match fetch(
-            req, client, config, link, &info, file, journal, on_event, stop,
+        let fetched = fetch(
+            req,
+            client,
+            config,
+            &shared.link,
+            ticket,
+            &info,
+            file,
+            journal,
+            on_event,
+            stop,
         )
-        .await
-        {
+        .await;
+        ticket.release_all();
+        match fetched {
             Ok(done) => return Ok(done),
             Err(Stop::Failed(e)) => return Err(e),
             Err(Stop::Reset(reason)) => {
@@ -208,9 +253,7 @@ fn prepare(
         url_hash: format::url_hash(req.url.as_str()),
         etag: info.etag.clone(),
         last_modified: info.last_modified.as_deref().and_then(unix_secs),
-        created_at: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as i64),
+        created_at: now_ms(),
     };
     let journal = Journal::create(&req.sidecar, header)?;
     if let Some(reason) = reason {
@@ -283,6 +326,7 @@ async fn fetch(
     client: &Client,
     config: &DownloadConfig,
     link: &LinkState,
+    ticket: &Ticket,
     info: &ProbeInfo,
     file: File,
     journal: Journal,
@@ -309,7 +353,11 @@ async fn fetch(
             }
             None => None,
         };
-        pending.push_back((gap, overlap));
+        pending.push_back(Pending {
+            range: gap,
+            overlap,
+            defined: None,
+        });
     }
 
     let validator = transfer::validator(info.etag.as_deref(), info.last_modified.as_deref());
@@ -324,6 +372,7 @@ async fn fetch(
     let can_range = info.resumable != Resumable::No && total.is_some();
     let rc = &config.ramp;
     let limit = ramp::connection_limit(total, can_range, req.connections, rc, link);
+    ticket.set_limit(limit);
     let (handle, done) = actor::spawn(Writer::new(file, journal, config.writer))?;
 
     // Shared with every connection's events.
@@ -339,7 +388,10 @@ async fn fetch(
                 *backoff_until.lock().unwrap() = Some(Instant::now() + *delay);
             }
             // §2.3: `Unknown` turned out not to range; stay at one.
-            ConnEvent::NotResumable => single.store(true, Ordering::Relaxed),
+            ConnEvent::NotResumable => {
+                single.store(true, Ordering::Relaxed);
+                ticket.stop_wanting();
+            }
         }
         on_event(DownloadEvent::Connection(e));
     };
@@ -347,6 +399,7 @@ async fn fetch(
     let mut plan = Plan {
         pending,
         live: HashMap::new(),
+        shedding: HashSet::new(),
         next_id: 0,
     };
     let mut running = FuturesUnordered::new();
@@ -360,20 +413,48 @@ async fn fetch(
             connections = open;
             on_event(DownloadEvent::Connections(open));
         }
+        // Registered first, so a budget change after the checks below
+        // still wakes this loop.
+        let changed = ticket.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+
         if running.is_empty() {
-            match plan.next_work(&handle, None, rc).await {
-                Ok(Some(work)) => {
-                    running.push(connection(
-                        &src,
-                        work,
-                        &handle,
-                        &config.transfer,
-                        &conn_event,
-                    ));
-                    continue;
+            if plan.pending.is_empty() {
+                break Ok(());
+            }
+            // Every connection holds a budget slot; the first may wait.
+            if ticket.held() == 0 && !ticket.try_first() {
+                on_event(DownloadEvent::Waiting(true));
+                tokio::select! {
+                    biased;
+                    _ = stopped(stop.clone()) => break 'run Err(None),
+                    _ = ticket.first() => {}
                 }
-                Ok(None) => break Ok(()),
+                on_event(DownloadEvent::Waiting(false));
+            }
+            match plan.next_work(&handle, None, rc).await {
+                Ok(Some(work)) => running.push(connection(
+                    &src,
+                    work,
+                    &handle,
+                    &config.transfer,
+                    &conn_event,
+                )),
+                Ok(None) => unreachable!("pending work exists"),
                 Err(WriterGone) => break Err(None),
+            }
+            continue;
+        }
+        // §10.3: the youngest download with spare connections gives one up
+        // for a newcomer.
+        while ticket.shed_requested() as usize > plan.shedding.len()
+            && running.len() > plan.shedding.len() + 1
+        {
+            match plan.shed(&handle).await {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(WriterGone) => break 'run Err(None),
             }
         }
         let single_now = single.load(Ordering::Relaxed);
@@ -386,21 +467,32 @@ async fn fetch(
             biased;
             _ = stopped(stop.clone()) => break 'run Err(None),
             Some((id, result)) = running.next() => {
-                let cursor = plan.live.remove(&id).expect("live chunk");
+                let cursor = plan.live.remove(&id).expect("live chunk").cursor;
+                if plan.shedding.remove(&id) {
+                    // Given up for a newcomer: its slot goes there.
+                    ticket.release(true);
+                    continue;
+                }
                 match result {
                     Ok(finished) => {
                         content_length_seen = finished.content_length_seen;
-                        // Refill the slot: unstarted ranges first, then
-                        // steal from the slowest (§4.3). One connection at
-                        // a time once downgraded.
-                        if !single.load(Ordering::Relaxed) || running.is_empty() {
+                        // Refill the slot: pending ranges first, then steal
+                        // from the slowest (§4.3). One connection at a time
+                        // once downgraded.
+                        let refill = !single.load(Ordering::Relaxed) || running.is_empty();
+                        let work = if refill {
                             match plan.next_work(&handle, cursor.rate(), rc).await {
-                                Ok(Some(work)) => running.push(connection(
-                                    &src, work, &handle, &config.transfer, &conn_event,
-                                )),
-                                Ok(None) => {}
+                                Ok(w) => w,
                                 Err(WriterGone) => break 'run Err(None),
                             }
+                        } else {
+                            None
+                        };
+                        match work {
+                            Some(work) => running.push(connection(
+                                &src, work, &handle, &config.transfer, &conn_event,
+                            )),
+                            None => ticket.release(false),
                         }
                     }
                     Err(TransferError::IdentityChanged(IdentityChange::RangeIgnored))
@@ -411,8 +503,10 @@ async fn fetch(
                         // was split from, whose response still covers it.
                         match plan.merge_back(&handle, id, &cursor).await {
                             Ok(true) => {
+                                ticket.release(false);
                                 single.store(true, Ordering::Relaxed);
                                 ramp.done = true;
+                                ticket.stop_wanting();
                                 tracing::warn!("download: server ignores Range now; one connection");
                                 on_event(DownloadEvent::Downgraded);
                             }
@@ -431,6 +525,8 @@ async fn fetch(
                 let now = Instant::now();
                 match ramp.check(now, received.load(Ordering::Relaxed), rc) {
                     Step::Wait => {}
+                    // The budget decides whether ramp-up may have it.
+                    Step::Open if !ticket.try_grow() => ramp.blocked(now, rc),
                     Step::Open => {
                         let peers = plan.average_rate();
                         match plan.next_work(&handle, peers, rc).await {
@@ -438,16 +534,23 @@ async fn fetch(
                                 &src, work, &handle, &config.transfer, &conn_event,
                             )),
                             // Nothing left worth a new connection.
-                            Ok(None) => ramp.done = true,
+                            Ok(None) => {
+                                ticket.release(false);
+                                ramp.done = true;
+                                ticket.stop_wanting();
+                            }
                             Err(WriterGone) => break 'run Err(None),
                         }
                     }
                     Step::Saturated => {
                         tracing::info!(connections = open, "download: link saturated");
                         link.record_saturation(open, rc.saturation_ttl);
+                        ticket.stop_wanting();
                     }
                 }
             }
+            // A newcomer may need one of ours.
+            _ = &mut changed => {}
         }
     };
     // Connections borrow the writer handle; they go first.
@@ -490,23 +593,56 @@ async fn fetch(
     })
 }
 
+/// `host:port`, the per-host budget key (§10.2).
+fn host_key(url: &Url) -> String {
+    format!(
+        "{}:{}",
+        url.host_str().unwrap_or_default(),
+        url.port_or_known_default().unwrap_or(0)
+    )
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
 /// One unit of work for a connection.
 struct Work {
     id: ChunkId,
     cursor: Arc<Cursor>,
     overlap: Option<Overlap>,
+    cancel: Arc<Notify>,
+}
+
+/// A range nobody is fetching.
+struct Pending {
+    range: std::ops::Range<u64>,
+    overlap: Option<Overlap>,
+    /// Already a chunk in the writer (given back by a shed connection).
+    defined: Option<ChunkId>,
+}
+
+struct Live {
+    cursor: Arc<Cursor>,
+    cancel: Arc<Notify>,
+    /// Started with an overlap to verify (I5); not shed before it has.
+    verifies: bool,
 }
 
 /// What is left to fetch and who is fetching it.
 struct Plan {
-    /// Ranges nobody has started (resume gaps), in order.
-    pending: VecDeque<(std::ops::Range<u64>, Option<Overlap>)>,
-    live: HashMap<ChunkId, Arc<Cursor>>,
+    /// Ranges nobody is fetching, in order.
+    pending: VecDeque<Pending>,
+    live: HashMap<ChunkId, Live>,
+    /// Connections being stopped for a newcomer (§10.3).
+    shedding: HashSet<ChunkId>,
     next_id: ChunkId,
 }
 
 impl Plan {
-    /// An unstarted range if any, else a piece stolen from the connection
+    /// A pending range if any, else a piece stolen from the connection
     /// that would finish last (§4.3). The split is journaled before this
     /// returns, so before the new connection sends anything.
     async fn next_work(
@@ -515,14 +651,24 @@ impl Plan {
         new_rate: Option<f64>,
         config: &RampConfig,
     ) -> Result<Option<Work>, WriterGone> {
-        if let Some((range, overlap)) = self.pending.pop_front() {
-            let id = self.take_id();
-            writer.define(id, range.clone()).await?;
-            return Ok(Some(self.start(id, range, overlap)));
+        if let Some(p) = self.pending.pop_front() {
+            let id = match p.defined {
+                Some(id) => id,
+                None => {
+                    let id = self.take_id();
+                    writer.define(id, p.range.clone()).await?;
+                    id
+                }
+            };
+            return Ok(Some(self.start(id, p.range, p.overlap)));
         }
         // Slowest to finish first: remaining / rate, unknown rates last.
-        let mut owners: Vec<(ChunkId, Arc<Cursor>)> =
-            self.live.iter().map(|(id, c)| (*id, c.clone())).collect();
+        let mut owners: Vec<(ChunkId, Arc<Cursor>)> = self
+            .live
+            .iter()
+            .filter(|(id, _)| !self.shedding.contains(id))
+            .map(|(id, l)| (*id, l.cursor.clone()))
+            .collect();
         owners.sort_by(|a, b| eta(&b.1).total_cmp(&eta(&a.1)));
         for (owner, cursor) in owners {
             let Some(at) =
@@ -539,6 +685,35 @@ impl Plan {
         Ok(None)
     }
 
+    /// Stops the newest connection where it is; the rest of its chunk goes
+    /// back to the front of the pending queue. Returns whether one was found.
+    async fn shed(&mut self, writer: &WriterHandle) -> Result<bool, WriterGone> {
+        let candidate = self
+            .live
+            .iter()
+            .filter(|(id, l)| {
+                !self.shedding.contains(id) && !(l.verifies && l.cursor.pos() == l.cursor.start())
+            })
+            .max_by_key(|(id, _)| **id)
+            .map(|(id, l)| (*id, l.cursor.clone(), l.cancel.clone()));
+        let Some((id, cursor, cancel)) = candidate else {
+            return Ok(false);
+        };
+        let at = cursor.pos();
+        let tail_id = self.take_id();
+        if let Some(tail) = writer.split(id, tail_id, at).await? {
+            cursor.set_end(at);
+            self.pending.push_front(Pending {
+                range: tail,
+                overlap: None,
+                defined: Some(tail_id),
+            });
+        }
+        self.shedding.insert(id);
+        cancel.notify_one();
+        Ok(true)
+    }
+
     /// Undoes the split that created `id` (§9 Protocol downgrade): the
     /// chunk ending at its start takes it back, if that connection hasn't
     /// got there yet.
@@ -551,8 +726,8 @@ impl Plan {
         let predecessor = self
             .live
             .iter()
-            .find(|(_, c)| c.end() == cursor.start() && c.pos() < cursor.start())
-            .map(|(pid, c)| (*pid, c.clone()));
+            .find(|(_, l)| l.cursor.end() == cursor.start() && l.cursor.pos() < cursor.start())
+            .map(|(pid, l)| (*pid, l.cursor.clone()));
         let Some((pid, pc)) = predecessor else {
             return Ok(false);
         };
@@ -576,17 +751,26 @@ impl Plan {
         overlap: Option<Overlap>,
     ) -> Work {
         let cursor = Arc::new(Cursor::new(range));
-        self.live.insert(id, cursor.clone());
+        let cancel = Arc::new(Notify::new());
+        self.live.insert(
+            id,
+            Live {
+                cursor: cursor.clone(),
+                cancel: cancel.clone(),
+                verifies: overlap.is_some(),
+            },
+        );
         Work {
             id,
             cursor,
             overlap,
+            cancel,
         }
     }
 
     /// Typical speed of the open connections: the guess for a new one.
     fn average_rate(&self) -> Option<f64> {
-        let rates: Vec<f64> = self.live.values().filter_map(|c| c.rate()).collect();
+        let rates: Vec<f64> = self.live.values().filter_map(|l| l.cursor.rate()).collect();
         (!rates.is_empty()).then(|| rates.iter().sum::<f64>() / rates.len() as f64)
     }
 }
@@ -605,17 +789,18 @@ async fn connection(
     config: &TransferConfig,
     on_event: &(dyn Fn(ConnEvent) + Send + Sync),
 ) -> (ChunkId, Result<Finished, TransferError>) {
-    let result = transfer::run_connection(
-        src,
-        work.id,
-        &work.cursor,
-        work.overlap,
-        writer,
-        config,
-        on_event,
-    )
-    .await;
-    (work.id, result)
+    let Work {
+        id,
+        cursor,
+        overlap,
+        cancel,
+    } = work;
+    tokio::select! {
+        biased;
+        // Shed (§10.3): stop here; the rest of the chunk is pending again.
+        _ = cancel.notified() => (id, Ok(Finished { content_length_seen: true })),
+        r = transfer::run_connection(src, id, &cursor, overlap, writer, config, on_event) => (id, r),
+    }
 }
 
 async fn writer_failure(
