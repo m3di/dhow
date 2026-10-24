@@ -184,3 +184,40 @@ fn suggest_name_uses_probe_fields() {
     let name = suggest_name(&info, &url("orig"), TargetFs::Posix, &["archive.zip"]);
     assert_eq!(name, "archive (2).zip");
 }
+
+/// ENGINE-SPEC §13.2.
+#[test]
+fn group_keys() {
+    let key = |name| group_key(name).map(|(k, _)| k);
+    for (name, expect) in [
+        ("A.part1.rar", Some("a.rar")),
+        ("A.Part2.rar", Some("a.rar")),
+        ("A.part1 (2).rar", Some("a.rar")),
+        ("B.rar", Some("b.rar")),
+        ("Movie_CD-2.mkv", Some("movie.mkv")),
+        ("Show S01E02.mkv", Some("show.mkv")),
+        ("Show - ep03 [1080p].mkv", Some("show ep03 [1080p].mkv")),
+        ("Show [01].mkv", Some("show.mkv")),
+        ("Book vol.3 of 5.pdf", Some("book.pdf")),
+        ("IMG_0042.JPG", Some("img.jpg")),
+        ("deep 3.txt", Some("deep.txt")),
+        ("photo 20240101.jpg", Some("photo 20240101.jpg")),
+        ("Backup.7z.001", Some("backup 7z")),
+        ("Backup.7z.002", Some("backup 7z")),
+        ("notes", Some("notes")),
+        ("x2.c", None),
+        ("01.mp3", None),
+        ("Part 1.rar", None),
+    ] {
+        assert_eq!(key(name).as_deref(), expect, "{name}");
+    }
+    assert_eq!(
+        group_key("Movie.Part1.rar").unwrap().1,
+        "Movie",
+        "display keeps the casing"
+    );
+    assert_eq!(
+        group_key("My.Big_Show.S02E10.mkv").unwrap().1,
+        "My Big Show"
+    );
+}

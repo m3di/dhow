@@ -8,6 +8,7 @@
 //! sure no two processes run the same download.
 
 pub mod categories;
+pub mod groups;
 pub mod limits;
 pub mod queues;
 pub mod speed;
@@ -196,6 +197,11 @@ pub enum EngineEvent {
         id: DownloadId,
         kind: WarningKind,
     },
+    /// The download's group is now `group` (§13.2).
+    GroupChanged {
+        id: DownloadId,
+        group: Option<groups::GroupSnapshot>,
+    },
 }
 
 pub struct AddRequest {
@@ -239,6 +245,7 @@ pub struct Snapshot {
     pub speed_limit: Option<u64>,
     /// Set at `Add` from the chosen name (§13.1).
     pub category: Category,
+    pub group: Option<groups::GroupId>,
 }
 
 impl Snapshot {
@@ -316,9 +323,15 @@ impl Engine {
         self.buckets.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Probes and records a download (§2, §3). Doesn't start it. Fails
-    /// fast as `Failed(NoSpace)` when the directory can't hold it (I10).
-    pub async fn add(&self, req: AddRequest) -> Result<Snapshot, EngineError> {
+    /// Probes and records a download (§2, §3) and groups it (§13.2).
+    /// Doesn't start it. Fails fast as `Failed(NoSpace)` when the directory
+    /// can't hold it (I10). Its group is in the snapshot; `GroupChanged`
+    /// goes to the others it joined.
+    pub async fn add(
+        &self,
+        req: AddRequest,
+        on_event: &(dyn Fn(EngineEvent) + Send + Sync),
+    ) -> Result<Snapshot, EngineError> {
         let queue_id = req
             .queue
             .clone()
@@ -406,6 +419,14 @@ impl Engine {
             ],
         )?;
         drop(db);
+        // A download that can't be grouped is still added.
+        let grouped = self.auto_group(&id).and_then(|changed| {
+            let others: Vec<DownloadId> = changed.into_iter().filter(|c| *c != id).collect();
+            self.announce_groups(&others, on_event)
+        });
+        if let Err(e) = grouped {
+            tracing::warn!(id, error = %e, "could not group download");
+        }
         self.get(&id)
     }
 
@@ -914,7 +935,7 @@ fn fail_reason(e: &DownloadError) -> FailReason {
 
 const SELECT: &str = "SELECT id, url, final_path, part_path, state, fail_reason, total_size,
     resumable, size_unverified, identity_weak, created_at, queue_id, position, speed_limit,
-    category FROM downloads";
+    category, group_id FROM downloads";
 
 fn snapshot(r: &Row) -> rusqlite::Result<Snapshot> {
     let state: String = r.get(4)?;
@@ -955,6 +976,7 @@ fn snapshot(r: &Row) -> rusqlite::Result<Snapshot> {
         position: r.get(12)?,
         speed_limit: r.get::<_, Option<i64>>(13)?.map(|v| v as u64),
         category: Category::parse(&r.get::<_, String>(14)?).unwrap_or(Category::Other),
+        group: r.get(15)?,
     })
 }
 

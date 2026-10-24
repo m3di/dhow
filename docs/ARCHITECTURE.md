@@ -59,7 +59,7 @@ pub enum Command {
     // Organisation
     MoveToQueue { id: DownloadId, queue: QueueId },
     Reorder     { id: DownloadId, before: Option<DownloadId> },
-    SetGroup    { id: DownloadId, group: Option<GroupId> }, // manual override of auto-grouping
+    SetGroup    { id: DownloadId, group: Option<GroupId> }, // manual override of auto-grouping (ENGINE-SPEC §13.2)
     RenameGroup { group: GroupId, name: String },
 
     // Queues
@@ -76,6 +76,7 @@ pub enum Command {
     // get_download(id) -> DownloadSnapshot
     // list_downloads(filter) -> Vec<DownloadSnapshot>
     // list_queues() -> Vec<QueueSnapshot>
+    // list_groups() -> Vec<GroupSnapshot>                    // { id, name, auto, members, downloaded, total, speed_bps, eta_secs }
     // storage_breakdown() -> Vec<CategoryUsage>              // { category, bytes, files, missing: Vec<DownloadId> }
     // speed_history(id, window) -> Vec<SpeedSample>
     // network_info() -> NetworkInfo
@@ -158,7 +159,7 @@ One database per user. WAL mode, `synchronous=NORMAL`, foreign keys on, `STRICT`
 
 Tables (abridged, the migrations are the truth):
 
-- `downloads` — id (UUIDv7), url, headers (json), final_path, part_path, state, fail_reason, queue_id, position, group_id, category, created_at, started_at, completed_at, total_size, etag, last_modified, digest, resumable, size_unverified, identity_weak, connections, speed_limit, file_token (blob)
+- `downloads` — id (UUIDv7), url, headers (json), final_path, part_path, state, fail_reason, queue_id, position, group_id, group_pinned, category, created_at, started_at, completed_at, total_size, etag, last_modified, digest, resumable, size_unverified, identity_weak, connections, speed_limit, file_token (blob)
 - `ranges` — download_id, start, end, state (`pending|active|committed`) — **mirror** of the sidecar journal, for queries only; the sidecar is authoritative (§5.2)
 - `queues` — id, name, max_concurrent, schedule (json), speed_limit, on_complete, is_default. The default queue is created by migration 1 with a fixed id and a NULL name (the shell localizes it); a trigger prevents deleting it.
 - `groups` — id, name, auto (bool)

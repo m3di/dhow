@@ -1,8 +1,9 @@
-//! File naming (ENGINE-SPEC §3) and categories (§13.1). Pure functions,
-//! no I/O.
+//! File naming (ENGINE-SPEC §3), categories (§13.1) and grouping keys
+//! (§13.2). Pure functions, no I/O.
 
 mod category;
 mod disposition;
+mod group;
 mod mime;
 #[cfg(test)]
 mod tests;
@@ -14,6 +15,7 @@ use reqwest::Url;
 use crate::probe::ProbeInfo;
 
 pub use category::{Category, ExtraExtensions, categorize, normalize_extension};
+pub use group::group_key;
 
 /// Longest final name in bytes: 255 minus the longest suffix the engine adds
 /// (`.dhow.tmp` during sidecar compaction, §5.3). UTF-8 bytes never undercount

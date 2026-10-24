@@ -93,7 +93,11 @@ async fn add_then_run_completes_with_events_in_order() {
     let server = TestServer::start().unwrap();
     let fx = Fx::new();
     let path = format!("/blob/400000?seed=3&{}", disposition("a.bin"));
-    let added = fx.engine.add(fx.request(&server, &path)).await.unwrap();
+    let added = fx
+        .engine
+        .add(fx.request(&server, &path), &|_| {})
+        .await
+        .unwrap();
     assert_eq!(added.state, State::Queued);
     assert_eq!(added.final_path, fx.downloads.join("a.bin"));
     assert_eq!(added.total_size, Some(400_000));
@@ -135,8 +139,16 @@ async fn queued_downloads_reserve_their_names() {
     let server = TestServer::start().unwrap();
     let fx = Fx::new();
     let path = format!("/blob/10?{}", disposition("same.bin"));
-    let first = fx.engine.add(fx.request(&server, &path)).await.unwrap();
-    let second = fx.engine.add(fx.request(&server, &path)).await.unwrap();
+    let first = fx
+        .engine
+        .add(fx.request(&server, &path), &|_| {})
+        .await
+        .unwrap();
+    let second = fx
+        .engine
+        .add(fx.request(&server, &path), &|_| {})
+        .await
+        .unwrap();
     assert_eq!(first.final_path, fx.downloads.join("same.bin"));
     assert_eq!(second.final_path, fx.downloads.join("same (2).bin"));
     assert_eq!(fx.engine.list().unwrap().len(), 2);
@@ -149,7 +161,7 @@ async fn too_big_for_the_disk_fails_at_add() {
     let fx = Fx::new();
     let added = fx
         .engine
-        .add(fx.request(&server, "/blob/1125899906842624"))
+        .add(fx.request(&server, "/blob/1125899906842624"), &|_| {})
         .await
         .unwrap();
     assert_eq!(added.state, State::Failed);
@@ -167,12 +179,12 @@ async fn user_filename_is_sanitized_and_empty_rejected() {
     let fx = Fx::new();
     let mut req = fx.request(&server, "/blob/10");
     req.filename = Some("../../.hidden".into());
-    let added = fx.engine.add(req).await.unwrap();
+    let added = fx.engine.add(req, &|_| {}).await.unwrap();
     assert_eq!(added.final_path, fx.downloads.join("hidden"));
     let mut req = fx.request(&server, "/blob/10");
     req.filename = Some("/".into());
     assert!(matches!(
-        fx.engine.add(req).await,
+        fx.engine.add(req, &|_| {}).await,
         Err(EngineError::InvalidName(_))
     ));
 }
@@ -183,7 +195,10 @@ async fn failures_are_recorded_with_a_reason() {
     let fx = Fx::new();
     let added = fx
         .engine
-        .add(fx.request(&server, "/blob/1000?fail=100&fail_mode=403"))
+        .add(
+            fx.request(&server, "/blob/1000?fail=100&fail_mode=403"),
+            &|_| {},
+        )
         .await
         .unwrap();
     let done = fx.run(&added.id).await;
@@ -203,7 +218,10 @@ async fn stop_pauses_and_run_again_finishes() {
     let fx = Fx::new();
     let added = fx
         .engine
-        .add(fx.request(&server, "/blob/1000000?throttle=2000000"))
+        .add(
+            fx.request(&server, "/blob/1000000?throttle=2000000"),
+            &|_| {},
+        )
         .await
         .unwrap();
     let (tx, stop) = watch::channel(false);
@@ -229,7 +247,7 @@ async fn pause_and_cancel_when_not_running() {
     let fx = Fx::new();
     let a = fx
         .engine
-        .add(fx.request(&server, "/blob/10"))
+        .add(fx.request(&server, "/blob/10"), &|_| {})
         .await
         .unwrap();
     assert_eq!(
@@ -251,7 +269,11 @@ async fn digest_mismatch_fails_without_a_final_file() {
     let server = TestServer::start().unwrap();
     let fx = Fx::new();
     let path = "/blob/1000?header=Content-Digest%3A%20sha-256%3D%3AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA%3D%3A";
-    let added = fx.engine.add(fx.request(&server, path)).await.unwrap();
+    let added = fx
+        .engine
+        .add(fx.request(&server, path), &|_| {})
+        .await
+        .unwrap();
     let done = fx.run(&added.id).await;
     assert_eq!(done.fail_reason, Some(FailReason::DigestMismatch));
     assert_eq!(fx.files(), ["1000.dhow", "1000.part"]);
@@ -264,7 +286,7 @@ async fn completing_after_a_crash_is_finished_without_downloading() {
     let fx = Fx::new();
     let added = fx
         .engine
-        .add(fx.request(&server, "/blob/10"))
+        .add(fx.request(&server, "/blob/10"), &|_| {})
         .await
         .unwrap();
     std::fs::write(&added.final_path, blob::bytes(0, 0..10)).unwrap();
@@ -285,7 +307,7 @@ async fn resolve_accepts_unique_prefixes() {
     let fx = Fx::new();
     let a = fx
         .engine
-        .add(fx.request(&server, "/blob/10"))
+        .add(fx.request(&server, "/blob/10"), &|_| {})
         .await
         .unwrap();
     assert_eq!(fx.engine.resolve(&a.id).unwrap(), a.id);
@@ -295,7 +317,7 @@ async fn resolve_accepts_unique_prefixes() {
         Err(EngineError::NotFound(_))
     ));
     fx.engine
-        .add(fx.request(&server, "/blob/10"))
+        .add(fx.request(&server, "/blob/10"), &|_| {})
         .await
         .unwrap();
     // Two UUIDv7s made within a millisecond share a long prefix.
@@ -332,12 +354,18 @@ async fn budget_wait_is_a_visible_state() {
     let fx = Fx::with(config);
     let a = fx
         .engine
-        .add(fx.request(&server, "/blob/400000?seed=1&throttle=1000000"))
+        .add(
+            fx.request(&server, "/blob/400000?seed=1&throttle=1000000"),
+            &|_| {},
+        )
         .await
         .unwrap();
     let b = fx
         .engine
-        .add(fx.request(&server, "/blob/400000?seed=2&throttle=1000000"))
+        .add(
+            fx.request(&server, "/blob/400000?seed=2&throttle=1000000"),
+            &|_| {},
+        )
         .await
         .unwrap();
     let seen_waiting = Arc::new(StdMutex::new(false));
@@ -378,7 +406,7 @@ mod queue_tests {
     async fn add_to(fx: &Fx, server: &TestServer, queue: Option<&str>) -> Snapshot {
         let mut req = fx.request(server, "/blob/10");
         req.queue = queue.map(str::to_owned);
-        fx.engine.add(req).await.unwrap()
+        fx.engine.add(req, &|_| {}).await.unwrap()
     }
 
     fn order(fx: &Fx, queue: &str) -> Vec<String> {
@@ -483,11 +511,14 @@ mod queue_tests {
         ));
         assert!(matches!(
             fx.engine
-                .add({
-                    let mut r = fx.request(&server, "/blob/10");
-                    r.queue = Some("nope".into());
-                    r
-                })
+                .add(
+                    {
+                        let mut r = fx.request(&server, "/blob/10");
+                        r.queue = Some("nope".into());
+                        r
+                    },
+                    &|_| {}
+                )
                 .await,
             Err(EngineError::NotFound(_))
         ));
@@ -586,7 +617,7 @@ mod schedule_tests {
     async fn add_to(fx: &Fx, server: &TestServer, queue: &str) -> String {
         let mut req = fx.request(server, "/blob/10");
         req.queue = Some(queue.into());
-        fx.engine.add(req).await.unwrap().id
+        fx.engine.add(req, &|_| {}).await.unwrap().id
     }
 
     fn runnable(fx: &Fx, now: &Zoned) -> Vec<String> {
@@ -606,7 +637,7 @@ mod schedule_tests {
         let dl = add_to(&fx, &server, &q).await;
         let other = fx
             .engine
-            .add(fx.request(&server, "/blob/10"))
+            .add(fx.request(&server, "/blob/10"), &|_| {})
             .await
             .unwrap()
             .id;
@@ -724,7 +755,7 @@ mod schedule_tests {
         let fx = Fx::new();
         let dl = fx
             .engine
-            .add(fx.request(&server, "/blob/10"))
+            .add(fx.request(&server, "/blob/10"), &|_| {})
             .await
             .unwrap()
             .id;
@@ -822,7 +853,7 @@ mod limit_tests {
 
         let mut req = fx.request(&server, "/blob/10");
         req.speed_limit = Some(5_000);
-        let added = fx.engine.add(req).await.unwrap();
+        let added = fx.engine.add(req, &|_| {}).await.unwrap();
         assert_eq!(added.speed_limit, Some(5_000));
         let snap = fx.engine.set_speed_limit(&added.id, Some(0)).unwrap();
         assert_eq!(snap.speed_limit, Some(0));
@@ -848,7 +879,7 @@ mod limit_tests {
         for seed in 0..2 {
             let mut req = fx.request(&server, &format!("/blob/300000?seed={seed}"));
             req.queue = Some(q.id.clone());
-            ids.push(fx.engine.add(req).await.unwrap().id);
+            ids.push(fx.engine.add(req, &|_| {}).await.unwrap().id);
         }
         let started = Instant::now();
         let (a, b) = tokio::join!(fx.run(&ids[0]), fx.run(&ids[1]));
@@ -866,7 +897,7 @@ mod limit_tests {
         let fx = Fx::new();
         let mut req = fx.request(&server, "/blob/2000000");
         req.speed_limit = Some(0);
-        let id = fx.engine.add(req).await.unwrap().id;
+        let id = fx.engine.add(req, &|_| {}).await.unwrap().id;
         let run = fx.run(&id);
         let lift = async {
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -935,7 +966,7 @@ mod speed_tests {
         let fx = Fx::new();
         let mut req = fx.request(&server, "/blob/1000000?throttle=200000");
         req.connections = Some(1);
-        let id = fx.engine.add(req).await.unwrap().id;
+        let id = fx.engine.add(req, &|_| {}).await.unwrap().id;
         assert_eq!(fx.run(&id).await.state, State::Completed);
 
         let samples = fx.engine.speed_history(Some(&id)).unwrap();
@@ -1005,7 +1036,7 @@ mod category_tests {
         let add = |path: String, name: Option<&str>| {
             let mut req = fx.request(&server, &path);
             req.filename = name.map(Into::into);
-            fx.engine.add(req)
+            fx.engine.add(req, &|_| {})
         };
         let named = add(format!("/blob/10?{}", disposition("Clip.MKV")), None);
         assert_eq!(named.await.unwrap().category, Category::Video);
@@ -1069,8 +1100,16 @@ mod category_tests {
             .unwrap();
         for name in ["model.safetensors", "src.tar.lz"] {
             let path = format!("/blob/10?{}", disposition(name));
-            let first = fx.engine.add(fx.request(&server, &path)).await.unwrap();
-            let second = fx.engine.add(fx.request(&server, &path)).await.unwrap();
+            let first = fx
+                .engine
+                .add(fx.request(&server, &path), &|_| {})
+                .await
+                .unwrap();
+            let second = fx
+                .engine
+                .add(fx.request(&server, &path), &|_| {})
+                .await
+                .unwrap();
             assert_ne!(first.final_path, second.final_path);
             assert_eq!(first.category, Category::Data, "{name}");
             assert_eq!(second.category, Category::Data, "{name}");
@@ -1089,12 +1128,19 @@ mod category_tests {
             ("d.zip", 40),
         ] {
             let path = format!("/blob/{size}?{}", disposition(name));
-            let added = fx.engine.add(fx.request(&server, &path)).await.unwrap();
+            let added = fx
+                .engine
+                .add(fx.request(&server, &path), &|_| {})
+                .await
+                .unwrap();
             ids.push(added.id);
         }
         // Not completed: not counted.
         fx.engine
-            .add(fx.request(&server, &format!("/blob/5?{}", disposition("e.pdf"))))
+            .add(
+                fx.request(&server, &format!("/blob/5?{}", disposition("e.pdf"))),
+                &|_| {},
+            )
             .await
             .unwrap();
         for id in &ids {
@@ -1119,5 +1165,236 @@ mod category_tests {
                 },
             ]
         );
+    }
+}
+
+mod group_tests {
+    use super::*;
+    use crate::engine::groups::GroupSnapshot;
+
+    impl Fx {
+        async fn add_named(&self, server: &TestServer, name: &str) -> Snapshot {
+            let mut req = self.request(server, "/blob/1000");
+            req.filename = Some(name.into());
+            let sink = self.events.clone();
+            let on_event = move |e: EngineEvent| sink.lock().unwrap().push(e);
+            self.engine.add(req, &on_event).await.unwrap()
+        }
+
+        fn group_events(&self) -> Vec<(DownloadId, Option<GroupSnapshot>)> {
+            std::mem::take(&mut *self.events.lock().unwrap())
+                .into_iter()
+                .filter_map(|e| match e {
+                    EngineEvent::GroupChanged { id, group } => Some((id, group)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn group_of(&self, id: &str) -> Option<GroupSnapshot> {
+            let g = self.engine.get(id).unwrap().group?;
+            Some(self.engine.group(&g).unwrap())
+        }
+    }
+
+    /// T-13, and the rest of §13.2's join rules.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parts_with_one_key_in_one_directory_group() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let a1 = fx.add_named(&server, "A.part1.rar").await;
+        assert_eq!(a1.group, None, "nothing to group with yet");
+        let a2 = fx.add_named(&server, "A.part2.rar").await;
+        let b = fx.add_named(&server, "B.rar").await;
+        assert_eq!(b.group, None);
+
+        let groups = fx.engine.list_groups().unwrap();
+        assert_eq!(groups.len(), 1);
+        let g = &groups[0];
+        assert_eq!((g.name.as_str(), g.auto), ("A", true));
+        assert_eq!(g.members, [a1.id.clone(), a2.id.clone()]);
+        assert_eq!(a2.group.as_ref(), Some(&g.id));
+        assert_eq!(
+            fx.group_events(),
+            [(a1.id.clone(), Some(g.clone()))],
+            "the partner hears; the new one's group is in its snapshot"
+        );
+
+        // Joins the existing group; other extensions and directories don't.
+        let a3 = fx.add_named(&server, "a_PART-3.rar").await;
+        assert_eq!(a3.group.as_ref(), Some(&g.id));
+        assert!(fx.group_events().is_empty());
+        assert_eq!(fx.add_named(&server, "A.part4.zip").await.group, None);
+        let mut req = fx.request(&server, "/blob/1000");
+        req.directory = fx.downloads.join("other");
+        std::fs::create_dir(&req.directory).unwrap();
+        req.filename = Some("A.part5.rar".into());
+        assert_eq!(fx.engine.add(req, &|_| {}).await.unwrap().group, None);
+        // A name collision's ` (2)` is stripped too.
+        let a1_again = fx.add_named(&server, "A.part1.rar").await;
+        assert!(a1_again.final_path.ends_with("A.part1 (2).rar"));
+        assert_eq!(a1_again.group.as_ref(), Some(&g.id));
+        assert_eq!(fx.engine.list_groups().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn manual_changes_make_groups_and_downloads_manual() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let a1 = fx.add_named(&server, "Album.cd1.flac").await;
+        let a2 = fx.add_named(&server, "Album.cd2.flac").await;
+        let b = fx.add_named(&server, "Booklet.pdf").await;
+        let g = fx.engine.list_groups().unwrap()[0].id.clone();
+        fx.group_events();
+
+        // Into an automatic group: it becomes manual.
+        let moved = fx.engine.set_group(&b.id, Some(&g), &|_| {}).unwrap();
+        assert_eq!(moved.group.as_ref(), Some(&g));
+        let snap = fx.engine.group(&g).unwrap();
+        assert!(!snap.auto);
+        assert_eq!(snap.members, [a1.id.clone(), a2.id.clone(), b.id.clone()]);
+        // ...so a new part doesn't join it, and has no one else to pair with.
+        let a3 = fx.add_named(&server, "Album.cd3.flac").await;
+        assert_eq!(a3.group, None);
+
+        // A manual group keeps its last member; empty, it's gone.
+        for id in [&a1.id, &a2.id] {
+            fx.engine.set_group(id, None, &|_| {}).unwrap();
+        }
+        assert_eq!(fx.engine.group(&g).unwrap().members, [b.id.as_str()]);
+        fx.engine.set_group(&b.id, None, &|_| {}).unwrap();
+        assert!(matches!(fx.engine.group(&g), Err(EngineError::NotFound(_))));
+        assert!(matches!(
+            fx.engine.set_group(&b.id, Some("nope"), &|_| {}),
+            Err(EngineError::NotFound(_))
+        ));
+
+        // Taken out by hand: a1 and a2 stay out; a fourth part pairs with
+        // the third, which was never placed.
+        let a4 = fx.add_named(&server, "Album.cd4.flac").await;
+        let g2 = a4.group.clone().expect("grouped with cd3");
+        assert_eq!(
+            fx.engine.group(&g2).unwrap().members,
+            [a3.id.clone(), a4.id.clone()]
+        );
+
+        // Renaming makes it manual.
+        assert!(matches!(
+            fx.engine.rename_group(&g2, "  ", &|_| {}),
+            Err(EngineError::InvalidName(_))
+        ));
+        fx.group_events();
+        let sink = fx.events.clone();
+        let on_event = move |e: EngineEvent| sink.lock().unwrap().push(e);
+        let renamed = fx.engine.rename_group(&g2, " Live ", &on_event).unwrap();
+        assert_eq!((renamed.name.as_str(), renamed.auto), ("Live", false));
+        assert_eq!(fx.group_events().len(), 2, "one per member");
+        assert_eq!(fx.engine.resolve_group("Live").unwrap(), g2);
+        assert_eq!(fx.engine.resolve_group(&g2[..12]).unwrap(), g2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_auto_group_down_to_one_dissolves() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let a1 = fx.add_named(&server, "Show.S01E01.mkv").await;
+        let a2 = fx.add_named(&server, "Show.S01E02.mkv").await;
+        let g = a2.group.clone().unwrap();
+        fx.group_events();
+        let sink = fx.events.clone();
+        let on_event = move |e: EngineEvent| sink.lock().unwrap().push(e);
+        fx.engine.set_group(&a1.id, None, &on_event).unwrap();
+        assert_eq!(
+            fx.group_events(),
+            [(a1.id.clone(), None), (a2.id.clone(), None)]
+        );
+        assert!(fx.engine.list_groups().unwrap().is_empty());
+        assert_eq!(fx.engine.get(&a2.id).unwrap().group, None);
+        assert!(matches!(fx.engine.group(&g), Err(EngineError::NotFound(_))));
+        // a1 was placed by hand; a2 wasn't.
+        let a3 = fx.add_named(&server, "Show.S01E03.mkv").await;
+        assert_eq!(
+            fx.group_of(&a3.id).unwrap().members,
+            [a2.id.clone(), a3.id.clone()]
+        );
+        assert_eq!(fx.engine.get(&a1.id).unwrap().group, None);
+    }
+
+    /// The `Renamed` path (M3.5): a member whose key no longer matches
+    /// leaves, and its group dissolves.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_renamed_member_leaves() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let a1 = fx.add_named(&server, "Movie.Part1.rar").await;
+        let a2 = fx.add_named(&server, "Movie.Part2.rar").await;
+        assert!(a2.group.is_some());
+        fx.engine
+            .db()
+            .conn()
+            .execute(
+                "UPDATE downloads SET final_path = ?2 WHERE id = ?1",
+                params![a2.id, path_str(&fx.downloads.join("Trailer.rar"))],
+            )
+            .unwrap();
+        assert_eq!(
+            fx.engine.auto_group(&a2.id).unwrap(),
+            [a2.id.clone(), a1.id.clone()]
+        );
+        assert!(fx.engine.list_groups().unwrap().is_empty());
+        assert!(fx.engine.auto_group(&a1.id).unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn groups_aggregate_progress_speed_and_eta() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let a1 = fx.add_named(&server, "Set.01.bin").await;
+        let a2 = fx.add_named(&server, "Set.02.bin").await;
+        let g = a2.group.clone().unwrap();
+        let snap = fx.engine.group(&g).unwrap();
+        assert_eq!((snap.downloaded, snap.total), (0, Some(2000)));
+        assert_eq!((snap.speed_bps, snap.eta_secs), (0, None));
+
+        assert_eq!(fx.run(&a1.id).await.state, State::Completed);
+        // a2 running at 4000 B/s by its recent samples; a stale one
+        // doesn't count.
+        let now = now_ms();
+        {
+            let db = fx.engine.db();
+            db.conn()
+                .execute(
+                    "UPDATE downloads SET state = 'active' WHERE id = ?1",
+                    [&a2.id],
+                )
+                .unwrap();
+            for (at, bps) in [
+                (now - 60_000, 1_000_000),
+                (now - 2000, 4000),
+                (now - 1000, 4000),
+                (now, 4000),
+            ] {
+                db.conn()
+                    .execute(
+                        "INSERT INTO speed_samples (download_id, period_secs, at, bytes_per_sec)
+                         VALUES (?1, 1, ?2, ?3)",
+                        params![a2.id, at, bps],
+                    )
+                    .unwrap();
+            }
+        }
+        let snap = fx.engine.group(&g).unwrap();
+        assert_eq!((snap.downloaded, snap.total), (1000, Some(2000)));
+        assert_eq!((snap.speed_bps, snap.eta_secs), (4000, Some(1)));
+        // Not running: no speed.
+        fx.engine
+            .db()
+            .conn()
+            .execute(
+                "UPDATE downloads SET state = 'paused' WHERE id = ?1",
+                [&a2.id],
+            )
+            .unwrap();
+        assert_eq!(fx.engine.group(&g).unwrap().speed_bps, 0);
     }
 }

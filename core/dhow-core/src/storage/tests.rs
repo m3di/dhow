@@ -257,7 +257,7 @@ fn v1_database_migrates_to_v2_keeping_data() {
             .unwrap();
     }
     let db = Db::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 2);
+    assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
     let (state, until): (String, Option<i64>) = db
         .conn()
         .query_row(
