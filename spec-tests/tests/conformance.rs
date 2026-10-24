@@ -298,39 +298,142 @@ fn output_name_override() {
     assert_eq!(sb.files(), ["mine.dat"]);
 }
 
+/// Ids in the order their `state → active` events appeared.
+fn start_order(out: &spec_tests::CliOutput) -> Vec<String> {
+    out.events()
+        .iter()
+        .filter(|e| e["event"] == "state" && e["to"] == "active" && e["from"] == "queued")
+        .map(|e| e["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Most downloads active at once, from one process's event stream.
+fn max_active(out: &spec_tests::CliOutput) -> usize {
+    let mut active = std::collections::HashSet::new();
+    let mut max = 0;
+    for e in out.events().iter().filter(|e| e["event"] == "state") {
+        let id = e["id"].as_str().unwrap().to_owned();
+        match e["to"].as_str().unwrap() {
+            "active" | "waiting" | "completing" => {
+                active.insert(id);
+            }
+            _ => {
+                active.remove(&id);
+            }
+        }
+        max = max.max(active.len());
+    }
+    max
+}
+
+fn queue_slow(sb: &Sandbox, server: &TestServer, seed: u64, extra: &[&str]) -> String {
+    let path = format!(
+        "/blob/500000?seed={seed}&throttle=1000000&{}",
+        named(&format!("{seed}.bin"))
+    );
+    let mut args = vec!["--queue"];
+    args.extend_from_slice(extra);
+    let out = sb.add(server, &path, &args);
+    out.assert_success();
+    out.id()
+}
+
+/// §10.4: `watch` runs a queue's downloads concurrently, at most
+/// `max_concurrent` at once, starting them in queue order.
 #[test]
-fn queue_then_watch_runs_everything_in_order() {
+fn watch_respects_queue_concurrency_and_order() {
     let server = TestServer::start().unwrap();
     let sb = Sandbox::new();
-    for seed in 1..=3 {
-        sb.add(
-            &server,
-            &format!("/blob/50000?seed={seed}&{}", named(&format!("{seed}.bin"))),
-            &["--queue"],
-        )
+    sb.dhow(["queue", "set", "default", "--max", "2"])
         .assert_success();
-    }
+    let ids: Vec<String> = (1..=4)
+        .map(|seed| queue_slow(&sb, &server, seed, &[]))
+        .collect();
     assert!(sb.files().is_empty(), "--queue only records");
     let out = sb.dhow(["watch"]);
     out.assert_success();
-    let finished: Vec<_> = out
-        .events()
-        .iter()
-        .filter(|e| e["event"] == "renamed")
-        .map(|e| {
-            e["path"]
-                .as_str()
-                .unwrap()
-                .rsplit('/')
-                .next()
-                .unwrap()
-                .to_owned()
-        })
-        .collect();
-    assert_eq!(finished, ["1.bin", "2.bin", "3.bin"]);
-    for seed in 1..=3 {
-        assert_blob(&sb.dl().join(format!("{seed}.bin")), seed, 50_000);
+    assert_eq!(max_active(&out), 2);
+    assert_eq!(start_order(&out), ids);
+    for seed in 1..=4 {
+        assert_blob(&sb.dl().join(format!("{seed}.bin")), seed, 500_000);
     }
+}
+
+#[test]
+fn reorder_changes_what_runs_first() {
+    let server = TestServer::start().unwrap();
+    let sb = Sandbox::new();
+    sb.dhow(["queue", "set", "default", "--max", "1"])
+        .assert_success();
+    let ids: Vec<String> = (1..=3)
+        .map(|seed| queue_slow(&sb, &server, seed, &[]))
+        .collect();
+    sb.dhow(["reorder", &ids[2], "--before", &ids[0]])
+        .assert_success();
+    sb.dhow(["reorder", &ids[0]]).assert_success(); // to the end
+    let out = sb.dhow(["watch"]);
+    out.assert_success();
+    assert_eq!(
+        start_order(&out),
+        [ids[2].clone(), ids[1].clone(), ids[0].clone()]
+    );
+    let positions: Vec<i64> = sb
+        .ls()
+        .iter()
+        .map(|r| r["position"].as_i64().unwrap())
+        .collect();
+    assert_eq!(positions.len(), 3);
+}
+
+/// Each queue has its own limit; queues run side by side.
+#[test]
+fn queues_run_side_by_side_within_their_limits() {
+    let server = TestServer::start().unwrap();
+    let sb = Sandbox::new();
+    let q = sb.dhow(["queue", "add", "Night", "--max", "1"]);
+    q.assert_success();
+    let night = q.events()[0]["id"].as_str().unwrap().to_owned();
+    sb.dhow(["queue", "set", "default", "--max", "1"])
+        .assert_success();
+    let n1 = queue_slow(&sb, &server, 1, &["--to", "Night"]);
+    let n2 = queue_slow(&sb, &server, 2, &["--to", "Night"]);
+    let d1 = queue_slow(&sb, &server, 3, &[]);
+    let out = sb.dhow(["watch"]);
+    out.assert_success();
+    assert_eq!(max_active(&out), 2, "one per queue");
+    let order = start_order(&out);
+    assert!(order.iter().position(|i| *i == n1) < order.iter().position(|i| *i == n2));
+    assert!(order.contains(&d1));
+    let ls = sb.ls();
+    assert_eq!(
+        ls.iter().filter(|r| r["queue"] == night.as_str()).count(),
+        2
+    );
+    assert!(ls.iter().all(|r| r["state"] == "completed"));
+}
+
+#[test]
+fn deleting_a_queue_moves_its_downloads() {
+    let server = TestServer::start().unwrap();
+    let sb = Sandbox::new();
+    sb.dhow(["queue", "add", "Temp"]).assert_success();
+    let id = queue_slow(&sb, &server, 1, &["--to", "Temp"]);
+    sb.dhow(["queue", "rm", "Temp"]).assert_success();
+    let queues = sb.dhow(["queue", "ls"]).events();
+    assert_eq!(queues.len(), 1);
+    assert_eq!(queues[0]["default"], true);
+    assert_eq!(queues[0]["unfinished"], 1);
+    let row = &sb.ls()[0];
+    assert_eq!(
+        (row["id"].as_str(), row["queue"].as_str()),
+        (Some(id.as_str()), queues[0]["id"].as_str())
+    );
+    let refused = sb.dhow(["queue", "rm", "default"]);
+    assert!(!refused.status.success());
+    assert!(
+        refused.stderr.contains("default queue cannot be deleted"),
+        "{refused:?}"
+    );
 }
 
 /// `pause` from another process: the runner commits and exits; `resume`

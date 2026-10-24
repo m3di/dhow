@@ -7,6 +7,7 @@
 //! decision (the CLI runs one in the foreground); the caller also makes
 //! sure no two processes run the same download.
 
+pub mod queues;
 #[cfg(test)]
 mod tests;
 
@@ -199,6 +200,8 @@ pub struct AddRequest {
     pub paused: bool,
     /// Connections for this download; `None` = the default (§4.1).
     pub connections: Option<u8>,
+    /// `None`: the default queue.
+    pub queue: Option<queues::QueueId>,
     pub target_fs: TargetFs,
 }
 
@@ -217,6 +220,9 @@ pub struct Snapshot {
     pub size_unverified: bool,
     pub identity_weak: bool,
     pub created_at: i64,
+    pub queue_id: queues::QueueId,
+    /// Order within its queue.
+    pub position: i64,
 }
 
 impl Snapshot {
@@ -239,6 +245,10 @@ pub enum EngineError {
     Ambiguous(String),
     #[error("{0:?} is not a usable file name")]
     InvalidName(String),
+    #[error("the default queue cannot be deleted")]
+    DefaultQueue,
+    #[error("{0}")]
+    InvalidQueue(&'static str),
 }
 
 impl From<rusqlite::Error> for EngineError {
@@ -276,6 +286,11 @@ impl Engine {
     /// Probes and records a download (§2, §3). Doesn't start it. Fails
     /// fast as `Failed(NoSpace)` when the directory can't hold it (I10).
     pub async fn add(&self, req: AddRequest) -> Result<Snapshot, EngineError> {
+        let queue_id = req
+            .queue
+            .clone()
+            .unwrap_or_else(|| DEFAULT_QUEUE_ID.to_owned());
+        self.queue(&queue_id)?;
         let info = probe::probe(&self.client, &req.url, &req.headers, self.config.probe).await?;
         let base = match &req.filename {
             Some(name) => naming::sanitize(name, req.target_fs)
@@ -317,7 +332,7 @@ impl Engine {
         let db = self.db();
         let position: i64 = db.conn().query_row(
             "SELECT COALESCE(MAX(position), -1) + 1 FROM downloads WHERE queue_id = ?1",
-            [DEFAULT_QUEUE_ID],
+            [&queue_id],
             |r| r.get(0),
         )?;
         db.conn().execute(
@@ -334,7 +349,7 @@ impl Engine {
                 path_str(&part_path),
                 state.as_str(),
                 reason.as_ref().map(FailReason::as_db),
-                DEFAULT_QUEUE_ID,
+                queue_id,
                 position,
                 now_ms(),
                 info.total_size.map(|t| t as i64),
@@ -773,7 +788,7 @@ fn fail_reason(e: &DownloadError) -> FailReason {
 }
 
 const SELECT: &str = "SELECT id, url, final_path, part_path, state, fail_reason, total_size,
-    resumable, size_unverified, identity_weak, created_at FROM downloads";
+    resumable, size_unverified, identity_weak, created_at, queue_id, position FROM downloads";
 
 fn snapshot(r: &Row) -> rusqlite::Result<Snapshot> {
     let state: String = r.get(4)?;
@@ -810,6 +825,8 @@ fn snapshot(r: &Row) -> rusqlite::Result<Snapshot> {
         size_unverified: r.get(8)?,
         identity_weak: r.get(9)?,
         created_at: r.get(10)?,
+        queue_id: r.get(11)?,
+        position: r.get(12)?,
     })
 }
 

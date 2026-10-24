@@ -2,6 +2,7 @@
 //! scripts and spec-tests read the same thing a person does.
 
 use dhow_core::download::ResetReason;
+use dhow_core::engine::queues::QueueSnapshot;
 use dhow_core::engine::{EngineEvent, Snapshot, WarningKind};
 use dhow_core::probe::Resumable;
 use serde_json::{Value, json};
@@ -75,5 +76,20 @@ pub fn snapshot(event: &str, s: &Snapshot) -> Value {
         },
         "size_unverified": s.size_unverified,
         "identity_weak": s.identity_weak,
+        "queue": s.queue_id,
+        "position": s.position,
+    })
+}
+
+pub fn queue(q: &QueueSnapshot) -> Value {
+    json!({
+        "event": "queue",
+        "id": q.id,
+        "name": q.name,
+        "default": q.is_default,
+        "max_concurrent": q.max_concurrent,
+        "speed_limit": q.speed_limit,
+        "on_complete": q.on_complete.as_str(),
+        "unfinished": q.unfinished,
     })
 }

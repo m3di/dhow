@@ -330,6 +330,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "dhow-core",
+ "futures-util",
  "rustix",
  "serde_json",
  "tempfile",
