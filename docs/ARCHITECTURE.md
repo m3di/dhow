@@ -34,7 +34,7 @@ The core is a library, not a daemon. Each shell instantiates one `Dhow` object i
 | `dhow-cli` | `dhow add <url>`, `dhow ls`, `dhow pause/resume`, `dhow watch` (TUI-less, prints events). Reference client for conformance tests. | `clap` |
 | `dhow-testserver` | Local HTTP/1.1 + HTTP/2 server with knobs: drop connection after N bytes, lie about `Content-Length`, change ETag mid-download, ignore `Range`, return 200 to `If-Range`, throttle, inject garbage into a range response, slow headers. | `axum` or `hyper` |
 
-The core must build for: `aarch64/x86_64-apple-darwin`, `aarch64-apple-ios` (+sim), `x86_64/aarch64-unknown-linux-gnu`, `x86_64/aarch64-pc-windows-msvc`, `aarch64/armv7/x86_64-linux-android`. CI builds all of them from day one, even before shells exist.
+The core must build for: `aarch64/x86_64-apple-darwin`, `aarch64-apple-ios` (+sim), `x86_64/aarch64-unknown-linux-gnu`, `x86_64/aarch64-pc-windows-msvc`, `aarch64/armv7/x86_64-linux-android`. Per-PR CI runs tests on Linux only; other targets are built locally and in the (later) release workflow.
 
 ## 3. Command / event API
 

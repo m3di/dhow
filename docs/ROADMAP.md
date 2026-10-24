@@ -4,12 +4,12 @@ Milestones are sequential. A milestone is done when every item is merged with te
 
 ## M0 — Repo & skeleton
 
-- M0.1 Cargo workspace with `dhow-core`, `dhow-cli`, `dhow-testserver`, `dhow-ffi` (empty), CI matrix building all targets in `ARCHITECTURE §2`.
+- M0.1 Cargo workspace with `dhow-core`, `dhow-cli`, `dhow-testserver`, `dhow-ffi` (empty), CI running fmt, clippy and tests on a Linux runner.
 - M0.2 `spec-tests/` harness: starts `dhow-testserver`, drives `dhow-cli`, asserts on files and CLI event output.
 - M0.3 `tracing` setup, structured logs to the platform log dir.
 - M0.4 SQLite schema v1 + migrations framework.
 
-Exit: `cargo test --workspace` green on Linux, macOS, Windows CI runners; `dhow --version` runs (binary of the `dhow-cli` crate).
+Exit: `cargo test --workspace` green on Linux CI and locally on macOS; `dhow --version` runs (binary of the `dhow-cli` crate).
 
 ## M1 — Engine core (single download, bulletproof)
 
