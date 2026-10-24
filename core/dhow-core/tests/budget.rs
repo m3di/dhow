@@ -14,7 +14,7 @@ use dhow_testserver::{TestServer, blob};
 use reqwest::Url;
 use tokio::sync::watch;
 
-fn config() -> DownloadConfig {
+fn config(window: Duration) -> DownloadConfig {
     DownloadConfig {
         transfer: TransferConfig {
             first_byte: Duration::from_secs(10),
@@ -31,13 +31,21 @@ fn config() -> DownloadConfig {
             commit_bytes: 8 * 1024 * 1024,
         },
         ramp: RampConfig {
-            window: Duration::from_millis(100),
+            window,
             min_chunk: 128 * 1024,
             min_steal_gain: Duration::from_millis(200),
+            // Never saturated: these tests are about the budget, and a
+            // short window on a busy machine measures scheduling as often as
+            // the link (a burst, then "no gain"). T-10b covers saturation.
+            min_gain: -1.0,
             ..RampConfig::default()
         },
         ..DownloadConfig::default()
     }
+}
+
+fn ms(n: u64) -> Duration {
+    Duration::from_millis(n)
 }
 
 /// Connection counts per download over time, as their events report them.
@@ -76,13 +84,6 @@ impl Timeline {
         }
     }
 
-    fn first_reach(&self, who: usize, n: u32) -> Option<Instant> {
-        self.changes
-            .iter()
-            .find(|(_, w, c)| *w == who && *c >= n)
-            .map(|(t, _, _)| *t)
-    }
-
     fn peak(&self, who: usize) -> u32 {
         self.changes
             .iter()
@@ -100,8 +101,14 @@ struct Job {
 }
 
 /// Runs `jobs` concurrently through one shared budget, starting them
-/// `stagger` apart (in age order). Asserts every file bit-exact.
-async fn run_all(jobs: Vec<Job>, budget: BudgetConfig, stagger: Duration) -> Timeline {
+/// `stagger` apart (in age order), ramping up every `window`. Asserts every
+/// file bit-exact.
+async fn run_all(
+    jobs: Vec<Job>,
+    budget: BudgetConfig,
+    stagger: Duration,
+    window: Duration,
+) -> Timeline {
     let shared = Arc::new(Shared::new(budget));
     let timeline = Arc::new(Mutex::new(Timeline::new(jobs.len())));
     let dir = tempfile::tempdir().unwrap();
@@ -123,7 +130,7 @@ async fn run_all(jobs: Vec<Job>, budget: BudgetConfig, stagger: Duration) -> Tim
             let (_keep, stop) = watch::channel(false);
             let on_event = move |e: DownloadEvent| timeline.lock().unwrap().record(i, &e);
             let client = http::client().unwrap();
-            let done = download(&req, &client, &config(), &shared, &on_event, &stop).await;
+            let done = download(&req, &client, &config(window), &shared, &on_event, &stop).await;
             done.unwrap_or_else(|e| panic!("download {i}: {e}"));
             let bytes = std::fs::read(&req.part).unwrap();
             assert_eq!(
@@ -146,12 +153,16 @@ async fn run_all(jobs: Vec<Job>, budget: BudgetConfig, stagger: Duration) -> Tim
         .unwrap()
 }
 
-/// T-10: 10 downloads, budget 16, per-host 4 (each on its own server).
-#[tokio::test(flavor = "multi_thread")]
-async fn ten_downloads_share_a_budget_of_sixteen_oldest_first() {
-    let servers: Vec<TestServer> = (0..10).map(|_| TestServer::start().unwrap()).collect();
+const T10: BudgetConfig = BudgetConfig {
+    global: 16,
+    per_host: 4,
+    min_for_new: 1,
+};
+
+/// 3 MB at 500 kB/s per connection, each on its own server.
+fn ten_jobs(servers: &[TestServer]) -> Vec<Job> {
     let size = 3_000_000;
-    let jobs = servers
+    servers
         .iter()
         .enumerate()
         .map(|(i, s)| Job {
@@ -159,14 +170,51 @@ async fn ten_downloads_share_a_budget_of_sixteen_oldest_first() {
             seed: i as u64,
             size,
         })
-        .collect();
-    let budget = BudgetConfig {
-        global: 16,
-        per_host: 4,
-        min_for_new: 1,
-    };
-    let t = run_all(jobs, budget, Duration::from_millis(60)).await;
+        .collect()
+}
 
+/// T-10: 10 downloads, budget 16, per-host 4 (each on its own server),
+/// started together. Their first connections leave 6 slots, exactly what
+/// the two oldest claim (§10.3): those two ramp to 4 while the younger 8
+/// stay at one connection, until one of the two gives a connection back.
+/// This follows from the rule, not from who happens to ask first.
+#[tokio::test(flavor = "multi_thread")]
+async fn ten_downloads_share_a_budget_of_sixteen_oldest_first() {
+    let servers: Vec<TestServer> = (0..10).map(|_| TestServer::start().unwrap()).collect();
+    // A window well beyond start-up: all ten hold a connection before any
+    // of them ramps.
+    let t = run_all(ten_jobs(&servers), T10, Duration::ZERO, ms(200)).await;
+    assert_caps(&t);
+
+    let mut now = [0; 10];
+    for &(_, who, n) in &t.changes {
+        if who < 2 && n < now[who] {
+            break;
+        }
+        if n > 1 {
+            assert!(
+                now.iter().all(|&c| c > 0),
+                "download {who} ramped before all ten had started: {now:?}"
+            );
+        }
+        now[who] = n;
+        assert!(who < 2 || n <= 1, "download {who} grew into a claimed slot");
+    }
+    assert_eq!(now[..2], [4, 4], "the two oldest ramp first");
+}
+
+/// §10.3 newcomers: arriving one by one while the budget is spent, each
+/// still gets a connection, from the youngest download with spares.
+#[tokio::test(flavor = "multi_thread")]
+async fn newcomers_get_a_slot_when_the_budget_is_spent() {
+    let servers: Vec<TestServer> = (0..10).map(|_| TestServer::start().unwrap()).collect();
+    let t = run_all(ten_jobs(&servers), T10, ms(60), ms(100)).await;
+    assert_caps(&t);
+    assert!(t.waited.iter().any(|&w| w), "the budget was never spent");
+    assert_eq!(t.max_holding, 10, "newcomers starved");
+}
+
+fn assert_caps(t: &Timeline) {
     assert!(t.max_total <= 16, "budget exceeded: {}", t.max_total);
     for who in 0..10 {
         assert!(
@@ -175,20 +223,6 @@ async fn ten_downloads_share_a_budget_of_sixteen_oldest_first() {
             t.peak(who)
         );
     }
-    // Oldest first: the oldest is the first to reach 4.
-    let oldest = t.first_reach(0, 4).expect("oldest reached 4");
-    for who in 1..10 {
-        if let Some(when) = t.first_reach(who, 4) {
-            assert!(oldest <= when, "download {who} reached 4 before the oldest");
-        }
-    }
-    // Newcomers got a connection even with the budget spent: more than
-    // 16 / 4 downloads held connections at once.
-    assert!(
-        t.max_holding > 4,
-        "newcomers starved: at most {} at once",
-        t.max_holding
-    );
 }
 
 /// §10.2: the per-host cap holds across downloads to one server, and a
@@ -209,7 +243,7 @@ async fn per_host_cap_is_shared_by_downloads_to_one_server() {
         per_host: 4,
         min_for_new: 1,
     };
-    let t = run_all(jobs, budget, Duration::from_millis(400)).await;
+    let t = run_all(jobs, budget, ms(400), ms(100)).await;
     assert!(t.max_total <= 4, "per-host cap exceeded: {}", t.max_total);
     assert_eq!(t.max_holding, 3, "all three ran at once");
 }
@@ -231,7 +265,7 @@ async fn a_full_host_makes_newcomers_wait() {
         per_host: 1,
         min_for_new: 1,
     };
-    let t = run_all(jobs, budget, Duration::from_millis(50)).await;
+    let t = run_all(jobs, budget, ms(50), ms(100)).await;
     assert_eq!(t.max_total, 1, "never two connections to the host");
     assert_eq!(t.waited, [false, true]);
 }
