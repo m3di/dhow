@@ -197,6 +197,8 @@ Optional per platform via `PlatformAdapter::file_token_*`.
 
 On `get_download` / `list_downloads`, if `final_path` no longer exists and a token is present, the core asks the adapter to resolve it; on success it updates `final_path` and emits `Renamed`. Resolution happens lazily on query, never on a timer.
 
+The token is created at completion (ENGINE-SPEC §8 step 8, also when completion is finished after a crash) and stored in `downloads.file_token`; an adapter without tokens (`Unsupported`, `Ok(None)`) stores none, and a failure is logged and stores none. Only `Completed` downloads are resolved. Queries are synchronous, so the adapter runs on the caller's thread, with no engine lock held; the core's `get`, `list` and `storage_breakdown` take the same `on_event` callback as commands (until the event channel exists) for the `Renamed` and `GroupChanged` they may cause. A resolved path that exists and differs is the new `final_path` (another directory is fine); the category is derived again if the name changed (§13.1) and the download is regrouped (§13.2). `Ok(None)` (deleted), a path that doesn't exist, or `Failed` (logged at warn) leave the download as it is, its file missing. The update is conditional on the old `final_path`, so two concurrent queries emit `Renamed` once.
+
 ## 7. Concurrency & idle model
 
 - One `tokio` multi-thread runtime per `Dhow` instance, worker threads = min(4, cores). Threads park when idle; parked threads cost nothing measurable.

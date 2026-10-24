@@ -29,10 +29,14 @@ impl Fx {
     }
 
     fn with(config: DownloadConfig) -> Self {
+        Self::with_adapter(config, Arc::new(NoopAdapter))
+    }
+
+    fn with_adapter(config: DownloadConfig, platform: Arc<dyn PlatformAdapter>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let downloads = dir.path().join("dl");
         std::fs::create_dir(&downloads).unwrap();
-        let engine = Engine::open(&dir.path().join("data"), config).unwrap();
+        let engine = Engine::open_with(&dir.path().join("data"), config, platform).unwrap();
         Self {
             _dir: dir,
             downloads,
@@ -151,7 +155,7 @@ async fn queued_downloads_reserve_their_names() {
         .unwrap();
     assert_eq!(first.final_path, fx.downloads.join("same.bin"));
     assert_eq!(second.final_path, fx.downloads.join("same (2).bin"));
-    assert_eq!(fx.engine.list().unwrap().len(), 2);
+    assert_eq!(fx.engine.list(&|_| {}).unwrap().len(), 2);
 }
 
 /// T-I10: fails at Add, before anything is written.
@@ -207,7 +211,7 @@ async fn failures_are_recorded_with_a_reason() {
         (State::Failed, Some(FailReason::Http(403)))
     );
     assert_eq!(
-        fx.engine.get(&added.id).unwrap().fail_reason,
+        fx.engine.get(&added.id, &|_| {}).unwrap().fail_reason,
         Some(FailReason::Http(403))
     );
 }
@@ -411,7 +415,7 @@ mod queue_tests {
 
     fn order(fx: &Fx, queue: &str) -> Vec<String> {
         fx.engine
-            .list()
+            .list(&|_| {})
             .unwrap()
             .into_iter()
             .filter(|s| s.queue_id == queue)
@@ -910,7 +914,7 @@ mod limit_tests {
                 .iter()
                 .any(|e| matches!(e, EngineEvent::Progress { downloaded, .. } if *downloaded > 64 * 1024));
             assert!(!p, "paused by limit");
-            assert_eq!(fx.engine.get(&id).unwrap().state, State::Active);
+            assert_eq!(fx.engine.get(&id, &|_| {}).unwrap().state, State::Active);
             fx.engine.set_speed_limit(&id, None).unwrap();
             Instant::now()
         };
@@ -1064,7 +1068,10 @@ mod category_tests {
         let mkv = add("/blob/10".into(), Some("b.mkv"));
         assert_eq!(mkv.await.unwrap().category, Category::Data, "extras win");
         // Already-added downloads keep theirs.
-        assert_eq!(fx.engine.list().unwrap()[0].category, Category::Video);
+        assert_eq!(
+            fx.engine.list(&|_| {}).unwrap()[0].category,
+            Category::Video
+        );
 
         // Moving an extension takes it out of its old category.
         let extra = fx
@@ -1149,7 +1156,7 @@ mod category_tests {
         std::fs::remove_file(fx.downloads.join("d.zip")).unwrap();
 
         assert_eq!(
-            fx.engine.storage_breakdown().unwrap(),
+            fx.engine.storage_breakdown(&|_| {}).unwrap(),
             [
                 CategoryUsage {
                     category: Category::Video,
@@ -1192,7 +1199,7 @@ mod group_tests {
         }
 
         fn group_of(&self, id: &str) -> Option<GroupSnapshot> {
-            let g = self.engine.get(id).unwrap().group?;
+            let g = self.engine.get(id, &|_| {}).unwrap().group?;
             Some(self.engine.group(&g).unwrap())
         }
     }
@@ -1309,7 +1316,7 @@ mod group_tests {
             [(a1.id.clone(), None), (a2.id.clone(), None)]
         );
         assert!(fx.engine.list_groups().unwrap().is_empty());
-        assert_eq!(fx.engine.get(&a2.id).unwrap().group, None);
+        assert_eq!(fx.engine.get(&a2.id, &|_| {}).unwrap().group, None);
         assert!(matches!(fx.engine.group(&g), Err(EngineError::NotFound(_))));
         // a1 was placed by hand; a2 wasn't.
         let a3 = fx.add_named(&server, "Show.S01E03.mkv").await;
@@ -1317,7 +1324,7 @@ mod group_tests {
             fx.group_of(&a3.id).unwrap().members,
             [a2.id.clone(), a3.id.clone()]
         );
-        assert_eq!(fx.engine.get(&a1.id).unwrap().group, None);
+        assert_eq!(fx.engine.get(&a1.id, &|_| {}).unwrap().group, None);
     }
 
     /// The `Renamed` path (M3.5): a member whose key no longer matches
@@ -1359,7 +1366,7 @@ mod group_tests {
             .conn()
             .execute("UPDATE downloads SET group_pinned = 0", [])
             .unwrap();
-        assert_eq!(fx.engine.get(&a2.id).unwrap().group, None);
+        assert_eq!(fx.engine.get(&a2.id, &|_| {}).unwrap().group, None);
 
         let other = rusqlite::Connection::open(fx._dir.path().join("data/dhow.sqlite")).unwrap();
         other.execute_batch("BEGIN IMMEDIATE").unwrap();
@@ -1437,5 +1444,246 @@ mod group_tests {
             )
             .unwrap();
         assert_eq!(fx.engine.group(&g).unwrap().speed_bps, 0);
+    }
+}
+
+mod token_tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::engine::categories::CategoryUsage;
+    use crate::platform::FileToken;
+
+    /// Tokens are indexes into `files`, which the test keeps up to date as
+    /// it moves them, as the OS would.
+    #[derive(Default)]
+    struct Tracker {
+        files: StdMutex<Vec<PathBuf>>,
+        resolves: AtomicUsize,
+        fail: AtomicBool,
+    }
+
+    impl PlatformAdapter for Tracker {
+        fn file_token_create(&self, path: &Path) -> Result<Option<FileToken>, AdapterError> {
+            let mut files = self.files.lock().unwrap();
+            files.push(path.to_owned());
+            Ok(Some(FileToken(
+                (files.len() as u32 - 1).to_le_bytes().into(),
+            )))
+        }
+
+        fn file_token_resolve(&self, token: &FileToken) -> Result<Option<PathBuf>, AdapterError> {
+            self.resolves.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(AdapterError::Failed("boom".into()));
+            }
+            let at = u32::from_le_bytes(token.0[..].try_into().unwrap()) as usize;
+            let path = self.files.lock().unwrap()[at].clone();
+            Ok(path.is_file().then_some(path))
+        }
+    }
+
+    impl Tracker {
+        fn move_file(&self, from: &Path, to: &Path) {
+            std::fs::rename(from, to).unwrap();
+            for f in self.files.lock().unwrap().iter_mut() {
+                if f == from {
+                    *f = to.to_owned();
+                }
+            }
+        }
+
+        fn resolves(&self) -> usize {
+            self.resolves.load(Ordering::SeqCst)
+        }
+    }
+
+    fn tracked() -> (Fx, Arc<Tracker>) {
+        let tracker = Arc::new(Tracker::default());
+        (Fx::with_adapter(fast(), tracker.clone()), tracker)
+    }
+
+    impl Fx {
+        async fn completed(&self, server: &TestServer, name: &str) -> Snapshot {
+            let mut req = self.request(server, "/blob/1000");
+            req.filename = Some(name.into());
+            let added = self.engine.add(req, &|_| {}).await.unwrap();
+            let done = self.run(&added.id).await;
+            assert_eq!(done.state, State::Completed);
+            self.events.lock().unwrap().clear();
+            done
+        }
+
+        fn token(&self, id: &str) -> Option<Vec<u8>> {
+            self.engine
+                .db()
+                .conn()
+                .query_row(
+                    "SELECT file_token FROM downloads WHERE id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        }
+
+        fn sink(&self) -> impl Fn(EngineEvent) + Send + Sync + use<> {
+            let sink = self.events.clone();
+            move |e: EngineEvent| sink.lock().unwrap().push(e)
+        }
+
+        fn taken(&self) -> Vec<EngineEvent> {
+            std::mem::take(&mut *self.events.lock().unwrap())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_moved_file_is_found_on_query_once() {
+        let server = TestServer::start().unwrap();
+        let (fx, tracker) = tracked();
+        let done = fx.completed(&server, "x.mkv").await;
+        assert_eq!(done.category, Category::Video);
+        assert!(fx.token(&done.id).is_some(), "§8 step 8");
+        assert_eq!(
+            *tracker.files.lock().unwrap(),
+            std::slice::from_ref(&done.final_path)
+        );
+        // Unfinished downloads have no final file to look for.
+        let mut req = fx.request(&server, "/blob/1000");
+        req.paused = true;
+        fx.engine.add(req, &|_| {}).await.unwrap();
+
+        let on_event = fx.sink();
+        assert_eq!(fx.engine.get(&done.id, &on_event).unwrap(), done);
+        assert_eq!(fx.engine.list(&on_event).unwrap().len(), 2);
+        assert_eq!(tracker.resolves(), 0, "the file is where it was");
+
+        let elsewhere = fx.downloads.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let moved = elsewhere.join("x.zip");
+        tracker.move_file(&done.final_path, &moved);
+        let snap = fx.engine.get(&done.id, &on_event).unwrap();
+        assert_eq!(snap.final_path, moved);
+        assert_eq!(snap.category, Category::Archive, "§13.1: from the new name");
+        assert_eq!(snap.downloaded, 1000);
+        assert_eq!(
+            fx.taken(),
+            [EngineEvent::Renamed {
+                id: done.id.clone(),
+                path: moved.clone(),
+            }]
+        );
+        let listed = fx.engine.list(&on_event).unwrap();
+        assert_eq!(listed[0], snap);
+        assert!(fx.taken().is_empty(), "found once");
+        assert_eq!(tracker.resolves(), 1);
+    }
+
+    /// §13.2 step 8: a part renamed out of its group's key leaves, and the
+    /// group dissolves.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_moved_part_leaves_its_group() {
+        let server = TestServer::start().unwrap();
+        let (fx, tracker) = tracked();
+        let a1 = fx.completed(&server, "Movie.Part1.rar").await;
+        let a2 = fx.completed(&server, "Movie.Part2.rar").await;
+        assert!(fx.engine.get(&a2.id, &|_| {}).unwrap().group.is_some());
+
+        let trailer = fx.downloads.join("Trailer.rar");
+        tracker.move_file(&a2.final_path, &trailer);
+        let on_event = fx.sink();
+        let listed = fx.engine.list(&on_event).unwrap();
+        assert_eq!(listed[1].final_path, trailer);
+        assert_eq!(listed[1].category, Category::Archive);
+        assert!(listed.iter().all(|s| s.group.is_none()));
+        assert_eq!(
+            fx.taken(),
+            [
+                EngineEvent::Renamed {
+                    id: a2.id.clone(),
+                    path: trailer,
+                },
+                EngineEvent::GroupChanged {
+                    id: a2.id.clone(),
+                    group: None,
+                },
+                EngineEvent::GroupChanged {
+                    id: a1.id.clone(),
+                    group: None,
+                },
+            ]
+        );
+        assert!(fx.engine.list_groups().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn storage_breakdown_follows_moved_files() {
+        let server = TestServer::start().unwrap();
+        let (fx, tracker) = tracked();
+        let a = fx.completed(&server, "a.mp4").await;
+        let b = fx.completed(&server, "b.mp4").await;
+        let c = fx.completed(&server, "c.mp4").await;
+        tracker.move_file(&a.final_path, &fx.downloads.join("a2.mp4"));
+        // Deleted: the token resolves to nothing.
+        std::fs::remove_file(&b.final_path).unwrap();
+        // The adapter fails: missing too.
+        tracker.move_file(&c.final_path, &fx.downloads.join("c2.mp4"));
+        let on_event = fx.sink();
+        let failing = |fail| tracker.fail.store(fail, Ordering::SeqCst);
+        failing(true);
+        let snap = fx.engine.get(&c.id, &on_event).unwrap();
+        assert_eq!(snap.final_path, c.final_path);
+        assert!(fx.taken().is_empty());
+        failing(false);
+
+        let usage = |fx: &Fx| fx.engine.storage_breakdown(&on_event).unwrap();
+        assert_eq!(
+            usage(&fx),
+            [CategoryUsage {
+                category: Category::Video,
+                bytes: 2000,
+                files: 2,
+                missing: vec![b.id.clone()],
+            }]
+        );
+        assert_eq!(fx.taken().len(), 2, "a and c renamed");
+        assert_eq!(
+            fx.engine.get(&b.id, &|_| {}).unwrap().final_path,
+            b.final_path
+        );
+    }
+
+    /// §8: the token is also created when completion is finished after a
+    /// crash.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recovered_completion_gets_a_token() {
+        let server = TestServer::start().unwrap();
+        let (fx, tracker) = tracked();
+        let added = fx
+            .engine
+            .add(fx.request(&server, "/blob/10"), &|_| {})
+            .await
+            .unwrap();
+        std::fs::write(&added.final_path, blob::bytes(0, 0..10)).unwrap();
+        std::fs::write(added.sidecar_path(), b"stale").unwrap();
+        fx.engine
+            .transition(&added.id, State::Completing, None, &|_| {})
+            .unwrap();
+        assert_eq!(fx.run(&added.id).await.state, State::Completed);
+        assert!(fx.token(&added.id).is_some());
+        assert_eq!(*tracker.files.lock().unwrap(), [added.final_path]);
+    }
+
+    /// Linux and Android: no tokens, and a moved file is just missing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_tokens_a_moved_file_is_missing() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let done = fx.completed(&server, "x.mkv").await;
+        assert_eq!(fx.token(&done.id), None);
+        std::fs::rename(&done.final_path, fx.downloads.join("y.mkv")).unwrap();
+        let on_event = fx.sink();
+        let snap = fx.engine.get(&done.id, &on_event).unwrap();
+        assert_eq!(snap.final_path, done.final_path);
+        assert!(fx.taken().is_empty());
     }
 }

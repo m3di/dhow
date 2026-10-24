@@ -15,6 +15,7 @@ pub mod queues;
 pub mod speed;
 #[cfg(test)]
 mod tests;
+mod tokens;
 
 use std::fmt;
 use std::io;
@@ -453,7 +454,7 @@ impl Engine {
         if let Err(e) = grouped {
             tracing::warn!(id, error = %e, "could not group download");
         }
-        self.get(&id)
+        self.stored(&id)
     }
 
     /// Final names of unfinished downloads in `dir`: their files don't
@@ -473,23 +474,47 @@ impl Engine {
         Ok(names)
     }
 
-    pub fn get(&self, id: &str) -> Result<Snapshot, EngineError> {
-        let db = self.db();
-        let snap = db
-            .conn()
-            .query_row(&format!("{SELECT} WHERE id = ?1"), [id], snapshot)
-            .optional()?;
-        snap.ok_or_else(|| EngineError::NotFound(id.to_owned()))
+    /// A completed download whose file moved is found again through its
+    /// token first (ARCHITECTURE §6): `Renamed`, then any `GroupChanged`.
+    pub fn get(
+        &self,
+        id: &str,
+        on_event: &(dyn Fn(EngineEvent) + Send + Sync),
+    ) -> Result<Snapshot, EngineError> {
+        self.located(self.stored(id)?, on_event)
     }
 
-    /// Oldest first.
-    pub fn list(&self) -> Result<Vec<Snapshot>, EngineError> {
+    /// Oldest first; moved files are found as in [`Engine::get`].
+    pub fn list(
+        &self,
+        on_event: &(dyn Fn(EngineEvent) + Send + Sync),
+    ) -> Result<Vec<Snapshot>, EngineError> {
+        let rows = self.rows()?;
+        let mut moved = false;
+        for snap in &rows {
+            moved |= self.located(snap.clone(), on_event)?.final_path != snap.final_path;
+        }
+        // Regrouping a moved one can change rows already read.
+        if moved { self.rows() } else { Ok(rows) }
+    }
+
+    fn rows(&self) -> Result<Vec<Snapshot>, EngineError> {
         let db = self.db();
         let mut stmt = db
             .conn()
             .prepare(&format!("{SELECT} ORDER BY position, created_at"))?;
         let rows = stmt.query_map([], snapshot)?.collect::<Result<_, _>>()?;
         Ok(rows)
+    }
+
+    /// The row as stored, without looking for a moved file.
+    fn stored(&self, id: &str) -> Result<Snapshot, EngineError> {
+        let db = self.db();
+        let snap = db
+            .conn()
+            .query_row(&format!("{SELECT} WHERE id = ?1"), [id], snapshot)
+            .optional()?;
+        snap.ok_or_else(|| EngineError::NotFound(id.to_owned()))
     }
 
     /// The download whose id is `prefix` or starts with it.
@@ -514,12 +539,12 @@ impl Engine {
         id: &str,
         on_event: &(dyn Fn(EngineEvent) + Send + Sync),
     ) -> Result<Snapshot, EngineError> {
-        let snap = self.get(id)?;
+        let snap = self.stored(id)?;
         if !snap.state.is_final() && snap.state != State::Paused && snap.state != State::Completing
         {
             self.transition(id, State::Paused, None, on_event)?;
         }
-        self.get(id)
+        self.stored(id)
     }
 
     /// Puts a download its runner stopped (schedule end, runner shutdown)
@@ -529,10 +554,10 @@ impl Engine {
         id: &str,
         on_event: &(dyn Fn(EngineEvent) + Send + Sync),
     ) -> Result<Snapshot, EngineError> {
-        if self.get(id)?.state == State::Paused {
+        if self.stored(id)?.state == State::Paused {
             self.transition(id, State::Queued, None, on_event)?;
         }
-        self.get(id)
+        self.stored(id)
     }
 
     /// Cancels a download that is not running; optionally deletes its
@@ -543,7 +568,7 @@ impl Engine {
         delete_partial: bool,
         on_event: &(dyn Fn(EngineEvent) + Send + Sync),
     ) -> Result<Snapshot, EngineError> {
-        let snap = self.get(id)?;
+        let snap = self.stored(id)?;
         if snap.state.is_final() {
             return Ok(snap);
         }
@@ -552,7 +577,7 @@ impl Engine {
             remove_if_exists(&snap.sidecar_path())?;
             remove_if_exists(&snap.part_path)?;
         }
-        self.get(id)
+        self.stored(id)
     }
 
     /// Runs a download in this task until it completes, fails, or `stop`
@@ -563,7 +588,7 @@ impl Engine {
         on_event: &(dyn Fn(EngineEvent) + Send + Sync),
         stop: &watch::Receiver<bool>,
     ) -> Result<Snapshot, EngineError> {
-        let snap = self.get(id)?;
+        let snap = self.stored(id)?;
         if snap.state.is_final() {
             return Ok(snap);
         }
@@ -572,12 +597,14 @@ impl Engine {
         // commit point; finish the bookkeeping.
         if snap.state == State::Completing && complete::recover(&part, &sidecar, &snap.final_path)?
         {
+            let token = tokens::create(self.platform.as_ref(), id, &snap.final_path);
+            self.store_token(id, token);
             self.transition(id, State::Completed, None, on_event)?;
             on_event(EngineEvent::Renamed {
                 id: id.to_owned(),
                 path: snap.final_path.clone(),
             });
-            return self.get(id);
+            return self.stored(id);
         }
         // Before it is Active: a failure here leaves it as it was.
         let url = Url::parse(&snap.url).map_err(io::Error::other)?;
@@ -624,12 +651,12 @@ impl Engine {
             Ok(done) => done,
             Err(DownloadError::Stopped) => {
                 self.transition(id, State::Paused, None, on_event)?;
-                return self.get(id);
+                return self.stored(id);
             }
             Err(e) => {
                 tracing::warn!(id, error = %e, "download failed");
                 self.transition(id, State::Failed, Some(fail_reason(&e)), on_event)?;
-                return self.get(id);
+                return self.stored(id);
             }
         };
         progress.lock().unwrap().flush(id, on_event);
@@ -668,6 +695,7 @@ impl Engine {
         let (directory, name) = split_final(&snap.final_path)?;
         let digest = done.info.digest.clone();
         let owned_id = id.to_owned();
+        let platform = self.platform.clone();
         let finalized = tokio::task::spawn_blocking(move || {
             let target = Target {
                 part: &part,
@@ -686,11 +714,16 @@ impl Engine {
                     .map_err(io::Error::other)?;
                 Ok(())
             })
+            .map(|path| {
+                let token = tokens::create(platform.as_ref(), &owned_id, &path);
+                (path, token)
+            })
         })
         .await
         .map_err(io::Error::other)?;
         match finalized {
-            Ok(path) => {
+            Ok((path, token)) => {
+                self.store_token(id, token);
                 self.transition(id, State::Completed, None, on_event)?;
                 on_event(EngineEvent::Renamed {
                     id: id.to_owned(),
@@ -711,7 +744,7 @@ impl Engine {
                 self.transition(id, State::Failed, Some(FailReason::Io), on_event)?;
             }
         }
-        self.get(id)
+        self.stored(id)
     }
 
     fn sample(

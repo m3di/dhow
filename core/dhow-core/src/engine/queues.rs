@@ -293,7 +293,7 @@ impl Engine {
 
     /// Moves a download to the end of another queue.
     pub fn move_to_queue(&self, id: &str, queue: &str) -> Result<Snapshot, EngineError> {
-        self.get(id)?;
+        self.stored(id)?;
         self.queue(queue)?;
         let db = self.db();
         let position: i64 = db.conn().query_row(
@@ -306,18 +306,18 @@ impl Engine {
             params![id, queue, position],
         )?;
         drop(db);
-        self.get(id)
+        self.stored(id)
     }
 
     /// Moves a download before `before` (same queue), or to the end of its
     /// queue. Positions are renumbered 0.. in queue order.
     pub fn reorder(&self, id: &str, before: Option<&str>) -> Result<Snapshot, EngineError> {
-        let me = self.get(id)?;
+        let me = self.stored(id)?;
         if let Some(b) = before {
             if b == id {
                 return Ok(me);
             }
-            if self.get(b)?.queue_id != me.queue_id {
+            if self.stored(b)?.queue_id != me.queue_id {
                 return Err(EngineError::InvalidQueue("can only reorder within a queue"));
             }
         }
@@ -339,7 +339,7 @@ impl Engine {
         }
         tx.commit()?;
         drop(db);
-        self.get(id)
+        self.stored(id)
     }
 
     /// `StartQueue` (§11): run now, overriding the schedule until its next
@@ -434,7 +434,7 @@ impl Engine {
         }
         let mut out = Vec::new();
         for id in running {
-            if stopping.contains(&self.get(id)?.queue_id) {
+            if stopping.contains(&self.stored(id)?.queue_id) {
                 out.push(id.to_owned());
             }
         }

@@ -370,7 +370,7 @@ async fn run(
             if let Some(pid) = lock::holder(&data_dir, &id)? {
                 lock::stop_runner(&data_dir, &id, pid)?;
             }
-            output::emit(output::snapshot("download", &engine.get(&id)?));
+            output::emit(output::snapshot("download", &engine.get(&id, &on_event)?));
             Ok(ExitCode::SUCCESS)
         }
         Command::Cancel { id, delete_partial } => {
@@ -395,7 +395,7 @@ async fn run(
             Ok(ExitCode::SUCCESS)
         }
         Command::Ls => {
-            for snap in engine.list()? {
+            for snap in engine.list(&on_event)? {
                 output::emit(output::snapshot("download", &snap));
             }
             Ok(ExitCode::SUCCESS)
@@ -539,7 +539,7 @@ async fn run(
             Ok(ExitCode::SUCCESS)
         }
         Command::Storage => {
-            for u in engine.storage_breakdown()? {
+            for u in engine.storage_breakdown(&on_event)? {
                 output::emit(output::storage(&u));
             }
             Ok(ExitCode::SUCCESS)
@@ -724,7 +724,10 @@ async fn runner(
         }
         // A pause or cancel another `dhow` recorded.
         for (id, (tx, _)) in &here {
-            if matches!(engine.get(id)?.state, State::Paused | State::Cancelled) {
+            if matches!(
+                engine.get(id, on_event)?.state,
+                State::Paused | State::Cancelled
+            ) {
                 let _ = tx.send(true);
             }
         }
