@@ -151,15 +151,15 @@ pub trait PlatformAdapter: Send + Sync {
 
 ### 5.1 SQLite (`dhow.sqlite` in the platform data dir)
 
-One database per user. WAL mode, `synchronous=NORMAL`, foreign keys on. Schema is versioned with embedded migrations.
+One database per user. WAL mode, `synchronous=NORMAL`, foreign keys on, `STRICT` tables. Schema version is `PRAGMA user_version`; embedded migrations in `dhow-core/src/storage/migrations/` are append-only, and each runs in one transaction with its version bump. A database newer than the running Dhow is refused, never downgraded.
 
-Tables (abridged, see `dhow-core/src/storage/schema.sql` for truth):
+Tables (abridged, the migrations are the truth):
 
-- `downloads` — id (UUIDv7), url, headers (json), final_path, part_path, state, fail_reason, queue_id, group_id, category, created_at, started_at, completed_at, total_size, etag, last_modified, resumable, connections, speed_limit, file_token (blob)
+- `downloads` — id (UUIDv7), url, headers (json), final_path, part_path, state, fail_reason, queue_id, position, group_id, category, created_at, started_at, completed_at, total_size, etag, last_modified, digest, resumable, size_unverified, identity_weak, connections, speed_limit, file_token (blob)
 - `ranges` — download_id, start, end, state (`pending|active|committed`) — **mirror** of the sidecar journal, for queries only; the sidecar is authoritative (§5.2)
-- `queues` — id, name, max_concurrent, schedule (json), speed_limit, is_default
+- `queues` — id, name, max_concurrent, schedule (json), speed_limit, on_complete, is_default. The default queue is created by migration 1 with a fixed id and a NULL name (the shell localizes it); a trigger prevents deleting it.
 - `groups` — id, name, auto (bool)
-- `speed_samples` — download_id, at, bytes_per_sec — ring-buffered, 10-minute retention at 1 s, hourly rollups beyond
+- `speed_samples` — download_id (NULL = global aggregate), period_secs, at, bytes_per_sec — ring-buffered, 10-minute retention at 1 s, hourly rollups beyond
 - `settings` — key, value (json)
 
 ### 5.2 Sidecar journal (`<name>.ext.dhow`)
