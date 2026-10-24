@@ -244,3 +244,32 @@ fn json_columns_reject_garbage_and_strict_rejects_wrong_types() {
     assert!(try_exec(conn, "UPDATE downloads SET headers = 'nope'").is_err());
     assert!(try_exec(conn, "UPDATE downloads SET total_size = 'big'").is_err());
 }
+
+#[test]
+fn v1_database_migrates_to_v2_keeping_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dhow.sqlite");
+    {
+        let mut conn = Connection::open(&path).unwrap();
+        configure(&conn).unwrap();
+        migrate(&mut conn, &MIGRATIONS[..1]).unwrap();
+        conn.execute("INSERT INTO queues (id, name) VALUES ('q', 'Night')", [])
+            .unwrap();
+    }
+    let db = Db::open(&path).unwrap();
+    assert_eq!(db.schema_version().unwrap(), 2);
+    let (state, until): (String, Option<i64>) = db
+        .conn()
+        .query_row(
+            "SELECT run_state, run_state_until FROM queues WHERE id = 'q'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((state.as_str(), until), ("auto", None));
+    assert!(
+        db.conn()
+            .execute("UPDATE queues SET run_state = 'paused'", [])
+            .is_err()
+    );
+}

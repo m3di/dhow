@@ -91,5 +91,9 @@ pub fn queue(q: &QueueSnapshot) -> Value {
         "speed_limit": q.speed_limit,
         "on_complete": q.on_complete.as_str(),
         "unfinished": q.unfinished,
+        "schedule": q.schedule,
+        "run_state": q.run_state.as_str(),
+        "run_state_until": q.run_state_until,
+        "active": q.active_at(&jiff::Zoned::now()),
     })
 }

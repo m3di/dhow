@@ -430,6 +430,19 @@ impl Engine {
         self.get(id)
     }
 
+    /// Puts a download its runner stopped (schedule end, runner shutdown)
+    /// back in its queue: `Paused` → `Queued`.
+    pub fn requeue(
+        &self,
+        id: &str,
+        on_event: &(dyn Fn(EngineEvent) + Send + Sync),
+    ) -> Result<Snapshot, EngineError> {
+        if self.get(id)?.state == State::Paused {
+            self.transition(id, State::Queued, None, on_event)?;
+        }
+        self.get(id)
+    }
+
     /// Cancels a download that is not running; optionally deletes its
     /// partial files (never the final file).
     pub fn cancel(
