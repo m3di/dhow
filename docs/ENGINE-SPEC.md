@@ -389,6 +389,12 @@ The group's display name is the normalized stem with original casing of the firs
 
 Per active download, once per second: `bytes_received_in_last_second` (counted at the socket read, before the limiter). Stored in the ring (`ARCHITECTURE §5.1`). `Progress.speed_bps` is a 5-sample EMA; ETA = `remaining / EMA`, reported as `None` when EMA < 1 KiB/s or fewer than 3 samples exist. A global aggregate sample (sum) is kept while any download is active.
 
+Precisely:
+- A download samples on a 1 s ticker that exists only while it runs (probing and `Waiting` included, which sample 0). A sample is the bytes received since the previous one (counted on arrival, before any limiter wait, §12) divided by the time since it, so a late tick doesn't inflate it. `at` is the start of the wall-clock second it was taken in (unix ms).
+- EMA: α = 2 / (5 + 1), starting at the first sample. ETA = `ceil(remaining / EMA)` seconds. `Progress` carries both, and is also emitted on every sample.
+- The global sample for a second is the sum of the samples downloads took in it.
+- Ring: a 1 s sample is kept until it is 10 minutes old **and** the hour it falls in has ended (so 10–70 minutes), then that hour's samples become one hourly row per download (and one global row) holding their mean: the average speed while it ran, not over the whole hour. Rollup runs when the engine opens and whenever a further hour becomes due while sampling; hourly rows are kept until the download is removed (global ones indefinitely, a few KB a year).
+
 ---
 
 ## 15. Conformance test matrix

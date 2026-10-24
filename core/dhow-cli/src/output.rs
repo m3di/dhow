@@ -4,6 +4,7 @@
 use dhow_core::download::ResetReason;
 use dhow_core::engine::limits::LimitSettings;
 use dhow_core::engine::queues::QueueSnapshot;
+use dhow_core::engine::speed::SpeedSample;
 use dhow_core::engine::{EngineEvent, Snapshot, WarningKind};
 use dhow_core::probe::Resumable;
 use serde_json::{Value, json};
@@ -28,9 +29,11 @@ pub fn event(e: &EngineEvent) -> Value {
             downloaded,
             total,
             connections,
+            speed_bps,
+            eta_secs,
         } => json!({
             "event": "progress", "id": id, "downloaded": downloaded, "total": total,
-            "connections": connections,
+            "connections": connections, "speed_bps": speed_bps, "eta_secs": eta_secs,
         }),
         EngineEvent::Reset { id, reason } => json!({
             "event": "reset", "id": id, "reason": match reason {
@@ -80,6 +83,13 @@ pub fn snapshot(event: &str, s: &Snapshot) -> Value {
         "queue": s.queue_id,
         "position": s.position,
         "speed_limit": s.speed_limit,
+    })
+}
+
+pub fn sample(id: Option<&str>, s: &SpeedSample) -> Value {
+    json!({
+        "event": "sample", "id": id, "at": s.at, "period_secs": s.period_secs,
+        "bytes_per_sec": s.bytes_per_sec,
     })
 }
 
