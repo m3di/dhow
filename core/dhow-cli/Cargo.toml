@@ -1,0 +1,15 @@
+[package]
+name = "dhow-cli"
+description = "Headless Dhow client; reference client for spec-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "dhow"
+path = "src/main.rs"
+
+[dependencies]
+dhow-core.workspace = true
+clap.workspace = true

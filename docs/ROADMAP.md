@@ -9,7 +9,7 @@ Milestones are sequential. A milestone is done when every item is merged with te
 - M0.3 `tracing` setup, structured logs to the platform log dir.
 - M0.4 SQLite schema v1 + migrations framework.
 
-Exit: `cargo test --workspace` green on Linux, macOS, Windows CI runners; `dhow-cli --version` runs.
+Exit: `cargo test --workspace` green on Linux, macOS, Windows CI runners; `dhow --version` runs (binary of the `dhow-cli` crate).
 
 ## M1 — Engine core (single download, bulletproof)
 

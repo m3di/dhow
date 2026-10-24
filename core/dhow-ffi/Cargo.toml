@@ -1,0 +1,10 @@
+[package]
+name = "dhow-ffi"
+description = "UniFFI (Swift, Kotlin) and C ABI (C#) bindings for dhow-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+dhow-core.workspace = true
