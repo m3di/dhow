@@ -94,6 +94,13 @@ pub fn base_name(
     unreachable!("\"download\" survives cleaning")
 }
 
+/// A user-supplied name made safe for `fs` (same rules as [`base_name`]),
+/// or `None` if nothing usable is left.
+pub fn sanitize(name: &str, fs: TargetFs) -> Option<String> {
+    let cleaned = clean(name, fs);
+    (!cleaned.is_empty()).then(|| fit(&unreserve(cleaned, fs), ""))
+}
+
 /// `name`, or `name (2)`, `name (3)`… before the extension: the first that
 /// matches no existing name, `.part` or `.dhow` (case-insensitively, as on
 /// macOS and Windows volumes).

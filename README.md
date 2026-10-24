@@ -44,6 +44,17 @@ All shells sit on `dhow-core`, a Rust library that owns downloading, queuing, sc
 
 Pre-alpha. The engine and CLI come first; see `docs/ROADMAP.md`.
 
+### Try the CLI
+
+```sh
+cd core && cargo build --release
+./target/release/dhow add https://example.com/file.zip -d ~/Downloads   # runs until done; Ctrl-C pauses
+./target/release/dhow ls                                                # one JSON object per download
+./target/release/dhow resume <id-or-prefix>
+```
+
+`add --queue` only records a download; `dhow watch` runs everything queued. Output is one JSON event per line.
+
 ## Contributing
 
 Start with `CLAUDE.md` (it is written for AI agents but is the fastest orientation for humans too), then `docs/ARCHITECTURE.md`. Engine work must satisfy `docs/ENGINE-SPEC.md` and the conformance tests in `spec-tests/`.

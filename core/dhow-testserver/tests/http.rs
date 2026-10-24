@@ -431,3 +431,18 @@ fn validators_knob() {
     );
     assert_eq!(r.status, 200);
 }
+
+#[test]
+fn throttle_slows_the_body() {
+    let server = TestServer::start().unwrap();
+    let started = std::time::Instant::now();
+    let r = get(&server, "/blob/200000?throttle=1000000&seed=2", "");
+    let elapsed = started.elapsed();
+    assert_eq!(r.body, blob::bytes(2, 0..200_000));
+    // 200 kB at 1 MB/s is ~200 ms.
+    assert!(
+        elapsed >= std::time::Duration::from_millis(150),
+        "{elapsed:?}"
+    );
+    assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+}

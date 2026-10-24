@@ -59,9 +59,22 @@ impl Db {
         user_version(&self.conn)
     }
 
-    #[cfg(test)]
     pub(crate) fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    /// The platform's conventional data directory for `dhow.sqlite`, or
+    /// `None` where the shell must supply one (iOS, Android).
+    pub fn default_dir() -> Option<PathBuf> {
+        if cfg!(target_os = "macos") {
+            dirs::home_dir().map(|d| d.join("Library/Application Support/Dhow"))
+        } else if cfg!(windows) {
+            dirs::data_local_dir().map(|d| d.join("Dhow"))
+        } else if cfg!(target_os = "linux") {
+            dirs::data_dir().map(|d| d.join("dhow"))
+        } else {
+            None
+        }
     }
 }
 
