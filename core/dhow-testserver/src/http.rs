@@ -8,8 +8,11 @@ pub const MAX_HEAD: usize = 16 * 1024;
 
 pub struct Request {
     pub method: String,
-    /// As received: path plus raw (still percent-encoded) query.
+    /// Path plus raw (still percent-encoded) query; an absolute-form
+    /// target (`http://host/path`, as sent to a proxy) loses its origin.
     pub target: String,
+    /// The request line's target exactly as received.
+    pub raw_target: String,
     pub path: String,
     /// Percent-decoded.
     pub query: Vec<(String, String)>,
@@ -39,6 +42,11 @@ pub fn parse_head(head: &[u8]) -> Option<Request> {
     if parts.next().is_some() {
         return None;
     }
+    let raw_target = target;
+    let target = match target.strip_prefix("http://") {
+        Some(rest) => rest.find('/').map_or("/", |i| &rest[i..]),
+        None => target,
+    };
     let headers: Vec<(String, String)> = lines
         .filter(|l| !l.is_empty())
         .map(|l| {
@@ -58,6 +66,7 @@ pub fn parse_head(head: &[u8]) -> Option<Request> {
     let mut req = Request {
         method: method.to_owned(),
         target: target.to_owned(),
+        raw_target: raw_target.to_owned(),
         path: path.to_owned(),
         query,
         keep_alive: version == "HTTP/1.1",
@@ -183,6 +192,19 @@ mod tests {
         let req = parse_head(b"GET /b?header=X-A%3A%201+2 HTTP/1.1\r\n\r\n").unwrap();
         assert_eq!(req.query, [("header".to_owned(), "X-A: 1 2".to_owned())]);
         assert_eq!(req.target, "/b?header=X-A%3A%201+2");
+        assert_eq!(req.raw_target, req.target);
+        let req = parse_head(b"GET http://o.test:8/blob/9?seed=1 HTTP/1.1\r\n\r\n").unwrap();
+        assert_eq!(
+            (req.target.as_str(), req.path.as_str()),
+            ("/blob/9?seed=1", "/blob/9")
+        );
+        assert_eq!(req.raw_target, "http://o.test:8/blob/9?seed=1");
+        assert_eq!(
+            parse_head(b"GET http://o.test HTTP/1.1\r\n\r\n")
+                .unwrap()
+                .path,
+            "/"
+        );
         assert!(parse_head(b"GET /b?x=%zz HTTP/1.1\r\n\r\n").is_none());
     }
 }

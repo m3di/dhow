@@ -103,8 +103,22 @@ impl Sandbox {
             .env("DHOW_DATA_DIR", self.data_dir())
             .env("DHOW_RETRY_BASE_MS", "1")
             // Commit often, so an interrupted run has something on disk.
-            .env("DHOW_COMMIT_INTERVAL_MS", "100")
-            .envs(self.env.iter().map(|(k, v)| (k, v)))
+            .env("DHOW_COMMIT_INTERVAL_MS", "100");
+        // The default proxy mode is the system's: keep the host's out.
+        for var in [
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "XDG_CURRENT_DESKTOP",
+        ] {
+            cmd.env_remove(var);
+        }
+        cmd.envs(self.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

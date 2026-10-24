@@ -24,8 +24,8 @@ fn network_shows_the_environment_proxy() {
     assert_eq!(proxy["http"], "http://plain.test:8080/");
     assert_eq!(proxy["all"], serde_json::Value::Null);
     assert_eq!(proxy["no_proxy"], serde_json::json!(["localhost", ".lan"]));
-    // Until M3.4 the client uses no proxy.
-    assert_eq!(n["proxy_in_use"], "none");
+    // The default mode follows it.
+    assert_eq!(n["proxy_in_use"], "system");
     assert!(n["vpn_active"].is_boolean());
     let kinds = ["wifi", "ethernet", "cellular", "vpn", "unknown"];
     assert!(kinds.contains(&n["interface"].as_str().unwrap()), "{n}");

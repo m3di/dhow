@@ -157,7 +157,11 @@ impl Engine {
         }))
     }
 
-    fn put_setting(&self, key: &str, value: &impl serde::Serialize) -> Result<(), EngineError> {
+    pub(super) fn put_setting(
+        &self,
+        key: &str,
+        value: &impl serde::Serialize,
+    ) -> Result<(), EngineError> {
         let json = serde_json::to_string(value).expect("settings serialize");
         self.db().conn().execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2)

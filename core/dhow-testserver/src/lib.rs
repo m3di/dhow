@@ -32,6 +32,12 @@
 //! | `extra=<n>` | `n` garbage bytes after the body, counted in `Content-Length` (not `Content-Range`) |
 //! | `extra_mid=<n>` | the same, but only after ranges that end before the file does (several connections, T-I6) |
 //!
+//! A request in absolute form (`GET http://host:port/blob/…`, as a client
+//! sends it to a forward proxy) is served as if for its path, so a second
+//! server can stand in for a proxy: it answers for the origin, and its
+//! [`TestServer::requests`] show the absolute targets and any
+//! `Proxy-Authorization`.
+//!
 //! Unknown knobs are a 400, so a misspelled knob fails the test instead of
 //! silently testing the happy path.
 
@@ -57,6 +63,7 @@ const BODY_BUF: usize = 64 * 1024;
 #[derive(Clone, Debug)]
 pub struct Seen {
     pub method: String,
+    /// As in the request line (absolute form through a proxy).
     pub target: String,
     pub headers: Vec<(String, String)>,
 }
@@ -185,7 +192,7 @@ async fn connection(mut stream: TcpStream, log: Log, counts: Counts) -> io::Resu
         };
         log.lock().unwrap().push(Seen {
             method: req.method.clone(),
-            target: req.target.clone(),
+            target: req.raw_target.clone(),
             headers: req.headers.clone(),
         });
         // GET/HEAD only; a request body would desync the connection.
