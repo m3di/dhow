@@ -14,6 +14,14 @@
 //! | `ranges=bytes\|none\|hidden\|ignore` | advertise+honor (default) / `Accept-Ranges: none`, ignore / no header, honor / no header, ignore |
 //! | `redirect=<n>` | `302` to the same URL with `redirect=<n-1>`, until 0 |
 //! | `header=<Name: value>` | add (or replace) a response header on 200/206; repeatable |
+//! | `fail=<n>` | the first `n` `GET`s of this exact URL fail (counted per server) |
+//! | `fail_mode=reset\|<status>` | how they fail: close without a response (default), or a bare status |
+//! | `retry_after=<value>` | `Retry-After` on failure statuses |
+//! | `truncate=<n>` | every body is cut after `n` bytes by closing the connection |
+//! | `stall_after=<n>` | every body stops after `n` bytes; the connection stays open |
+//! | `extra_delay=<ms>` | flush and wait before sending the `extra` bytes, so they arrive in a separate read |
+//! | `ignore_range_after=<n>` | honor `Range` on the first `n` `GET`s of this URL, then ignore it |
+//! | `extra=<n>` | `n` garbage bytes after the body, counted in `Content-Length` (not `Content-Range`) |
 //!
 //! Unknown knobs are a 400, so a misspelled knob fails the test instead of
 //! silently testing the happy path.
@@ -21,6 +29,7 @@
 pub mod blob;
 mod http;
 
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -53,6 +62,8 @@ impl Seen {
 }
 
 type Log = Arc<Mutex<Vec<Seen>>>;
+/// `GET`s seen per exact target, for `fail=`.
+type Counts = Arc<Mutex<HashMap<String, u32>>>;
 
 /// A server running on its own thread, bound to an ephemeral loopback port.
 /// Shuts down when dropped.
@@ -69,7 +80,7 @@ impl TestServer {
         listener.set_nonblocking(true)?;
         let addr = listener.local_addr()?;
         let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
+            .enable_all()
             .build()?;
         let log = Log::default();
         let (shutdown, stop) = oneshot::channel();
@@ -122,16 +133,17 @@ pub async fn serve(listener: TcpListener) -> io::Result<()> {
 }
 
 async fn serve_logged(listener: TcpListener, log: Log) -> io::Result<()> {
+    let counts = Counts::default();
     loop {
         let (stream, _) = listener.accept().await?;
-        let log = log.clone();
+        let (log, counts) = (log.clone(), counts.clone());
         tokio::spawn(async move {
-            let _ = connection(stream, log).await;
+            let _ = connection(stream, log, counts).await;
         });
     }
 }
 
-async fn connection(mut stream: TcpStream, log: Log) -> io::Result<()> {
+async fn connection(mut stream: TcpStream, log: Log, counts: Counts) -> io::Result<()> {
     stream.set_nodelay(true)?;
     let mut buf = Vec::new();
     loop {
@@ -165,10 +177,16 @@ async fn connection(mut stream: TcpStream, log: Log) -> io::Result<()> {
         {
             return simple(&mut stream, "400 Bad Request", false).await;
         }
-        if !respond(&mut stream, &req).await? {
+        if !respond(&mut stream, &req, &counts).await? {
             return Ok(());
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum FailMode {
+    Reset,
+    Status(u16),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -187,6 +205,14 @@ struct Knobs {
     ranges: Ranges,
     redirect: u32,
     headers: Vec<(String, String)>,
+    fail: u32,
+    fail_mode: FailMode,
+    retry_after: Option<String>,
+    truncate: Option<u64>,
+    stall_after: Option<u64>,
+    extra: u64,
+    ignore_range_after: Option<u32>,
+    extra_delay: Option<u64>,
 }
 
 fn knobs(query: &[(String, String)]) -> Option<Knobs> {
@@ -198,6 +224,14 @@ fn knobs(query: &[(String, String)]) -> Option<Knobs> {
         ranges: Ranges::Bytes,
         redirect: 0,
         headers: Vec::new(),
+        fail: 0,
+        fail_mode: FailMode::Reset,
+        retry_after: None,
+        truncate: None,
+        stall_after: None,
+        extra: 0,
+        ignore_range_after: None,
+        extra_delay: None,
     };
     for (name, value) in query {
         match (name.as_str(), value.as_str()) {
@@ -214,6 +248,17 @@ fn knobs(query: &[(String, String)]) -> Option<Knobs> {
                 let (n, v) = v.split_once(':')?;
                 k.headers.push((n.trim().to_owned(), v.trim().to_owned()));
             }
+            ("fail", v) => k.fail = v.parse().ok()?,
+            ("fail_mode", "reset") => k.fail_mode = FailMode::Reset,
+            ("fail_mode", v) => {
+                k.fail_mode = FailMode::Status(v.parse().ok().filter(|s| (100..600).contains(s))?)
+            }
+            ("retry_after", v) => k.retry_after = Some(v.to_owned()),
+            ("truncate", v) => k.truncate = Some(v.parse().ok()?),
+            ("stall_after", v) => k.stall_after = Some(v.parse().ok()?),
+            ("extra", v) => k.extra = v.parse().ok()?,
+            ("ignore_range_after", v) => k.ignore_range_after = Some(v.parse().ok()?),
+            ("extra_delay", v) => k.extra_delay = Some(v.parse().ok()?),
             _ => return None,
         }
     }
@@ -221,7 +266,7 @@ fn knobs(query: &[(String, String)]) -> Option<Knobs> {
 }
 
 /// Writes one response. Returns whether the connection may serve another.
-async fn respond(stream: &mut TcpStream, req: &Request) -> io::Result<bool> {
+async fn respond(stream: &mut TcpStream, req: &Request, counts: &Counts) -> io::Result<bool> {
     let keep = req.keep_alive;
     let is_head = req.method == "HEAD";
     if req.method != "GET" && !is_head {
@@ -250,9 +295,40 @@ async fn respond(stream: &mut TcpStream, req: &Request) -> io::Result<bool> {
         simple(stream, &format!("{status} Knob"), keep).await?;
         return Ok(keep);
     }
+    if !is_head && k.fail > 0 {
+        let seen = {
+            let mut counts = counts.lock().unwrap();
+            let n = counts.entry(req.target.clone()).or_default();
+            *n += 1;
+            *n
+        };
+        if seen <= k.fail {
+            return match k.fail_mode {
+                FailMode::Reset => Ok(false),
+                FailMode::Status(code) => {
+                    let mut headers = vec![("Content-Length", "0".to_owned())];
+                    headers.extend(k.retry_after.clone().map(|v| ("Retry-After", v)));
+                    write_head(stream, &format!("{code} Knob"), &headers, keep).await?;
+                    Ok(keep)
+                }
+            };
+        }
+    }
 
     let etag = format!("\"{:x}-{size:x}\"", k.seed);
-    let honor_range = matches!(k.ranges, Ranges::Bytes | Ranges::Hidden)
+    let range_allowed = match k.ignore_range_after {
+        Some(n) if !is_head => {
+            let mut counts = counts.lock().unwrap();
+            let seen = counts
+                .entry(format!("ignore_range_after:{}", req.target))
+                .or_default();
+            *seen += 1;
+            *seen <= n
+        }
+        _ => true,
+    };
+    let honor_range = range_allowed
+        && matches!(k.ranges, Ranges::Bytes | Ranges::Hidden)
         && req
             .header("if-range")
             .is_none_or(|v| v == etag || v == LAST_MODIFIED);
@@ -296,10 +372,15 @@ async fn respond(stream: &mut TcpStream, req: &Request) -> io::Result<bool> {
     };
     // Without a length, a GET body is delimited by closing the connection.
     let keep = keep && (with_length || is_head);
+    let extra = if is_head || status.starts_with("416") {
+        0
+    } else {
+        k.extra
+    };
     if with_length {
         headers.push((
             "Content-Length".to_owned(),
-            (body.end - body.start).to_string(),
+            (body.end - body.start + extra).to_string(),
         ));
     }
     let headers: Vec<(&str, String)> = headers
@@ -311,13 +392,29 @@ async fn respond(stream: &mut TcpStream, req: &Request) -> io::Result<bool> {
         return Ok(keep);
     }
 
+    let cut = [k.truncate, k.stall_after].into_iter().flatten().min();
+    let stop = cut.map_or(body.end, |n| body.end.min(body.start + n));
     let mut buf = vec![0; BODY_BUF];
     let mut pos = body.start;
-    while pos < body.end {
-        let n = (body.end - pos).min(BODY_BUF as u64) as usize;
+    while pos < stop {
+        let n = (stop - pos).min(BODY_BUF as u64) as usize;
         blob::fill(k.seed, pos, &mut buf[..n]);
         stream.write_all(&buf[..n]).await?;
         pos += n as u64;
+    }
+    if stop < body.end {
+        stream.flush().await?;
+        if k.stall_after.is_some_and(|n| body.start + n == stop) {
+            std::future::pending::<()>().await;
+        }
+        return Ok(false);
+    }
+    if extra > 0 {
+        if let Some(ms) = k.extra_delay {
+            stream.flush().await?;
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
+        stream.write_all(&vec![0xEE; extra as usize]).await?;
     }
     Ok(keep)
 }

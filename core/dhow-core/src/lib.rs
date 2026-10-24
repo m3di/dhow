@@ -7,6 +7,7 @@ pub mod naming;
 pub mod probe;
 pub mod rangeset;
 pub mod storage;
+pub mod transfer;
 pub mod writer;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

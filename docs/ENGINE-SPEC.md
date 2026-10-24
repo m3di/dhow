@@ -209,10 +209,19 @@ Part files are preallocated to `total_size` with `fallocate`/`F_PREALLOCATE`/`Se
 
 ```
 loop:
-  req = GET effective_url, Range: bytes={req_start}-{end-1}, If-Range: <identity>, user headers
+  req = GET original_url, Range: bytes={pos}-{end-1}, If-Range: <identity>, user headers
+                                         // redirects are re-followed on every request: signed
+                                         // redirect targets expire mid-download
   resp = send(req)                       // timeout: connect 15s, first byte 30s, idle 30s
   validate(resp):                        // I4
-    status == 206 && Content-Range matches {req_start}-{end-1}/{total}
+    206: Content-Range is {pos}-{last}/{total} with last <= end-1
+         (a server may cap a range: a shorter prefix is accepted and the rest re-requested)
+    200 at pos 0 (chunk starts at 0): the whole file. If the response's ETag/Last-Modified
+         still match If-Range, the server just ignores ranges: continue, download becomes
+         non-resumable (§2.3 downgrade). If they don't, the file changed: identity reset.
+    200 past pos 0: identity reset (or §9 Protocol downgrade with several connections)
+    a 200 whose Content-Length is below total_size, a Content-Range total that differs,
+    or 416: identity reset
   if overlap_pending: compare first bytes (I5)
   stream body:
     for each buffer (64 KiB):
@@ -220,9 +229,13 @@ loop:
       writer.send(pos, bytes)             // I9
       pos += len
       limiter.consume(len)                // §12
-      if pos == end: break
+      if pos == end and end < total_size: break
+      // a chunk ending the file reads on to EOF, so bytes past total_size are seen (I6)
   on EOF before end: reconnect with backoff (§9), same chunk, from pos
+  on EOF exactly where a capped 206 said it would end: reconnect at once, not a failure
 ```
+
+Blind mode (`total_size = None`) and non-resumable downloads send no `Range`. Losing the connection after bytes arrived cannot be resumed there: the download restarts from zero (I4 reset procedure).
 
 The `Writer` batches: it issues `pwrite` immediately, but `fdatasync` + `range_commit` (then a journal sync) at most every `settings.commit_interval` (default 2 s) after the oldest uncommitted write **or** once any chunk has 8 MiB uncommitted, whichever first, and always on pause/cancel/shutdown. Uncommitted window on crash is therefore bounded by ~2 s of throughput. With nothing uncommitted the writer has no deadline.
 
@@ -248,9 +261,9 @@ Steps 5–7 are the only non-idempotent moment. If the process dies between 5 an
 
 | Class | Examples | Behaviour |
 |---|---|---|
-| Transient | connection reset, timeout, 5xx, 429, DNS failure | Retry the *connection* with exponential backoff 1s·2ⁿ, jitter ±25%, cap 60s, up to `settings.max_retries` (default 10) consecutive failures per connection. Download stays `Active` (shows "reconnecting"). After the cap: `Failed(Transient)`; `Retry` command restarts from the journal. |
-| Identity | 200 to a Range, size mismatch, overlap mismatch | Reset per I4. Not a retry; a restart. |
-| Permanent | 401/403/404/410, TLS failure, `NoSpace`, `DigestMismatch` | `Failed(...)` immediately. Journal kept; `Retry` re-probes first (links may be refreshed). |
+| Transient | connection reset, timeout, 408, 429, 5xx, DNS failure, body cut short | Retry the *connection* with exponential backoff 1s·2ⁿ⁻¹ after the n-th failure, jitter ±25%, cap 60s. `settings.max_retries` (default 10) is the number of consecutive failed *attempts* per connection that gives up (the 10th failure fails, T-9a); an attempt that wrote at least one byte resets the count, so a server that keeps cutting responses short still finishes (T-I7). Download stays `Active` (shows "reconnecting"). After the cap: `Failed(Transient)`; `Retry` command restarts from the journal. |
+| Identity | 200 to a Range (see §7), size mismatch, `Content-Range` not what was asked, 416, overlap mismatch | Reset per I4. Not a retry; a restart. |
+| Permanent | any other 4xx (401/403/404/410 …), TLS failure, too many redirects, `NoSpace`, `DigestMismatch`, `ServerSentExtraData` | `Failed(...)` immediately. Journal kept; `Retry` re-probes first (links may be refreshed). |
 | Protocol | server ignores `Range` on a *non-first* request after having honored it | Downgrade download to single connection, keep committed bytes, continue. Warn. |
 
 `429` and `503` honor `Retry-After` if present (cap 5 min).

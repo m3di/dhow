@@ -254,3 +254,114 @@ fn requests_are_logged_in_order() {
     assert_eq!(seen[1].target, "/blob/2?seed=1");
     assert_eq!(seen[1].header("x-probe"), Some("yes"));
 }
+
+#[test]
+fn fail_knob_fails_the_first_n_gets_then_serves() {
+    let server = TestServer::start().unwrap();
+    for _ in 0..2 {
+        let mut conn = TcpStream::connect(server.addr()).unwrap();
+        conn.write_all(b"GET /blob/10?fail=2 HTTP/1.1\r\nHost: t\r\n\r\n")
+            .unwrap();
+        let mut rest = Vec::new();
+        conn.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty(), "reset mode closes without a response");
+    }
+    assert_eq!(get(&server, "/blob/10?fail=2", "").status, 200);
+    // HEAD isn't counted; a different URL has its own count.
+    assert_eq!(head(&server, "/blob/10?fail=1").status, 200);
+    let mut conn = TcpStream::connect(server.addr()).unwrap();
+    conn.write_all(b"GET /blob/10?fail=1 HTTP/1.1\r\nHost: t\r\n\r\n")
+        .unwrap();
+    let mut rest = Vec::new();
+    conn.read_to_end(&mut rest).unwrap();
+    assert!(rest.is_empty());
+}
+
+#[test]
+fn fail_with_status_and_retry_after() {
+    let server = TestServer::start().unwrap();
+    let r = get(&server, "/blob/10?fail=1&fail_mode=503&retry_after=7", "");
+    assert_eq!((r.status, r.header("retry-after")), (503, Some("7")));
+    assert_eq!(
+        get(&server, "/blob/10?fail=1&fail_mode=503&retry_after=7", "").status,
+        200
+    );
+}
+
+/// Reads one response head, then whatever body arrives until close.
+fn raw_body(server: &TestServer, target: &str, extra_head: &str) -> (Response, Vec<u8>) {
+    let mut conn = TcpStream::connect(server.addr()).unwrap();
+    conn.write_all(
+        format!("GET {target} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n{extra_head}\r\n")
+            .as_bytes(),
+    )
+    .unwrap();
+    let mut raw = Vec::new();
+    conn.read_to_end(&mut raw).unwrap();
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let text = String::from_utf8(raw[..split].to_vec()).unwrap();
+    let headers = text
+        .split("\r\n")
+        .skip(1)
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let (k, v) = l.split_once(": ").unwrap();
+            (k.to_owned(), v.to_owned())
+        })
+        .collect();
+    let status = text[9..12].parse().unwrap();
+    (
+        Response {
+            status,
+            headers,
+            body: Vec::new(),
+        },
+        raw[split..].to_vec(),
+    )
+}
+
+#[test]
+fn truncate_cuts_every_body() {
+    let server = TestServer::start().unwrap();
+    let (r, body) = raw_body(&server, "/blob/1000?truncate=300", "");
+    assert_eq!(r.header("content-length"), Some("1000"));
+    assert_eq!(body, blob::bytes(0, 0..300));
+    let (r, body) = raw_body(&server, "/blob/1000?truncate=300", "Range: bytes=500-\r\n");
+    assert_eq!(r.status, 206);
+    assert_eq!(body, blob::bytes(0, 500..800));
+}
+
+#[test]
+fn extra_appends_garbage_counted_in_length_only() {
+    let server = TestServer::start().unwrap();
+    let (r, body) = raw_body(&server, "/blob/100?extra=20", "Range: bytes=10-19\r\n");
+    assert_eq!(r.header("content-range"), Some("bytes 10-19/100"));
+    assert_eq!(r.header("content-length"), Some("30"));
+    assert_eq!(&body[..10], &blob::bytes(0, 10..20)[..]);
+    assert_eq!(&body[10..], &[0xEE; 20][..]);
+}
+
+#[test]
+fn stall_after_stops_sending_but_keeps_the_connection() {
+    let server = TestServer::start().unwrap();
+    let mut conn = TcpStream::connect(server.addr()).unwrap();
+    conn.set_read_timeout(Some(std::time::Duration::from_millis(300)))
+        .unwrap();
+    conn.write_all(b"GET /blob/1000?stall_after=100 HTTP/1.1\r\nHost: t\r\n\r\n")
+        .unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0; 4096];
+    let err = loop {
+        match conn.read(&mut buf) {
+            Ok(0) => panic!("connection closed; should stall"),
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e) => break e,
+        }
+    };
+    assert!(matches!(
+        err.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
+    let split = got.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    assert_eq!(&got[split..], &blob::bytes(0, 0..100)[..]);
+}
