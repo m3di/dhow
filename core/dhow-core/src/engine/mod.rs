@@ -10,6 +10,7 @@
 pub mod categories;
 pub mod groups;
 pub mod limits;
+mod live;
 mod proxy;
 pub mod queues;
 pub mod settings;
@@ -33,11 +34,12 @@ use crate::download::hold::PartHold;
 use crate::download::{
     self, DownloadConfig, DownloadError, DownloadEvent, Request, ResetReason, Shared,
 };
+pub use crate::download::{ConnectionRange, RangeMap};
 use crate::http::{self, Header};
 use crate::journal::format;
 use crate::naming::{self, Category, TargetFs};
 use crate::platform::{AdapterError, NetworkInfo, NoopAdapter, PlatformAdapter, ProxyConfig};
-use crate::probe::{self, ProbeError, Resumable};
+use crate::probe::{self, ProbeError, ProbeInfo, Resumable};
 use crate::speed::{Ema, rollup_cutoff};
 use crate::storage::{DEFAULT_QUEUE_ID, Db, StorageError};
 use crate::transfer::{ConnEvent, TransferError};
@@ -166,6 +168,21 @@ pub enum WarningKind {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum EngineEvent {
+    /// Recorded by [`Engine::add`]; before the `GroupChanged` of the
+    /// downloads it joined.
+    DownloadAdded {
+        snapshot: Snapshot,
+    },
+    /// Forgotten by [`Engine::remove`].
+    Removed {
+        id: DownloadId,
+        queue_id: queues::QueueId,
+    },
+    /// The segment map, while watched ([`Engine::watch_ranges`]).
+    RangeMap {
+        id: DownloadId,
+        map: RangeMap,
+    },
     StateChanged {
         id: DownloadId,
         from: State,
@@ -230,6 +247,17 @@ pub struct AddRequest {
     /// limit apply (§12).
     pub speed_limit: Option<u64>,
     pub target_fs: TargetFs,
+    /// Blind mode (§2.4): if the probe fails, add it anyway, named from
+    /// the URL, size and resumability unknown.
+    pub blind: bool,
+}
+
+/// What [`Engine::probe`] learned: the probe (§2.2), its `suggested_name`
+/// following the naming settings (§3), and that name's category (§13.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Probed {
+    pub info: ProbeInfo,
+    pub category: Category,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -308,6 +336,7 @@ pub struct Engine {
     platform: Arc<dyn PlatformAdapter>,
     /// The adapter's last answer to `system_proxy`.
     last_system: Mutex<Option<ProxyConfig>>,
+    controls: Mutex<live::Controls>,
 }
 
 impl Engine {
@@ -335,6 +364,7 @@ impl Engine {
             speed: Mutex::default(),
             platform,
             last_system: Mutex::default(),
+            controls: Mutex::default(),
         };
         engine.refresh_limits()?;
         // Leftovers of earlier runs whose hour has since ended.
@@ -363,10 +393,30 @@ impl Engine {
         self.buckets.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn controls(&self) -> MutexGuard<'_, live::Controls> {
+        self.controls.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `Probe` (§2): what `add` would learn, recording nothing.
+    pub async fn probe(&self, url: &Url, headers: &[Header]) -> Result<Probed, EngineError> {
+        let lease = self.lease(url).await?;
+        let settings = self.settings()?;
+        let options = settings.apply(self.config).probe;
+        let mut info = probe::probe(&lease.client, url, headers, options).await?;
+        drop(lease);
+        info.suggested_name = suggested_name(&info, url, &settings, TargetFs::host());
+        let category = naming::categorize(
+            &info.suggested_name,
+            info.content_type.as_deref(),
+            &settings.extra_extensions,
+        );
+        Ok(Probed { info, category })
+    }
+
     /// Probes and records a download (§2, §3) and groups it (§13.2).
     /// Doesn't start it. Fails fast as `Failed(NoSpace)` when the directory
-    /// can't hold it (I10). Its group is in the snapshot; `GroupChanged`
-    /// goes to the others it joined.
+    /// can't hold it (I10). `DownloadAdded`, with its group in the
+    /// snapshot, then `GroupChanged` for the others it joined.
     pub async fn add(
         &self,
         req: AddRequest,
@@ -380,23 +430,20 @@ impl Engine {
         let lease = self.lease(&req.url).await?;
         let settings = self.settings()?;
         let probe = settings.apply(self.config).probe;
-        let info = probe::probe(&lease.client, &req.url, &req.headers, probe).await?;
+        let probed = probe::probe(&lease.client, &req.url, &req.headers, probe).await;
         drop(lease);
+        let (info, blind) = match probed {
+            Ok(info) => (info, false),
+            Err(e) if req.blind && e.allows_blind() => {
+                tracing::info!(error = %e, "probe failed, adding blind");
+                (ProbeInfo::blind(&req.url), true)
+            }
+            Err(e) => return Err(e.into()),
+        };
         let base = match &req.filename {
             Some(name) => naming::sanitize(name, req.target_fs)
                 .ok_or_else(|| EngineError::InvalidName(name.clone()))?,
-            // The naming toggles (§3) only hide what the server said.
-            None => naming::base_name(
-                info.content_disposition
-                    .as_deref()
-                    .filter(|_| settings.use_content_disposition),
-                info.content_type
-                    .as_deref()
-                    .filter(|_| settings.append_type_extension),
-                &info.effective_url,
-                &req.url,
-                req.target_fs,
-            ),
+            None => suggested_name(&info, &req.url, &settings, req.target_fs),
         };
         let mut taken: Vec<String> = std::fs::read_dir(&req.directory)?
             .filter_map(|e| e.ok())
@@ -441,9 +488,9 @@ impl Engine {
         db.conn().execute(
             "INSERT INTO downloads (id, url, headers, final_path, part_path, state, fail_reason,
                  queue_id, position, category, created_at, total_size, etag, last_modified,
-                 digest, resumable, connections, speed_limit)
+                 digest, resumable, connections, speed_limit, blind)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                 ?17, ?18)",
+                 ?17, ?18, ?19)",
             params![
                 id,
                 req.url.as_str(),
@@ -463,22 +510,77 @@ impl Engine {
                 resumable_str(info.resumable),
                 req.connections.map(|n| n.max(1)),
                 req.speed_limit.map(|r| r as i64),
+                blind,
             ],
         )?;
         drop(db);
         // A download that can't be grouped is still added.
-        let grouped = if !settings.auto_grouping {
-            Ok(())
-        } else {
-            self.auto_group(&id).and_then(|changed| {
-                let others: Vec<DownloadId> = changed.into_iter().filter(|c| *c != id).collect();
-                self.announce_groups(&others, on_event)
-            })
+        let others = match settings.auto_grouping {
+            false => Vec::new(),
+            true => self.auto_group(&id).unwrap_or_else(|e| {
+                tracing::warn!(id, error = %e, "could not group download");
+                Vec::new()
+            }),
         };
-        if let Err(e) = grouped {
-            tracing::warn!(id, error = %e, "could not group download");
+        let snap = self.stored(&id)?;
+        on_event(EngineEvent::DownloadAdded {
+            snapshot: snap.clone(),
+        });
+        let others: Vec<DownloadId> = others.into_iter().filter(|c| *c != id).collect();
+        if let Err(e) = self.announce_groups(&others, on_event) {
+            tracing::warn!(id, error = %e, "could not announce groups");
         }
-        self.stored(&id)
+        Ok(snap)
+    }
+
+    /// Forgets a download that isn't running (ARCHITECTURE §3.1): its row,
+    /// ranges and speed samples. `delete_files` also deletes its file: the
+    /// final file if completed (found first if it moved, §6), else the part
+    /// file and sidecar; nothing on disk otherwise. Waits for a dropped
+    /// run's file work first; one whose rename already happened is
+    /// completed (§8). `Removed`, then `GroupChanged` for members that left
+    /// its group with it (§13.2).
+    pub async fn remove(
+        &self,
+        id: &str,
+        delete_files: bool,
+        on_event: &(dyn Fn(EngineEvent) + Send + Sync),
+    ) -> Result<(), EngineError> {
+        let snap = self.get(id, on_event)?;
+        let _hold = PartHold::acquire(&snap.part_path).await;
+        let mut snap = self.stored(id)?;
+        if self.recovered(&snap, on_event).await? {
+            snap = self.stored(id)?;
+        }
+        if delete_files {
+            if snap.state == State::Completed {
+                remove_if_exists(&snap.final_path)?;
+            } else {
+                // Sidecar first, as in prepare (§5.4).
+                remove_if_exists(&snap.sidecar_path())?;
+                remove_if_exists(&snap.part_path)?;
+            }
+        }
+        let left = self.forget(id)?;
+        self.forget_watch(id);
+        on_event(EngineEvent::Removed {
+            id: id.to_owned(),
+            queue_id: snap.queue_id,
+        });
+        self.announce_groups(&left, on_event)
+    }
+
+    /// `Retry` (§9): a failed download back in its queue, its journal kept
+    /// (its run probes again first). Others are left as they are.
+    pub fn retry(
+        &self,
+        id: &str,
+        on_event: &(dyn Fn(EngineEvent) + Send + Sync),
+    ) -> Result<Snapshot, EngineError> {
+        if self.stored(id)?.state == State::Failed {
+            self.transition(id, State::Queued, None, on_event)?;
+        }
+        self.stored(id)
     }
 
     /// Final names of unfinished downloads in `dir`: their files don't
@@ -520,6 +622,16 @@ impl Engine {
         }
         // Regrouping a moved one can change rows already read.
         if moved { self.rows() } else { Ok(rows) }
+    }
+
+    /// Every download's id; nothing is looked up on disk.
+    pub fn ids(&self) -> Result<Vec<DownloadId>, EngineError> {
+        let db = self.db();
+        let mut stmt = db.conn().prepare("SELECT id FROM downloads")?;
+        let ids = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(ids)
     }
 
     fn rows(&self) -> Result<Vec<Snapshot>, EngineError> {
@@ -664,6 +776,25 @@ impl Engine {
         on_event: &(dyn Fn(EngineEvent) + Send + Sync),
         stop: &watch::Receiver<bool>,
     ) -> Result<Snapshot, EngineError> {
+        let result = self.run_once(id, on_event, stop).await;
+        // Its connections are gone: the map as it stays.
+        if let Ok(snap) = &result
+            && self.watched(id)
+        {
+            on_event(EngineEvent::RangeMap {
+                id: id.to_owned(),
+                map: live::stored_map(snap),
+            });
+        }
+        result
+    }
+
+    async fn run_once(
+        &self,
+        id: &str,
+        on_event: &(dyn Fn(EngineEvent) + Send + Sync),
+        stop: &watch::Receiver<bool>,
+    ) -> Result<Snapshot, EngineError> {
         let snap = self.stored(id)?;
         if snap.state.is_final() {
             return Ok(snap);
@@ -694,15 +825,19 @@ impl Engine {
         // future is dropped mid-run: buckets, sampling, the lease, and in
         // `download` the budget ticket, the learner and the writer.
         let (limits, own_bucket) = self.take_buckets(id, &snap.queue_id)?;
+        let (tuning, _control) = self.take_control(id)?;
+        let connections = *tuning.connections.borrow();
         let req = Request {
             url,
             headers: self.headers(id)?,
             part: part.clone(),
             sidecar: sidecar.clone(),
-            connections: self.connections(id)?,
+            connections,
             started_at: self.started_at(id)?,
             limits,
             hold: Some(hold.clone()),
+            blind: self.blind(id)?,
+            tuning: Some(tuning),
         };
         let progress = Mutex::new(Progress::new(snap.total_size));
         let dl_event = |e: DownloadEvent| self.on_download_event(id, e, &progress, on_event);
@@ -911,6 +1046,10 @@ impl Engine {
                     kind: WarningKind::NotResumable,
                 });
             }
+            DownloadEvent::Ranges(map) => on_event(EngineEvent::RangeMap {
+                id: id.to_owned(),
+                map,
+            }),
         }
     }
 
@@ -931,6 +1070,15 @@ impl Engine {
             |r| r.get(0),
         )?;
         Ok(n.and_then(|n| u8::try_from(n).ok()))
+    }
+
+    fn blind(&self, id: &str) -> Result<bool, EngineError> {
+        let db = self.db();
+        Ok(db
+            .conn()
+            .query_row("SELECT blind FROM downloads WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })?)
     }
 
     fn headers(&self, id: &str) -> Result<Vec<Header>, EngineError> {
@@ -1042,6 +1190,22 @@ impl Progress {
             eta_secs,
         });
     }
+}
+
+/// §3's name for what the probe said. The naming toggles only hide what
+/// the server said.
+fn suggested_name(info: &ProbeInfo, url: &Url, s: &settings::Settings, fs: TargetFs) -> String {
+    naming::base_name(
+        info.content_disposition
+            .as_deref()
+            .filter(|_| s.use_content_disposition),
+        info.content_type
+            .as_deref()
+            .filter(|_| s.append_type_extension),
+        &info.effective_url,
+        url,
+        fs,
+    )
 }
 
 fn fail_reason(e: &DownloadError) -> FailReason {

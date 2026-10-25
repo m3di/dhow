@@ -1,7 +1,7 @@
 //! Event delivery (ARCHITECTURE §3.2, §3.3): the engine never waits for the
 //! shell. Events go into a queue that one thread per engine hands to the
-//! listener in order; a `Progress` still queued is replaced by a newer one
-//! for the same download. The thread is parked while nothing happens and
+//! listener in order; a `Progress` or `RangeMap` still queued is replaced
+//! by a newer one for the same download. The thread is parked while nothing happens and
 //! is not a runtime task.
 
 use std::collections::VecDeque;
@@ -48,15 +48,17 @@ impl Sink {
         if q.closed {
             return;
         }
-        if let Event::Progress { id, .. } = &event {
-            // The newest event of this download, if still queued, is
-            // overtaken: replace it rather than queue both.
+        if let Event::Progress { id, .. } | Event::RangeMap { id, .. } = &event {
+            // The newest event of this download, if still queued and of
+            // the same kind, is overtaken: replace it rather than queue both.
             let last = q
                 .events
                 .iter_mut()
                 .rev()
                 .find(|e| e.download() == Some(id.as_str()));
-            if let Some(slot @ Event::Progress { .. }) = last {
+            if let Some(slot) = last
+                && std::mem::discriminant(slot) == std::mem::discriminant(&event)
+            {
                 *slot = event;
                 return;
             }

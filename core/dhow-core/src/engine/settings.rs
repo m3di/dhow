@@ -458,6 +458,7 @@ mod tests {
             queue: None,
             speed_limit: None,
             target_fs: TargetFs::Posix,
+            blind: false,
         }
     }
 

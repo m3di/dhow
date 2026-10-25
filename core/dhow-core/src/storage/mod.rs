@@ -14,6 +14,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_initial.sql"),
     include_str!("migrations/0002_queue_run_state.sql"),
     include_str!("migrations/0003_group_pinned.sql"),
+    include_str!("migrations/0004_blind.sql"),
 ];
 
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;

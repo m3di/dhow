@@ -49,6 +49,7 @@ async fn fetch(engine: &Engine, origin: &TestServer, dir: &Path, seed: u64) {
         queue: None,
         speed_limit: None,
         target_fs: TargetFs::host(),
+        blind: false,
     };
     let id = engine.add(req, &|_| {}).await.unwrap().id;
     let (_keep, stop) = watch::channel(false);
@@ -103,6 +104,7 @@ async fn a_change_while_running_applies_to_the_next_lease() {
         queue: None,
         speed_limit: None,
         target_fs: TargetFs::host(),
+        blind: false,
     };
     let id = engine.add(req, &|_| {}).await.unwrap().id;
     let probed = origin.requests().len();

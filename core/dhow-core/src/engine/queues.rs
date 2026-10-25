@@ -109,9 +109,19 @@ pub struct QueueSnapshot {
     pub run_state_until: Option<i64>,
     /// Downloads in it that aren't completed or cancelled.
     pub unfinished: u32,
+    /// Of those, `Queued` ones: waiting for their turn (§10.4, §11).
+    pub queued: u32,
+    /// And `Active`, `Waiting` or `Completing` ones. With `queued`, 0 once
+    /// the queue has run dry (`on_complete`).
+    pub running: u32,
 }
 
 impl QueueSnapshot {
+    /// `run_state` as in force at `now`: `Auto` once a timed override ended.
+    pub fn run_state_at(&self, now: Timestamp) -> RunState {
+        self.run_override(now).unwrap_or(RunState::Auto)
+    }
+
     /// The override still in force at `now`, if any.
     fn run_override(&self, now: Timestamp) -> Option<RunState> {
         let live = self
@@ -248,6 +258,12 @@ impl Engine {
             .query_map([], queue_snapshot)?
             .collect::<Result<_, _>>()?;
         Ok(rows)
+    }
+
+    /// The queue a download is in.
+    pub fn queue_of(&self, id: &str) -> Result<QueueSnapshot, EngineError> {
+        let q = self.stored(id)?.queue_id;
+        self.queue(&q)
     }
 
     pub fn queue(&self, id: &str) -> Result<QueueSnapshot, EngineError> {
@@ -483,7 +499,10 @@ fn schedule_json(spec: &QueueSpec) -> Option<String> {
 const QUEUE_SELECT: &str = "SELECT q.id, q.name, q.max_concurrent, q.speed_limit, q.on_complete,
     q.is_default, q.schedule, q.run_state, q.run_state_until,
     (SELECT count(*) FROM downloads d WHERE d.queue_id = q.id
-        AND d.state NOT IN ('completed', 'cancelled'))
+        AND d.state NOT IN ('completed', 'cancelled')),
+    (SELECT count(*) FROM downloads d WHERE d.queue_id = q.id AND d.state = 'queued'),
+    (SELECT count(*) FROM downloads d WHERE d.queue_id = q.id
+        AND d.state IN ('active', 'waiting', 'completing'))
     FROM queues q";
 
 fn queue_snapshot(r: &rusqlite::Row) -> rusqlite::Result<QueueSnapshot> {
@@ -506,6 +525,8 @@ fn queue_snapshot(r: &rusqlite::Row) -> rusqlite::Result<QueueSnapshot> {
         run_state: RunState::parse(&r.get::<_, String>(7)?),
         run_state_until: r.get(8)?,
         unfinished: r.get(9)?,
+        queued: r.get(10)?,
+        running: r.get(11)?,
     })
 }
 

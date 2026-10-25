@@ -98,6 +98,7 @@ async fn engine_reports_the_adapter_and_keeps_awake_while_transferring() {
             queue: None,
             speed_limit: None,
             target_fs: TargetFs::host(),
+            blind: false,
         };
         ids.push(engine.add(req, &|_| {}).await.unwrap().id);
     }
@@ -137,6 +138,7 @@ async fn keep_awake_ends_when_a_run_is_dropped() {
         queue: None,
         speed_limit: None,
         target_fs: TargetFs::host(),
+        blind: false,
     };
     let id = engine.add(req, &|_| {}).await.unwrap().id;
     let (_keep, stop) = watch::channel(false);

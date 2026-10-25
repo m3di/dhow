@@ -82,6 +82,8 @@ fn t_idle_ffi_nothing_runs_after_the_last_download() {
         req.queue = Some(q.id.clone());
         ids.push(block(engine.add(req)).unwrap().id);
     }
+    // Its segment map watched, and left on.
+    engine.watch_ranges(ids[0].clone(), true).unwrap();
     for id in &ids {
         events.wait_state(id, DownloadState::Completed);
     }
@@ -110,5 +112,6 @@ fn t_idle_ffi_nothing_runs_after_the_last_download() {
     engine.list().unwrap();
     engine.storage_breakdown().unwrap();
     engine.list_queues().unwrap();
+    engine.watch_ranges(ids[1].clone(), true).unwrap();
     assert_eq!(engine.alive_tasks(), 0);
 }

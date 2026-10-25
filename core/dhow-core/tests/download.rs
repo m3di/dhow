@@ -59,6 +59,8 @@ impl Env {
             started_at: None,
             limits: vec![],
             hold: None,
+            blind: false,
+            tuning: None,
         };
         Self { _dir: dir, req }
     }

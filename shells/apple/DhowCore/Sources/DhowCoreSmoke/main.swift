@@ -11,8 +11,13 @@ final class Listener: EventListener, @unchecked Sendable {
     let settingsChanged = DispatchSemaphore(value: 0)
 
     func onEvent(event: Event) {
-        if case .settingsChanged = event {
+        // Exhaustive, as a shell's is: a new variant fails to compile here.
+        switch event {
+        case .settingsChanged:
             settingsChanged.signal()
+        case .downloadAdded, .removed, .stateChanged, .progress, .reset, .retrying, .renamed,
+            .warning, .groupChanged, .rangeMap, .queueChanged, .queueRemoved, .networkChanged:
+            break
         }
     }
 
@@ -80,6 +85,13 @@ do {
     _ = try await engine.add(
         request: AddRequest(url: "http://127.0.0.1:1/x", directory: dir, start: .queued))
     check(false, "unreachable server accepted")
+} catch DhowError.Probe(let reason) {
+    check(reason == .connect, "probe failure \(reason)")
+}
+do {
+    // The add dialog's preview (UI-GUIDELINES §4).
+    _ = try await engine.probe(url: "http://127.0.0.1:1/x", headers: [])
+    check(false, "unreachable server probed")
 } catch DhowError.Probe(let reason) {
     check(reason == .connect, "probe failure \(reason)")
 }
