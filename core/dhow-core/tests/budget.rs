@@ -55,6 +55,10 @@ struct Timeline {
     /// (when, download, connections), every change.
     changes: Vec<(Instant, usize, u32)>,
     max_total: u32,
+    /// Most slots the budget itself had out (held and reserved), seen at
+    /// any event: the events of different downloads may arrive out of
+    /// order, so their sum can briefly exceed it.
+    max_used: u32,
     /// Most downloads holding a connection at the same moment.
     max_holding: usize,
     waited: Vec<bool>,
@@ -141,7 +145,12 @@ async fn run_all(
                 }
             }
             let (_keep, stop) = watch::channel(false);
-            let on_event = move |e: DownloadEvent| timeline.lock().unwrap().record(i, &e);
+            let budget = shared.budget.clone();
+            let on_event = move |e: DownloadEvent| {
+                let mut t = timeline.lock().unwrap();
+                t.record(i, &e);
+                t.max_used = t.max_used.max(budget.usage("").0);
+            };
             let client = http::client().unwrap();
             let done = download(&req, &client, &config(window), &shared, &on_event, &stop).await;
             done.unwrap_or_else(|e| panic!("download {i}: {e}"));
@@ -258,7 +267,7 @@ async fn newcomers_get_a_slot_when_the_budget_is_spent() {
 }
 
 fn assert_caps(t: &Timeline) {
-    assert!(t.max_total <= 16, "budget exceeded: {}", t.max_total);
+    assert!(t.max_used <= 16, "budget exceeded: {}", t.max_used);
     for who in 0..10 {
         assert!(
             t.peak(who) <= 4,

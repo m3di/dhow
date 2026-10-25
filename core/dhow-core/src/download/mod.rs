@@ -489,7 +489,7 @@ async fn fetch(
                 let cursor = plan.live.remove(&id).expect("live chunk").cursor;
                 if plan.shedding.remove(&id) {
                     // Given up for a newcomer: its slot goes there.
-                    ticket.release(true);
+                    ticket.release();
                     continue;
                 }
                 match result {
@@ -511,7 +511,7 @@ async fn fetch(
                             Some(work) => running.push(connection(
                                 &src, work, &handle, &config.transfer, &conn_event,
                             )),
-                            None => ticket.release(false),
+                            None => ticket.release(),
                         }
                     }
                     Err(TransferError::IdentityChanged(IdentityChange::RangeIgnored))
@@ -522,7 +522,7 @@ async fn fetch(
                         // was split from, whose response still covers it.
                         match plan.merge_back(&handle, id, &cursor).await {
                             Ok(true) => {
-                                ticket.release(false);
+                                ticket.release();
                                 single.store(true, Ordering::Relaxed);
                                 ramp.done = true;
                                 ticket.stop_wanting();
@@ -563,7 +563,7 @@ async fn fetch(
                             )),
                             // Nothing left worth a new connection.
                             Ok(None) => {
-                                ticket.release(false);
+                                ticket.release();
                                 ramp.done = true;
                                 ticket.stop_wanting();
                             }
