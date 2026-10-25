@@ -49,7 +49,8 @@ pub struct Request {
     /// Speed limits besides the global one: its queue's and its own (§12).
     pub limits: Vec<Arc<Bucket>>,
     /// The caller's hold on `part`, when its run touches the files outside
-    /// [`download`] too (recovery, finalize). `None`: `download` takes one.
+    /// [`download`] too (recovery, finalize). `None`: `download` takes one,
+    /// so a caller already holding `part` that passes `None` deadlocks.
     pub hold: Option<PartHold>,
 }
 
@@ -189,7 +190,7 @@ impl<E: Into<DownloadError>> From<E> for Stop {
 }
 
 /// Resolves once `stop` holds `true`; never if its sender is gone.
-async fn stopped(mut stop: watch::Receiver<bool>) {
+pub(crate) async fn stopped(mut stop: watch::Receiver<bool>) {
     if stop.wait_for(|s| *s).await.is_err() {
         std::future::pending::<()>().await;
     }
@@ -207,7 +208,11 @@ pub async fn download(
 ) -> Result<Downloaded, DownloadError> {
     let hold = match &req.hold {
         Some(h) => h.clone(),
-        None => PartHold::acquire(&req.part).await,
+        None => tokio::select! {
+            biased;
+            _ = stopped(stop.clone()) => return Err(DownloadError::Stopped),
+            h = PartHold::acquire(&req.part) => h,
+        },
     };
     let mut resets = 0;
     let mut force = None;
@@ -273,12 +278,13 @@ async fn prepare(
         sidecar: req.sidecar.clone(),
     };
     let (info, hold) = (info.clone(), hold.clone());
-    let (file, journal, prepared) = tokio::task::spawn_blocking(move || {
-        let _hold = hold;
-        prepare_files(&files, &info, force)
-    })
-    .await
-    .map_err(io::Error::other)??;
+    // The hold last: a dropped run's result is dropped in order, so its
+    // files are closed before a rerun gets them (Windows delete-pending).
+    let (prepared, _hold) =
+        tokio::task::spawn_blocking(move || (prepare_files(&files, &info, force), hold))
+            .await
+            .map_err(io::Error::other)?;
+    let (file, journal, prepared) = prepared?;
     match prepared {
         Prepared::Resumed => on_event(DownloadEvent::Resumed {
             committed: journal.committed().len(),

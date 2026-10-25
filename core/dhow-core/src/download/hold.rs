@@ -56,10 +56,10 @@ pub(crate) mod park {
     }
 
     impl Park {
-        /// Blocks until a thread is parked here.
+        /// Blocks until a thread is parked here (or it was released).
         pub(crate) fn wait_reached(&self) {
             let mut s = self.state.lock().unwrap();
-            while !s.0 {
+            while !s.0 && !s.1 {
                 s = self.changed.wait(s).unwrap();
             }
         }
@@ -70,17 +70,38 @@ pub(crate) mod park {
         }
     }
 
-    type Armed = Vec<(&'static str, PathBuf, Arc<Park>)>;
+    /// Releases its park when dropped, so a failing test can't leave a
+    /// thread parked (and the runtime waiting for it) forever.
+    pub(crate) struct Armed(Arc<Park>);
 
-    static ARMED: Mutex<Armed> = Mutex::new(Vec::new());
+    impl std::ops::Deref for Armed {
+        type Target = Park;
+        fn deref(&self) -> &Park {
+            &self.0
+        }
+    }
 
-    pub(crate) fn arm(point: &'static str, part: &Path) -> Arc<Park> {
+    impl Armed {
+        pub(crate) fn park(&self) -> Arc<Park> {
+            self.0.clone()
+        }
+    }
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    static ARMED: Mutex<Vec<(&'static str, PathBuf, Arc<Park>)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn arm(point: &'static str, part: &Path) -> Armed {
         let park = Arc::new(Park::default());
         ARMED
             .lock()
             .unwrap()
             .push((point, part.to_owned(), park.clone()));
-        park
+        Armed(park)
     }
 
     pub(crate) fn at(point: &'static str, part: &Path) {

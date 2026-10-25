@@ -206,6 +206,11 @@ impl Writer {
         self.journal.committed()
     }
 
+    #[cfg(test)]
+    pub(crate) fn sidecar(&self) -> &std::path::Path {
+        self.journal.path()
+    }
+
     pub fn total_size(&self) -> Option<u64> {
         self.journal.header().total_size
     }

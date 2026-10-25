@@ -427,7 +427,7 @@ async fn run(
                 }
                 Err(lock::Held::Io(e)) => return Err(e.into()),
             };
-            let snap = engine.cancel(&id, delete_partial, &on_event)?;
+            let snap = engine.cancel(&id, delete_partial, &on_event).await?;
             output::emit(output::snapshot("download", &snap));
             Ok(ExitCode::SUCCESS)
         }
