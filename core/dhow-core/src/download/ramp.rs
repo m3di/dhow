@@ -138,9 +138,12 @@ pub struct Ramp {
     phase: Phase,
     /// Throughput measured before the last connection opened.
     previous: Option<f64>,
-    /// Aggregate throughput of the last full window (headroom's peak,
-    /// §10.6), until taken.
+    /// Aggregate throughput of the step the last full window ended
+    /// (headroom's peak, §10.6), until taken.
     aggregate: Option<f64>,
+    /// When the step being measured began (the connection was asked for)
+    /// and the aggregate then: the peak spans the whole step.
+    step: Option<(Instant, u64)>,
     pub next_check: Instant,
     pub done: bool,
 }
@@ -173,6 +176,7 @@ impl Ramp {
             phase: Phase::Settling,
             previous: None,
             aggregate: None,
+            step: None,
             next_check: now + settle(config),
             done: false,
         }
@@ -182,13 +186,17 @@ impl Ramp {
     pub fn check(&mut self, now: Instant, sample: Sample, config: &RampConfig) -> Step {
         let (from, start) = match self.phase {
             Phase::Measuring { from, start } if start.waits == sample.waits => (from, start),
-            // Settled; or a limit made it wait, so it measured the limit:
-            // measure again.
-            Phase::Settling | Phase::Measuring { .. } => {
+            Phase::Settling => {
                 self.measure(now, sample, config);
                 return Step::Wait;
             }
+            // A limit made it wait, so it measured the limit: measure again.
+            Phase::Measuring { .. } => {
+                self.remeasure(now, sample, config);
+                return Step::Wait;
+            }
             Phase::Blocked => {
+                self.step = Some((now, sample.aggregate));
                 self.phase = Phase::Settling;
                 self.next_check = now + settle(config);
                 return Step::Open;
@@ -197,10 +205,15 @@ impl Ramp {
         let delta = sample.bytes.saturating_sub(start.bytes);
         let elapsed = now.saturating_duration_since(from).as_secs_f64();
         if delta == 0 || elapsed <= 0.0 {
-            self.measure(now, sample, config);
+            self.remeasure(now, sample, config);
             return Step::Wait;
         }
-        self.aggregate = Some(sample.aggregate.saturating_sub(start.aggregate) as f64 / elapsed);
+        // Over the whole step: a stall that held the connections back
+        // (a commit on a slow disk) is then counted with the backlog it
+        // left, which arrives all at once.
+        let (since, base) = self.step.unwrap_or((from, start.aggregate));
+        let span = now.saturating_duration_since(since).as_secs_f64();
+        self.aggregate = Some(sample.aggregate.saturating_sub(base) as f64 / span);
         let rate = delta as f64 / elapsed;
         if let Some(previous) = self.previous
             && rate < previous * (1.0 + config.min_gain)
@@ -209,6 +222,7 @@ impl Ramp {
             return Step::Saturated;
         }
         self.previous = Some(rate);
+        self.step = Some((now, sample.aggregate));
         self.phase = Phase::Settling;
         self.next_check = now + settle(config);
         Step::Open
@@ -219,7 +233,13 @@ impl Ramp {
         self.next_check = now + config.window;
     }
 
-    /// The aggregate throughput of the last window measured, once.
+    /// The window didn't count: its step starts over with the next one.
+    fn remeasure(&mut self, now: Instant, start: Sample, config: &RampConfig) {
+        self.step = None;
+        self.measure(now, start, config);
+    }
+
+    /// The aggregate throughput of the last step measured, once.
     pub fn take_aggregate(&mut self) -> Option<f64> {
         self.aggregate.take()
     }
@@ -359,9 +379,26 @@ mod tests {
             Step::Saturated
         ));
         assert!(r.done);
-        // Every download's bytes over the last window: headroom's peak.
-        assert_eq!(r.take_aggregate(), Some(4_200_000.0));
+        // Every download's bytes over the last step, settling included:
+        // headroom's peak.
+        assert_eq!(r.take_aggregate(), Some(4_150_000.0));
         assert_eq!(r.take_aggregate(), None);
+    }
+
+    #[test]
+    fn the_peak_counts_a_stall_with_its_backlog() {
+        let c = RampConfig::default();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut r = Ramp::new(t0, &c);
+        r.check(at(1), s(0, 0), &c);
+        assert!(matches!(r.check(at(4), s(3_000_000, 0), &c), Step::Open));
+        // The step began with a 2 s stall: nothing arrived until the
+        // window, which then got the backlog all at once.
+        r.check(at(6), s(3_000_000, 0), &c);
+        assert!(matches!(r.check(at(9), s(13_000_000, 0), &c), Step::Open));
+        // The window alone saw 20 MB in 3 s; over the step it is 4 MB/s.
+        assert_eq!(r.take_aggregate(), Some(4_000_000.0));
     }
 
     #[test]

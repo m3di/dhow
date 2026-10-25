@@ -29,6 +29,7 @@ fn config(window: Duration) -> DownloadConfig {
         writer: WriterConfig {
             commit_interval: Duration::from_millis(100),
             commit_bytes: 8 * 1024 * 1024,
+            ..WriterConfig::default()
         },
         ramp: RampConfig {
             window,

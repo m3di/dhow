@@ -139,9 +139,10 @@ impl Bucket {
 
 /// The process-wide limit: the user's global limit, lowered by headroom
 /// (§10.6) to `(1 − headroom) × peak`. The peak is the highest aggregate
-/// throughput ramp-up measured (its windows are settled and unlimited);
-/// the cap is lifted while any download ramps up, so ramp-up measures the
-/// link and not the cap, and applies in between.
+/// throughput over a ramp-up step (unlimited, and long enough that a
+/// stall and the backlog it leaves count together); the cap is lifted
+/// while any download ramps up, so ramp-up measures the link and not the
+/// cap, and applies in between.
 #[derive(Debug)]
 pub struct GlobalLimit {
     bucket: Arc<Bucket>,

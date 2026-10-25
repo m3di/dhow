@@ -28,6 +28,9 @@ pub struct WriterConfig {
     pub commit_interval: Duration,
     /// Commit when one chunk has this many uncommitted bytes.
     pub commit_bytes: u64,
+    /// Test hook: each commit takes this much longer, as on a slow disk.
+    #[doc(hidden)]
+    pub slow_sync: Duration,
 }
 
 impl Default for WriterConfig {
@@ -35,6 +38,7 @@ impl Default for WriterConfig {
         Self {
             commit_interval: Duration::from_secs(2),
             commit_bytes: 8 * 1024 * 1024,
+            slow_sync: Duration::ZERO,
         }
     }
 }
@@ -359,6 +363,9 @@ impl Writer {
         if pending.is_empty() {
             self.pending_since = None;
             return Ok(());
+        }
+        if !self.config.slow_sync.is_zero() {
+            std::thread::sleep(self.config.slow_sync);
         }
         self.part.sync_data()?;
         #[cfg(test)]

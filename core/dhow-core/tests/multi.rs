@@ -38,6 +38,7 @@ fn config(window_ms: u64) -> DownloadConfig {
         writer: WriterConfig {
             commit_interval: Duration::from_secs(60),
             commit_bytes: 8 * 1024 * 1024,
+            ..WriterConfig::default()
         },
         ramp: RampConfig {
             window: Duration::from_millis(window_ms),
@@ -358,10 +359,11 @@ async fn the_global_limit_is_shared() {
     assert!((2.6..4.0).contains(&secs), "{secs} s");
 }
 
-/// §10.6 (issue #8): with 50 % headroom, once ramp-up has found the link
-/// (1 MB/s, saturating at 4 connections) the download keeps to half of it.
-#[tokio::test(flavor = "multi_thread")]
-async fn headroom_leaves_part_of_the_link_free() {
+/// A 4 MB download with 50 % headroom on a 1 MB/s link that saturates at
+/// 4 connections, each commit taking `slow_sync` longer. Timed commits,
+/// unlike the other tests here: each may hold the connections back (the
+/// step's split waits behind it). Returns the learned peak.
+async fn headroom_run(slow_sync: Duration) -> (f64, Run, Shared) {
     let server = TestServer::start().unwrap();
     let shared = Shared::new(BudgetConfig {
         per_host: 16,
@@ -369,17 +371,35 @@ async fn headroom_leaves_part_of_the_link_free() {
     });
     shared.global.set_headroom(50);
     let env = Env::new(&server, "/blob/4000000?throttle=250000&link=1000000");
-    let run = env.run(&config(300), &shared).await;
+    let mut config = config(300);
+    config.writer.commit_interval = Duration::from_millis(100);
+    config.writer.slow_sync = slow_sync;
+    let run = env.run(&config, &shared).await;
     run.result.as_ref().unwrap();
     assert_eq!(env.part_hash(), blob::digest(0, 4 * MB));
-    // A window can't see more than the link carried since the connection
-    // before it opened (settle + window, 4/3 of one): bytes held up by the
-    // split's fsync arrive late, all at once.
     let peak = shared.global.peak().expect("peak measured") as f64;
-    assert!((800_000.0..1_400_000.0).contains(&peak), "peak {peak}");
+    (peak, run, shared)
+}
+
+/// §10.6 (issue #8): with 50 % headroom, once ramp-up has found the link
+/// the download keeps to half of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn headroom_leaves_part_of_the_link_free() {
+    let (peak, run, shared) = headroom_run(Duration::ZERO).await;
+    assert!((800_000.0..1_200_000.0).contains(&peak), "peak {peak}");
     let cap = shared.global.rate().expect("capped after ramp-up") as f64;
     assert!((cap / peak - 0.5).abs() < 0.01, "cap {cap}, peak {peak}");
     // Unlimited it takes about 4 s; at half the link after ramp-up, longer.
     let secs = run.elapsed.as_secs_f64();
     assert!(secs > 5.5, "{secs} s");
+}
+
+/// §10.6: on a slow disk (commits longer than the settling third) the
+/// backlog a stall leaves arrives all at once in the next window, which
+/// alone read 2.3 MB/s here. Over the whole step it is the link's rate.
+#[tokio::test(flavor = "multi_thread")]
+async fn headroom_peak_is_the_link_on_a_slow_disk() {
+    let (peak, _, _) = headroom_run(Duration::from_millis(500)).await;
+    // Low is the safe side: a stall that ends the step lowers it.
+    assert!((700_000.0..1_200_000.0).contains(&peak), "peak {peak}");
 }
