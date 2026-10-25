@@ -232,9 +232,21 @@ pub async fn download(
                 .budget
                 .register(started_at, host_key(&info.effective_url))
         });
+        // Claimed from here, not from the first connection: prepare can
+        // take a while, and younger downloads must not ramp into this
+        // one's share meanwhile (§10.3).
+        let can_range = info.resumable != Resumable::No && info.total_size.is_some();
+        let limit = ramp::connection_limit(
+            info.total_size,
+            can_range,
+            req.connections,
+            &config.ramp,
+            &shared.link,
+        );
+        ticket.set_limit(limit);
         let (file, journal) = prepare(req, &hold, &info, force.take(), on_event).await?;
         let fetched = fetch(
-            req, client, config, shared, ticket, &info, file, journal, &hold, on_event, stop,
+            req, client, config, shared, ticket, limit, &info, file, journal, &hold, on_event, stop,
         )
         .await;
         ticket.release_all();
@@ -400,6 +412,7 @@ async fn fetch(
     config: &DownloadConfig,
     shared: &Shared,
     ticket: &Ticket,
+    limit: u32,
     info: &ProbeInfo,
     file: File,
     journal: Journal,
@@ -446,10 +459,7 @@ async fn fetch(
         limiter: limiter.clone(),
     };
     let link = &shared.link;
-    let can_range = info.resumable != Resumable::No && total.is_some();
     let rc = &config.ramp;
-    let limit = ramp::connection_limit(total, can_range, req.connections, rc, link);
-    ticket.set_limit(limit);
     // A dropped run's writer still makes its final commit; until then the
     // files are its.
     let writer = Writer::new(file, journal, config.writer);
@@ -914,5 +924,121 @@ fn remove_if_exists(path: &Path) -> io::Result<()> {
     match std::fs::remove_file(path) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use dhow_testserver::TestServer;
+
+    use super::hold::park;
+    use super::*;
+
+    /// An elder parked in prepare while a younger download, holding its
+    /// first connection, asks for more on a budget of 4.
+    struct Fx {
+        shared: Arc<Shared>,
+        armed: park::Armed,
+        elder: tokio::task::JoinHandle<Result<Downloaded, DownloadError>>,
+        /// The elder's connections, as its events report them.
+        open: watch::Receiver<u32>,
+        young: Ticket,
+        _server: TestServer,
+        _dir: tempfile::TempDir,
+    }
+
+    async fn elder_in_prepare() -> Fx {
+        let shared = Arc::new(Shared::new(BudgetConfig {
+            global: 4,
+            per_host: 4,
+            min_for_new: 1,
+        }));
+        let server = TestServer::start().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let req = Request {
+            url: Url::parse(&server.url("/blob/3000000?throttle=500000")).unwrap(),
+            headers: vec![],
+            part: dir.path().join("a.part"),
+            sidecar: dir.path().join("a.dhow"),
+            connections: Some(4),
+            started_at: Some(1),
+            limits: vec![],
+            hold: None,
+        };
+        let armed = park::arm("prepare", &req.part);
+        let p = armed.park();
+        let reached = tokio::task::spawn_blocking(move || p.wait_reached());
+        let (tx, open) = watch::channel(0);
+        let s = shared.clone();
+        let elder = tokio::spawn(async move {
+            let config = DownloadConfig {
+                ramp: RampConfig {
+                    window: Duration::from_millis(60),
+                    min_chunk: 128 * 1024,
+                    // Never saturated: this is about the budget.
+                    min_gain: -1.0,
+                    ..RampConfig::default()
+                },
+                ..DownloadConfig::default()
+            };
+            let on_event = move |e: DownloadEvent| {
+                if let DownloadEvent::Connections(n) = e {
+                    tx.send_replace(n);
+                }
+            };
+            let (_keep, stop) = watch::channel(false);
+            let client = crate::http::client().unwrap();
+            download(&req, &client, &config, &s, &on_event, &stop).await
+        });
+        tokio::time::timeout(Duration::from_secs(10), reached)
+            .await
+            .expect("the elder parked in prepare")
+            .unwrap();
+        let young = shared.budget.register(2, "young:80".into());
+        young.set_limit(4);
+        assert!(young.try_first(), "a first connection needs only the caps");
+        Fx {
+            shared,
+            armed,
+            elder,
+            open,
+            young,
+            _server: server,
+            _dir: dir,
+        }
+    }
+
+    /// §10.3: a download claims its share from the moment it is
+    /// registered, not from its first connection, so a younger one can't
+    /// ramp into it while the elder's prepare is still on disk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_elder_in_prepare_keeps_its_claim() {
+        let mut fx = elder_in_prepare().await;
+        assert!(
+            !fx.young.try_grow(),
+            "grew into the preparing elder's claim"
+        );
+        fx.armed.release();
+        tokio::time::timeout(Duration::from_secs(30), fx.open.wait_for(|n| *n == 3))
+            .await
+            .expect("the elder ramped into the rest of the budget")
+            .unwrap();
+        assert!(!fx.young.try_grow());
+        assert_eq!(fx.shared.budget.usage("").0, 4);
+        drop(fx.young);
+        fx.elder.await.unwrap().unwrap();
+    }
+
+    /// A run dropped during prepare gives its claim back with its ticket.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_dropped_in_prepare_releases_its_claim() {
+        let fx = elder_in_prepare().await;
+        assert!(!fx.young.try_grow());
+        fx.elder.abort();
+        assert!(fx.elder.await.unwrap_err().is_cancelled());
+        assert!(fx.young.try_grow() && fx.young.try_grow() && fx.young.try_grow());
+        drop(fx.armed);
     }
 }
