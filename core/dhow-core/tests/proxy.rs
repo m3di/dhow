@@ -144,7 +144,13 @@ fn custom_needs_a_usable_proxy() {
     ] {
         let r = set_proxy(&engine, ProxyMode::Custom(Box::new(bad.clone())));
         assert!(
-            matches!(r, Err(EngineError::InvalidSetting { .. })),
+            matches!(
+                r,
+                Err(EngineError::InvalidSetting {
+                    key: "proxy_mode",
+                    ..
+                })
+            ),
             "{bad:?}"
         );
     }

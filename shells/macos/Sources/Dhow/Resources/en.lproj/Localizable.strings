@@ -80,7 +80,7 @@
 /* Context menu */
 "menu.pause" = "Pause";
 "menu.resume" = "Resume";
-"menu.retry" = "Retry";
+"menu.retry" = "Retry Now";
 "menu.startNow" = "Start Now";
 "menu.open" = "Open";
 "menu.showInFinder" = "Show in Finder";
@@ -111,7 +111,7 @@
 "add.queue" = "Queue";
 "add.more" = "More";
 "add.connections %lld" = "Connections: %lld";
-"add.speedLimit" = "Speed limit (KB/s)";
+"add.speedLimit" = "Speed limit (kB/s)";
 "add.noLimit" = "None";
 "add.start" = "Start";
 "add.startNow" = "Now";
@@ -240,7 +240,7 @@
 "settings.yes" = "Yes";
 "settings.no" = "No";
 "settings.unit.seconds" = "s";
-"settings.unit.kbps" = "KB/s";
+"settings.unit.kbps" = "kB/s";
 "settings.unit.percent" = "%";
 "settings.defaultFolder" = "Save downloads to";
 "settings.defaultConnections" = "Connections per download";
@@ -286,7 +286,8 @@
 "settings.extraExtensions" = "More Extensions";
 "settings.extensionsPrompt" = "None";
 "settings.extensionsNote" = "Files with these extensions go in that category. Listing a built-in extension under Other takes it out of its category.";
-"settings.invalid.headroom" = "Use a value from 0 to 99.";
+"settings.invalid.limit" = "Use 0 kB/s or more.";
+"settings.invalid.headroom" ="Use a value from 0 to 99.";
 "settings.invalid.atLeastOne" = "Use 1 or more.";
 "settings.invalid.newcomer" = "Turn this on or off.";
 "settings.invalid.defaultConnections" = "Use 1 or more, up to the most connections per download.";

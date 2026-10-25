@@ -67,7 +67,9 @@ private struct DownloadDetail: View {
                     ConnectionsStepper(download: d)
                     HStack {
                         if d.state == .failed {
+                            // Back in its queue, or at once by hand.
                             Button(tr("detail.retry")) { model.retry(d.id) }
+                            Button(tr("menu.retry")) { model.resume([d.id]) }
                         }
                         Spacer()
                         if Actions.canCancel(d.state) {
@@ -339,78 +341,145 @@ private struct ConnectionInfo: View {
 private struct LimitSlider: View {
     @Environment(AppModel.self) private var model
     var download: DownloadSnapshot
-    /// The step while the user moves it, until the download has it.
-    @State private var editing: Int?
+    /// The limit while the user moves it, until the download has it.
+    @State private var editing: PendingLimit?
 
-    /// kB/s (decimal, as `Format` shows them), then no limit.
-    static let steps: [UInt64?] =
-        [64, 128, 256, 512, 1000, 2000, 5000, 10_000, 20_000, 50_000].map { $0 * 1000 } + [nil]
-
-    /// The step nearest a limit (one the CLI set may fall between).
-    static func step(of limit: UInt64?) -> Int {
-        guard let limit else { return steps.count - 1 }
-        let rates = steps.compactMap { $0 }
-        let distance = { (i: Int) in abs(log2(Double(rates[i])) - log2(Double(max(limit, 1)))) }
-        return rates.indices.min { distance($0) < distance($1) } ?? 0
+    struct PendingLimit: Equatable {
+        var id: String
+        var limit: UInt64?
+        var sent = false
     }
 
     var body: some View {
-        let shown = editing.map { Self.steps[$0] } ?? download.speedLimit
+        let pending = editing?.id == download.id ? editing : nil
+        let shown = pending.map(\.limit) ?? download.speedLimit
+        let steps = LimitSteps.steps(for: download.speedLimit)
         VStack(alignment: .leading, spacing: 4) {
             LabeledContent(tr("detail.speedLimit")) {
-                Text(shown.map(Format.speed) ?? tr("menu.noLimit")).monospacedDigit()
+                Text(LimitSteps.label(shown)).monospacedDigit()
             }
             Slider(
                 value: Binding(
-                    get: { Double(editing ?? Self.step(of: download.speedLimit)) },
-                    set: { editing = Int($0.rounded()) }),
-                in: 0...Double(Self.steps.count - 1), step: 1
+                    get: { Double(LimitSteps.index(of: shown, in: steps)) },
+                    set: {
+                        editing = PendingLimit(id: download.id, limit: steps[Int($0.rounded())])
+                    }),
+                in: 0...Double(steps.count - 1), step: 1
             ) {
                 Text(tr("detail.speedLimit"))
             }
             .labelsHidden()
-            .accessibilityValue(shown.map(Format.speed) ?? tr("menu.noLimit"))
+            .accessibilityValue(LimitSteps.label(shown))
         }
         // Applied once it rests, not on every step of a drag.
         .task(id: editing) {
-            guard let step = editing, Self.steps[step] != download.speedLimit else { return }
+            guard let p = editing, !p.sent else { return }
             try? await Task.sleep(for: .milliseconds(300))
             guard !Task.isCancelled else { return }
-            model.setSpeedLimit([download.id], Self.steps[step])
+            send(p)
         }
-        .onChange(of: download.speedLimit) { editing = nil }
-        .onChange(of: download.id) { editing = nil }
+        // Kept until the download has it, whatever else changes meanwhile.
+        .onChange(of: download.speedLimit) {
+            if let p = editing, p.id == download.id, p.limit == download.speedLimit {
+                editing = nil
+            }
+        }
+        // Another download, or the pane closes: a change still resting goes now.
+        .onChange(of: download.id) { flush() }
+        .onDisappear { flush() }
+    }
+
+    private func send(_ p: PendingLimit) {
+        model.setSpeedLimit([p.id], p.limit)
+        editing?.sent = true
+    }
+
+    private func flush() {
+        if let p = editing, !p.sent {
+            model.setSpeedLimit([p.id], p.limit)
+        }
+        editing = nil
+    }
+}
+
+/// The detail pane's speed-limit steps (§5.5): kB/s, decimal as `Format`
+/// shows them, then no limit. 0 (held by its limit, set elsewhere) is a
+/// step only while it is the limit, so the slider and label agree.
+enum LimitSteps {
+    static let rates: [UInt64] =
+        [64, 128, 256, 512, 1000, 2000, 5000, 10_000, 20_000, 50_000].map { $0 * 1000 }
+
+    static func steps(for limit: UInt64?) -> [UInt64?] {
+        (limit == 0 ? [0] : []) + rates.map { $0 } + [nil]
+    }
+
+    /// The step of a limit, or the nearest (one the CLI set may fall
+    /// between).
+    static func index(of limit: UInt64?, in steps: [UInt64?]) -> Int {
+        if let exact = steps.firstIndex(of: limit) {
+            return exact
+        }
+        guard let limit else { return steps.count - 1 }
+        let distance = { (i: Int) -> Double in
+            guard let rate = steps[i], rate > 0 else { return .infinity }
+            return abs(log2(Double(rate)) - log2(Double(max(limit, 1))))
+        }
+        return steps.indices.min { distance($0) < distance($1) } ?? 0
+    }
+
+    static func label(_ limit: UInt64?) -> String {
+        switch limit {
+        case nil: tr("menu.noLimit")
+        case 0: tr("status.limitedToZero")
+        case let rate?: Format.speed(rate)
+        }
     }
 }
 
 /// Connections for this download (§5.5): a running one follows at once.
+/// Steps go to the engine in order; the stepper counts from the last one
+/// asked for, not from the snapshot that hasn't caught up yet.
 private struct ConnectionsStepper: View {
     @Environment(AppModel.self) private var model
     var download: DownloadSnapshot
+    @State private var pending: (id: String, value: Int)?
 
     var body: some View {
         let settings = model.store.settings
         let standard = Int(settings?.defaultConnections ?? 8)
         let maximum = max(1, Int(settings?.maxConnectionsPerDownload ?? 16))
-        let current = download.connections.map(Int.init) ?? standard
+        let stored = download.connections.map(Int.init) ?? standard
+        let current = pending.flatMap { $0.id == download.id ? $0.value : nil } ?? stored
         HStack {
             Stepper(
                 value: Binding(
                     get: { current },
-                    set: { model.setConnections(download.id, UInt8(clamping: $0)) }),
+                    set: {
+                        pending = (download.id, $0)
+                        model.setConnections(download.id, UInt8(clamping: $0))
+                    }),
                 in: 1...max(maximum, current)
             ) {
                 Text(
-                    download.connections == nil
+                    download.connections == nil && pending == nil
                         ? tr("detail.connectionsDefault \(current)")
                         : tr("detail.connections \(current)"))
             }
             Spacer()
             if download.connections != nil {
-                Button(tr("detail.useDefault")) { model.setConnections(download.id, nil) }
-                    .controlSize(.small)
+                Button(tr("detail.useDefault")) {
+                    pending = nil
+                    model.setConnections(download.id, nil)
+                }
+                .controlSize(.small)
             }
         }
+        .onChange(of: download.connections) {
+            if let p = pending, p.id == download.id, p.value == download.connections.map(Int.init) {
+                pending = nil
+            }
+        }
+        .onChange(of: download.id) { pending = nil }
     }
 }
 

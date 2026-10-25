@@ -42,7 +42,8 @@ struct StorageView: View {
         }
         .navigationTitle(tr("sidebar.storage"))
         .task(id: reloadKey) {
-            if let read = await model.storageBreakdown() {
+            // A read a newer one superseded (a Forget meanwhile) is dropped.
+            if let read = await model.storageBreakdown(), !Task.isCancelled {
                 usage = read
             }
         }

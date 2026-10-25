@@ -42,6 +42,8 @@ struct PauseAllRecord: Equatable {
 @MainActor @Observable
 final class AppModel {
     let store = DownloadStore()
+    /// The Settings window's draft, kept while the window is closed.
+    let settingsForm = SettingsForm()
     /// Kept for the app's life: dropping it blocks the dropping thread, so
     /// it is never dropped, only shut down at quit.
     private(set) var engine: Engine?
@@ -60,6 +62,9 @@ final class AppModel {
     @ObservationIgnored private var rangeWatch = RangeWatch()
     /// `watch_ranges` calls in the order made.
     @ObservationIgnored private let watchQueue = DispatchQueue(label: "app.dhow.watch-ranges")
+    /// Per-download settings in the order made (`inOrder`).
+    @ObservationIgnored private let commandQueue = DispatchQueue(
+        label: "app.dhow.download-settings")
     @ObservationIgnored private var observers: [(NotificationCenter, NSObjectProtocol)] = []
     /// While the engine opens: quitting waits for it.
     @ObservationIgnored private(set) var opening: Task<Void, Never>?
@@ -276,9 +281,43 @@ final class AppModel {
     }
 
     func setSpeedLimit(_ ids: Set<String>, _ limit: UInt64?) {
-        each(
-            Array(ids), { _ = try $0.setSpeedLimit(id: $1, limit: limit) },
+        inOrder(
+            ids.sorted(), { _ = try $0.setSpeedLimit(id: $1, limit: limit) },
             done: { [store] in store.adjust($0) { $0.speedLimit = limit } })
+    }
+
+    /// Like `each`, but one call after another, in the order asked, on one
+    /// queue: a download's settings (limit, connections) changed twice in
+    /// quick succession end at the second.
+    private func inOrder(
+        _ ids: [String], _ op: @escaping @Sendable (Engine, String) throws -> Void,
+        done: @escaping @MainActor (String) -> Void
+    ) {
+        guard let engine, !ids.isEmpty else { return }
+        let bulk = ids.count > 1
+        commandQueue.async {
+            var succeeded: [String] = []
+            var failure: Error?
+            for id in ids {
+                do {
+                    try op(engine, id)
+                    succeeded.append(id)
+                } catch DhowError.RunningElsewhere where bulk {
+                } catch {
+                    failure = failure ?? error
+                }
+            }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    for id in succeeded {
+                        done(id)
+                    }
+                    if let failure {
+                        self.show(failure)
+                    }
+                }
+            }
+        }
     }
 
     // MARK: Pause All, Resume All
@@ -414,7 +453,7 @@ final class AppModel {
 
     /// `nil`: the default connections setting.
     func setConnections(_ id: String, _ connections: UInt8?) {
-        each(
+        inOrder(
             [id], { _ = try $0.setConnections(id: $1, connections: connections) },
             done: { [store] in store.adjust($0) { $0.connections = connections } })
     }

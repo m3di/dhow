@@ -3,10 +3,16 @@ import Foundation
 import Observation
 
 /// The Settings window's fields (UI-GUIDELINES §7) in the units it shows:
-/// KB/s, seconds, lists as text. Every `DhowSettings` field, plus the
-/// shell's default folder.
+/// kB/s (1000 bytes, as `Format` shows them), seconds, lists as text. Every
+/// `DhowSettings` field, plus the shell's default folder.
 struct SettingsDraft: Equatable {
     enum Proxy: Hashable { case system, direct, custom }
+
+    /// A value its setting's type can't hold (a negative count, 300 for a
+    /// byte): said at the field, never clamped into another value.
+    struct OutOfRange: Error, Equatable {
+        var key: String
+    }
 
     var defaultFolder = ""
     var limitOn = false
@@ -37,7 +43,7 @@ struct SettingsDraft: Equatable {
     init(_ s: DhowSettings, folder: String) {
         defaultFolder = folder
         limitOn = s.globalSpeedLimit != nil
-        limitKB = Int(clamping: (s.globalSpeedLimit ?? 1024 * 1024) / 1024)
+        limitKB = Int(clamping: (s.globalSpeedLimit ?? 1_000_000) / 1000)
         headroomPercent = Int(s.headroomPercent)
         globalConnections = Int(s.globalConnections)
         perHostConnections = Int(s.perHostConnections)
@@ -67,29 +73,44 @@ struct SettingsDraft: Equatable {
         }
     }
 
-    /// What differs from `s`, as one patch; values are passed as typed (in
-    /// range of their type), and the core says whether they are valid.
-    func patch(over s: DhowSettings) -> SettingsPatch {
+    /// What differs from `s`, as one patch; the core says whether the
+    /// values are valid. Throws for one its type can't hold.
+    func patch(over s: DhowSettings) throws(OutOfRange) -> SettingsPatch {
         var p = SettingsPatch()
         func changed<T: Equatable>(_ new: T, _ old: T) -> T? { new == old ? nil : new }
+        func fit<T: FixedWidthInteger>(_ v: Int, _ key: String) throws(OutOfRange) -> T {
+            guard let x = T(exactly: v) else { throw OutOfRange(key: key) }
+            return x
+        }
         // Compared as shown: a limit the CLI set in bytes stays unless edited.
         let shown = SettingsDraft(s, folder: "")
         if limitOn != shown.limitOn || limitKB != shown.limitKB {
-            p.globalSpeedLimit =
-                limitOn ? .rate(bytesPerSec: UInt64(clamping: limitKB) * 1024) : .unlimited
+            if limitOn {
+                let kb: UInt64 = try fit(limitKB, "global_speed_limit")
+                let (bytes, overflow) = kb.multipliedReportingOverflow(by: 1000)
+                guard !overflow else { throw OutOfRange(key: "global_speed_limit") }
+                p.globalSpeedLimit = .rate(bytesPerSec: bytes)
+            } else {
+                p.globalSpeedLimit = .unlimited
+            }
         }
-        p.headroomPercent = changed(UInt8(clamping: headroomPercent), s.headroomPercent)
-        p.globalConnections = changed(UInt32(clamping: globalConnections), s.globalConnections)
+        p.headroomPercent = changed(try fit(headroomPercent, "headroom_percent"), s.headroomPercent)
+        p.globalConnections = changed(
+            try fit(globalConnections, "global_connections"), s.globalConnections)
         p.perHostConnections = changed(
-            UInt32(clamping: perHostConnections), s.perHostConnections)
+            try fit(perHostConnections, "per_host_connections"), s.perHostConnections)
         p.minConnectionsForNew = changed(newcomerGetsConnection ? 1 : 0, s.minConnectionsForNew)
-        p.defaultConnections = changed(UInt8(clamping: defaultConnections), s.defaultConnections)
+        p.defaultConnections = changed(
+            try fit(defaultConnections, "default_connections"), s.defaultConnections)
         p.maxConnectionsPerDownload = changed(
-            UInt8(clamping: maxConnectionsPerDownload), s.maxConnectionsPerDownload)
-        p.firstByteTimeoutMs = changed(Self.ms(firstByteTimeout), s.firstByteTimeoutMs)
-        p.idleTimeoutMs = changed(Self.ms(idleTimeout), s.idleTimeoutMs)
-        p.maxRetries = changed(UInt32(clamping: maxRetries), s.maxRetries)
-        p.commitIntervalMs = changed(Self.ms(commitInterval), s.commitIntervalMs)
+            try fit(maxConnectionsPerDownload, "max_connections_per_download"),
+            s.maxConnectionsPerDownload)
+        p.firstByteTimeoutMs = changed(
+            try Self.ms(firstByteTimeout, "first_byte_timeout_ms"), s.firstByteTimeoutMs)
+        p.idleTimeoutMs = changed(try Self.ms(idleTimeout, "idle_timeout_ms"), s.idleTimeoutMs)
+        p.maxRetries = changed(try fit(maxRetries, "max_retries"), s.maxRetries)
+        p.commitIntervalMs = changed(
+            try Self.ms(commitInterval, "commit_interval_ms"), s.commitIntervalMs)
         p.probeRangeGet = changed(probeRangeGet, s.probeRangeGet)
         p.useContentDisposition = changed(useContentDisposition, s.useContentDisposition)
         p.appendTypeExtension = changed(appendTypeExtension, s.appendTypeExtension)
@@ -117,11 +138,48 @@ struct SettingsDraft: Equatable {
         }
     }
 
-    /// Seconds as whole milliseconds; below zero is 0, which the core
-    /// refuses as it would any value out of range.
-    static func ms(_ seconds: Double) -> UInt64 {
-        guard seconds.isFinite, seconds > 0 else { return 0 }
-        return UInt64(clamping: Int64((seconds * 1000).rounded()))
+    /// The fields edited since `old`, over `new`: what another process
+    /// changed meanwhile comes in, the user's edits stay.
+    func rebased(from old: SettingsDraft, to new: SettingsDraft) -> SettingsDraft {
+        var d = self
+        func follow<T: Equatable>(_ field: WritableKeyPath<SettingsDraft, T>) {
+            if d[keyPath: field] == old[keyPath: field] {
+                d[keyPath: field] = new[keyPath: field]
+            }
+        }
+        follow(\.defaultFolder)
+        follow(\.limitOn)
+        follow(\.limitKB)
+        follow(\.headroomPercent)
+        follow(\.globalConnections)
+        follow(\.perHostConnections)
+        follow(\.newcomerGetsConnection)
+        follow(\.defaultConnections)
+        follow(\.maxConnectionsPerDownload)
+        follow(\.firstByteTimeout)
+        follow(\.idleTimeout)
+        follow(\.maxRetries)
+        follow(\.commitInterval)
+        follow(\.probeRangeGet)
+        follow(\.useContentDisposition)
+        follow(\.appendTypeExtension)
+        follow(\.autoGrouping)
+        for c in DhowCore.Category.allCases {
+            follow(\.extraExtensions[c])
+        }
+        follow(\.proxy)
+        follow(\.proxyHttp)
+        follow(\.proxyHttps)
+        follow(\.proxyOther)
+        follow(\.noProxy)
+        return d
+    }
+
+    /// Seconds as milliseconds; one that isn't a time is refused here.
+    static func ms(_ seconds: Double, _ key: String) throws(OutOfRange) -> UInt64 {
+        let ms = (seconds * 1000).rounded()
+        guard seconds.isFinite, ms >= 0, ms < 0x1p63 else { throw OutOfRange(key: key) }
+        return UInt64(ms)
     }
 
     /// "mkv, webm .m4v" as ["mkv", "webm", ".m4v"]: the core normalizes.
@@ -157,46 +215,60 @@ enum SettingsTab: Hashable, CaseIterable {
 }
 
 /// The Settings window's state: the draft, what the core has, and the
-/// error of the last save. A save sends one `set_settings` patch with
-/// every change, which the core validates whole (ARCHITECTURE §3.1).
+/// error of the last save. A save sends one `set_settings` patch with the
+/// user's edits, which the core validates whole (ARCHITECTURE §3.1). The
+/// app keeps it, so edits survive closing the window, unsaved.
 @MainActor @Observable
 final class SettingsForm {
     struct Failure: Equatable {
         /// The setting it names, as the core's key; `nil`: none.
         var key: String?
         var message: String
+        /// For `extra_extensions`: the categories the refused patch changed
+        /// (the core names the setting, not the category).
+        var categories: Set<DhowCore.Category> = []
     }
 
     var draft = SettingsDraft()
     private(set) var base: DhowSettings?
     private(set) var baseFolder = ""
+    /// `base` as the draft shows it: what edits are measured from.
+    private var origin = SettingsDraft()
     private(set) var failure: Failure?
     private(set) var saving = false
 
+    /// Something to save: the patch isn't empty (or can't be made), or the
+    /// folder changed.
     var isDirty: Bool {
         guard let base else { return false }
-        return draft != SettingsDraft(base, folder: baseFolder)
+        if draft.defaultFolder != baseFolder {
+            return true
+        }
+        guard let patch = try? draft.patch(over: base) else { return true }
+        return patch != SettingsPatch()
     }
 
-    /// What the core has now; the draft follows unless it has edits.
+    /// What the core has now. Fields the user hasn't edited follow it;
+    /// edited ones stay.
     func load(_ settings: DhowSettings, folder: String) {
-        let follow = !isDirty
+        let shown = SettingsDraft(settings, folder: folder)
+        draft = base == nil ? shown : draft.rebased(from: origin, to: shown)
+        origin = shown
         base = settings
         baseFolder = folder
-        if follow {
-            draft = SettingsDraft(settings, folder: folder)
-        }
     }
 
     func revert() {
         failure = nil
-        if let base {
-            draft = SettingsDraft(base, folder: baseFolder)
-        }
+        draft = origin
     }
 
     func error(for key: String) -> String? {
         failure?.key == key ? failure?.message : nil
+    }
+
+    func error(for category: DhowCore.Category) -> String? {
+        failure?.categories.contains(category) == true ? failure?.message : nil
     }
 
     /// Sends the patch; on success the folder is stored too and the draft
@@ -206,7 +278,13 @@ final class SettingsForm {
         _ send: (SettingsPatch) async throws -> DhowSettings?, folder store: (String) -> Void
     ) async -> SettingsTab? {
         guard let base, !saving else { return nil }
-        let patch = draft.patch(over: base)
+        let patch: SettingsPatch
+        do {
+            patch = try draft.patch(over: base)
+        } catch {
+            failure = Failure(key: error.key, message: SettingsText.invalid(error.key, error))
+            return SettingsTab.of(key: error.key)
+        }
         let folder = draft.defaultFolder
         saving = true
         defer { saving = false }
@@ -221,11 +299,15 @@ final class SettingsForm {
             failure = nil
             self.base = stored
             baseFolder = folder
-            draft = SettingsDraft(stored, folder: folder)
+            origin = SettingsDraft(stored, folder: folder)
+            draft = origin
             return nil
         } catch {
             let key = Self.key(of: error, patch: patch)
-            failure = Failure(key: key, message: SettingsText.invalid(key, error))
+            failure = Failure(
+                key: key, message: SettingsText.invalid(key, error),
+                categories: key == "extra_extensions"
+                    ? Set(patch.extraExtensions.map(\.category)) : [])
             return key.flatMap(SettingsTab.of)
         }
     }
@@ -245,6 +327,7 @@ final class SettingsForm {
 enum SettingsText {
     static func invalid(_ key: String?, _ error: Error) -> String {
         switch key {
+        case "global_speed_limit": tr("settings.invalid.limit")
         case "headroom_percent": tr("settings.invalid.headroom")
         case "global_connections", "per_host_connections": tr("settings.invalid.atLeastOne")
         case "min_connections_for_new": tr("settings.invalid.newcomer")

@@ -4,11 +4,13 @@ import SwiftUI
 
 /// The Settings window (UI-GUIDELINES §7, §8 macOS): toolbar tabs over one
 /// draft, saved with one `set_settings` patch. The core validates it and
-/// its refusal shows at the field it names.
+/// its refusal shows at the field it names. The draft is the app's, so
+/// closing the window keeps unsaved edits for the next time it opens.
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
-    @State private var form = SettingsForm()
     @State private var tab = SettingsTab.general
+
+    private var form: SettingsForm { model.settingsForm }
 
     var body: some View {
         Group {
@@ -87,10 +89,18 @@ private struct FieldError: View {
 
     var body: some View {
         if let message = form.error(for: key) {
-            Text(message)
-                .font(.caption)
-                .foregroundStyle(Color(nsColor: .systemRed))
+            ErrorLine(message: message)
         }
+    }
+}
+
+private struct ErrorLine: View {
+    var message: String
+
+    var body: some View {
+        Text(message)
+            .font(.caption)
+            .foregroundStyle(Color(nsColor: .systemRed))
     }
 }
 
@@ -126,7 +136,8 @@ private struct SecondsRow: View {
         LabeledContent(title) {
             HStack(spacing: 4) {
                 TextField(
-                    title, value: $value, format: .number.precision(.fractionLength(0...1))
+                    // To the millisecond the core stores, so nothing rounds.
+                    title, value: $value, format: .number.precision(.fractionLength(0...3))
                 )
                 .labelsHidden()
                 .multilineTextAlignment(.trailing)
@@ -376,8 +387,10 @@ private struct CategoriesTab: View {
                             get: { form.draft.extraExtensions[c] ?? "" },
                             set: { form.draft.extraExtensions[c] = $0 }),
                         prompt: Text(tr("settings.extensionsPrompt")))
+                    if let message = form.error(for: c) {
+                        ErrorLine(message: message)
+                    }
                 }
-                FieldError(form: form, key: "extra_extensions")
             } header: {
                 Text(tr("settings.extraExtensions"))
             } footer: {

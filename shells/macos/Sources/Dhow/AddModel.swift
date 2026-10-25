@@ -66,7 +66,7 @@ final class AddModel {
     var start = Start.queued
     /// `nil`: the settings' default (§4.1).
     var connections: Int?
-    /// KB/s; `nil`: no limit of its own.
+    /// kB/s (1000 bytes, as `Format` shows them); `nil`: no limit of its own.
     var speedLimitKB: Int?
     /// "Name: value" per line.
     var headers = ""
@@ -194,7 +194,7 @@ final class AddModel {
             url: item.url, headers: headerList ?? [], directory: directory.path,
             filename: item.filename.flatMap { $0.isEmpty ? nil : $0 }, start: start.mode,
             connections: connections.map { UInt8(clamping: $0) }, queue: queue,
-            speedLimit: speedLimitKB.map { UInt64($0) * 1024 }, targetFs: targetFs,
+            speedLimit: speedLimitKB.map { UInt64($0) * 1000 }, targetFs: targetFs,
             blind: item.failure != nil)
     }
 
