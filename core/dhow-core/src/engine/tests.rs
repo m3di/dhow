@@ -263,7 +263,7 @@ async fn pause_and_cancel_when_not_running() {
     // Leave partial files behind, then cancel with deletion.
     std::fs::write(&a.part_path, b"x").unwrap();
     std::fs::write(a.sidecar_path(), b"y").unwrap();
-    let c = fx.engine.cancel(&a.id, true, &|_| {}).unwrap();
+    let c = fx.engine.cancel(&a.id, true, &|_| {}).await.unwrap();
     assert_eq!(c.state, State::Cancelled);
     assert!(fx.files().is_empty());
     // Running a cancelled download does nothing.
@@ -1449,7 +1449,7 @@ mod group_tests {
         let mut req = fx.request(&server, "/blob/5000");
         req.filename = Some("Set.03.bin".into());
         let a3 = fx.engine.add(req, &|_| {}).await.unwrap();
-        fx.engine.cancel(&a3.id, false, &|_| {}).unwrap();
+        fx.engine.cancel(&a3.id, false, &|_| {}).await.unwrap();
         let snap = fx.engine.group(&g).unwrap();
         assert_eq!(snap.members.len(), 3);
         assert_eq!((snap.downloaded, snap.total), (0, Some(2000)));
@@ -1808,5 +1808,198 @@ mod token_tests {
         let snap = fx.engine.get(&done.id, &on_event).unwrap();
         assert_eq!(snap.final_path, done.final_path);
         assert!(fx.taken().is_empty());
+    }
+}
+
+/// A run dropped while its file work is half done: a rerun (or a cancel)
+/// waits for that work instead of interleaving with it (download::hold).
+mod hold_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+    use crate::download::hold::park::{self, Armed};
+
+    async fn added(fx: &Fx, server: &TestServer, path: &str) -> DownloadId {
+        fx.engine
+            .add(fx.request(server, path), &|_| {})
+            .await
+            .unwrap()
+            .id
+    }
+
+    /// Runs `id` until its blocking work parks at `point`, then drops the
+    /// run, leaving that work parked. `"commit"` (the writer's final
+    /// commit) is only reached once the run is dropped: it is dropped as
+    /// soon as bytes flow.
+    async fn orphan_at(fx: &Fx, id: &str, point: &'static str) -> Armed {
+        let snap = fx.engine.stored(id).unwrap();
+        // The writer knows its files by the sidecar.
+        let key = match point {
+            "commit" => snap.sidecar_path(),
+            _ => snap.part_path,
+        };
+        let armed = park::arm(point, &key);
+        let p = armed.park();
+        let reached = tokio::task::spawn_blocking(move || p.wait_reached());
+        let (tx, mut flowing) = watch::channel(false);
+        let on_event = move |e: EngineEvent| {
+            if matches!(e, EngineEvent::Progress { downloaded, .. } if downloaded > 0) {
+                tx.send_replace(true);
+            }
+        };
+        let (_keep, stop) = watch::channel(false);
+        let drop_on_flow = async {
+            if point == "commit" {
+                flowing.wait_for(|f| *f).await.unwrap();
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            r = fx.engine.run(id, &on_event, &stop) => panic!("finished before parking: {r:?}"),
+            _ = drop_on_flow => {}
+            r = reached => r.unwrap(),
+        }
+        if point == "commit" {
+            let p = armed.park();
+            let reached = tokio::task::spawn_blocking(move || p.wait_reached());
+            tokio::time::timeout(Duration::from_secs(10), reached)
+                .await
+                .expect("the writer parked")
+                .unwrap();
+        }
+        armed
+    }
+
+    /// Runs `fut` while the orphan stays parked for 300 ms, then releases
+    /// it. Nothing may have happened before the release.
+    async fn after_release<T>(
+        armed: &Armed,
+        started: &AtomicBool,
+        fut: impl std::future::Future<Output = T>,
+    ) -> T {
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let early = started.load(Ordering::SeqCst);
+            armed.release();
+            early
+        };
+        let (out, early) = tokio::join!(fut, release);
+        assert!(!early, "went ahead while the orphan held the files");
+        out
+    }
+
+    fn noting(started: &AtomicBool) -> impl Fn(EngineEvent) + Send + Sync + '_ {
+        move |e: EngineEvent| {
+            if matches!(e, EngineEvent::StateChanged { .. }) {
+                started.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    async fn rerun(fx: &Fx, id: &str, armed: &Armed) -> Snapshot {
+        let started = AtomicBool::new(false);
+        let on_event = noting(&started);
+        let (_keep, stop) = watch::channel(false);
+        let run = fx.engine.run(id, &on_event, &stop);
+        after_release(armed, &started, run).await.unwrap()
+    }
+
+    fn assert_done(fx: &Fx, done: &Snapshot) {
+        assert_eq!(done.state, State::Completed);
+        assert_eq!(
+            blake3::hash(&std::fs::read(&done.final_path).unwrap()),
+            blob::digest(0, 1_000_000)
+        );
+        // One file: no second copy under a de-duplicated name, no leftovers.
+        let name = done.final_path.file_name().unwrap().to_string_lossy();
+        assert_eq!(fx.files(), [name.into_owned()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rerun_waits_for_a_dropped_runs_prepare() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let id = added(&fx, &server, "/blob/1000000").await;
+        let armed = orphan_at(&fx, &id, "prepare").await;
+        let done = rerun(&fx, &id, &armed).await;
+        assert_done(&fx, &done);
+    }
+
+    /// The orphan's writer was making its final commit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rerun_waits_for_a_dropped_runs_writer() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let id = added(&fx, &server, "/blob/1000000?throttle=1000000").await;
+        let armed = orphan_at(&fx, &id, "commit").await;
+        let done = rerun(&fx, &id, &armed).await;
+        assert_done(&fx, &done);
+    }
+
+    /// The orphan was finalizing (digest check, rename): the rerun finds
+    /// its rename done and only records it, rather than downloading again
+    /// to a de-duplicated name.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rerun_waits_for_a_dropped_runs_finalize() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let id = added(&fx, &server, "/blob/1000000").await;
+        let armed = orphan_at(&fx, &id, "finalize").await;
+        assert_eq!(fx.engine.stored(&id).unwrap().state, State::Completing);
+        let done = rerun(&fx, &id, &armed).await;
+        assert_done(&fx, &done);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_waiting_rerun_can_be_paused() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let id = added(&fx, &server, "/blob/1000000").await;
+        let _armed = orphan_at(&fx, &id, "prepare").await;
+        let (tx, stop) = watch::channel(false);
+        let run = fx.engine.run(&id, &|_| {}, &stop);
+        let pause = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            tx.send_replace(true);
+        };
+        let joined = async { tokio::join!(run, pause) };
+        let (snap, ()) = tokio::time::timeout(Duration::from_secs(10), joined)
+            .await
+            .expect("paused while waiting");
+        assert_eq!(snap.unwrap().state, State::Paused);
+    }
+
+    /// A cancel deleting the partial files waits too, or the orphan would
+    /// create them again behind it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_waits_for_a_dropped_runs_prepare() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let id = added(&fx, &server, "/blob/1000000").await;
+        let armed = orphan_at(&fx, &id, "prepare").await;
+        let started = AtomicBool::new(false);
+        let on_event = noting(&started);
+        let cancel = fx.engine.cancel(&id, true, &on_event);
+        let snap = after_release(&armed, &started, cancel).await.unwrap();
+        assert_eq!(snap.state, State::Cancelled);
+        // Whatever the orphan does, it has done by now.
+        drop(PartHold::acquire(&snap.part_path).await);
+        assert!(fx.files().is_empty(), "{:?}", fx.files());
+    }
+
+    /// Cancelling one whose orphaned finalize renames it: it is complete,
+    /// not a complete file under a cancelled download.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_after_a_dropped_runs_rename_completes_it() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let id = added(&fx, &server, "/blob/1000000").await;
+        let armed = orphan_at(&fx, &id, "finalize").await;
+        let started = AtomicBool::new(false);
+        let on_event = noting(&started);
+        let cancel = fx.engine.cancel(&id, true, &on_event);
+        let snap = after_release(&armed, &started, cancel).await.unwrap();
+        assert_done(&fx, &snap);
     }
 }

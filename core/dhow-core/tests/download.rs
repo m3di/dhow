@@ -58,6 +58,7 @@ impl Env {
             connections: None,
             started_at: None,
             limits: vec![],
+            hold: None,
         };
         Self { _dir: dir, req }
     }

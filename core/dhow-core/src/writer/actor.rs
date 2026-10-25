@@ -16,6 +16,7 @@ use flume::RecvTimeoutError;
 use tokio::sync::oneshot;
 
 use super::{ChunkId, Writer, WriterError};
+use crate::download::hold::PartHold;
 use crate::rangeset::RangeSet;
 
 /// Messages in flight; at 64 KiB reads, ~4 MiB of buffered data at most.
@@ -145,11 +146,34 @@ pub fn spawn(
     WriterHandle,
     oneshot::Receiver<Result<Outcome, WriterError>>,
 )> {
+    start(writer, None)
+}
+
+/// [`spawn`], keeping `hold` until the thread has made its last commit.
+pub fn spawn_holding(
+    writer: Writer,
+    hold: PartHold,
+) -> io::Result<(
+    WriterHandle,
+    oneshot::Receiver<Result<Outcome, WriterError>>,
+)> {
+    start(writer, Some(hold))
+}
+
+fn start(
+    writer: Writer,
+    hold: Option<PartHold>,
+) -> io::Result<(
+    WriterHandle,
+    oneshot::Receiver<Result<Outcome, WriterError>>,
+)> {
     let (tx, rx) = flume::bounded(QUEUE);
     let (done_tx, done) = oneshot::channel();
     thread::Builder::new()
         .name("dhow-writer".into())
         .spawn(move || {
+            // Declared first, dropped last: after the writer's files.
+            let _hold = hold;
             let result = run(writer, rx);
             if let Err(e) = &result {
                 tracing::error!(error = %e, "writer stopped");
@@ -173,6 +197,8 @@ fn run(mut w: Writer, rx: flume::Receiver<Msg>) -> Result<Outcome, WriterError> 
             None => rx.recv().ok(),
         };
         let Some(msg) = msg else {
+            #[cfg(test)]
+            crate::download::hold::park::at("commit", w.sidecar());
             w.commit()?;
             return Ok(Outcome::Closed(w.committed().clone()));
         };

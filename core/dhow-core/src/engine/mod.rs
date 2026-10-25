@@ -29,6 +29,7 @@ use rusqlite::{OptionalExtension, Row, params};
 use tokio::sync::watch;
 
 use crate::complete::{self, CompleteError, Target};
+use crate::download::hold::PartHold;
 use crate::download::{
     self, DownloadConfig, DownloadError, DownloadEvent, Request, ResetReason, Shared,
 };
@@ -579,8 +580,10 @@ impl Engine {
     }
 
     /// Cancels a download that is not running; optionally deletes its
-    /// partial files (never the final file).
-    pub fn cancel(
+    /// partial files (never the final file). Waits for a dropped run's
+    /// file work first. One whose rename already happened is completed
+    /// instead (§8: the rename is the commit point).
+    pub async fn cancel(
         &self,
         id: &str,
         delete_partial: bool,
@@ -590,12 +593,48 @@ impl Engine {
         if snap.state.is_final() {
             return Ok(snap);
         }
+        let _hold = PartHold::acquire(&snap.part_path).await;
+        let snap = self.stored(id)?;
+        if snap.state.is_final() || self.recovered(&snap, on_event).await? {
+            return self.stored(id);
+        }
         self.transition(id, State::Cancelled, None, on_event)?;
         if delete_partial {
             remove_if_exists(&snap.sidecar_path())?;
             remove_if_exists(&snap.part_path)?;
         }
         self.stored(id)
+    }
+
+    /// §8: died (or was dropped) between rename and sidecar removal. The
+    /// rename was the commit point; finishes the bookkeeping. Under the
+    /// download's hold.
+    async fn recovered(
+        &self,
+        snap: &Snapshot,
+        on_event: &(dyn Fn(EngineEvent) + Send + Sync),
+    ) -> Result<bool, EngineError> {
+        if snap.state != State::Completing
+            || !complete::recover(&snap.part_path, &snap.sidecar_path(), &snap.final_path)?
+        {
+            return Ok(false);
+        }
+        let (platform, owned_id, path) = (
+            self.platform.clone(),
+            snap.id.clone(),
+            snap.final_path.clone(),
+        );
+        let token =
+            tokio::task::spawn_blocking(move || tokens::create(&*platform, &owned_id, &path))
+                .await
+                .map_err(io::Error::other)?;
+        self.store_token(&snap.id, token);
+        self.transition(&snap.id, State::Completed, None, on_event)?;
+        on_event(EngineEvent::Renamed {
+            id: snap.id.clone(),
+            path: snap.final_path.clone(),
+        });
+        Ok(true)
     }
 
     /// Runs a download in this task until it completes, fails, or `stop`
@@ -610,26 +649,20 @@ impl Engine {
         if snap.state.is_final() {
             return Ok(snap);
         }
+        // Before anything touches the files: a dropped run of this download
+        // may still be preparing, committing or finalizing them. Read again
+        // after, its finalize records the final name. Stoppable meanwhile.
+        let hold = tokio::select! {
+            biased;
+            _ = download::stopped(stop.clone()) => return self.pause(id, on_event),
+            h = PartHold::acquire(&snap.part_path) => h,
+        };
+        let snap = self.stored(id)?;
+        if snap.state.is_final() {
+            return Ok(snap);
+        }
         let (part, sidecar) = (snap.part_path.clone(), snap.sidecar_path());
-        // §8: died between rename and sidecar removal. The rename was the
-        // commit point; finish the bookkeeping.
-        if snap.state == State::Completing && complete::recover(&part, &sidecar, &snap.final_path)?
-        {
-            let (platform, owned_id, path) = (
-                self.platform.clone(),
-                id.to_owned(),
-                snap.final_path.clone(),
-            );
-            let token =
-                tokio::task::spawn_blocking(move || tokens::create(&*platform, &owned_id, &path))
-                    .await
-                    .map_err(io::Error::other)?;
-            self.store_token(id, token);
-            self.transition(id, State::Completed, None, on_event)?;
-            on_event(EngineEvent::Renamed {
-                id: id.to_owned(),
-                path: snap.final_path.clone(),
-            });
+        if self.recovered(&snap, on_event).await? {
             return self.stored(id);
         }
         // Before it is Active: a failure here leaves it as it was.
@@ -650,6 +683,7 @@ impl Engine {
             connections: self.connections(id)?,
             started_at: self.started_at(id)?,
             limits,
+            hold: Some(hold.clone()),
         };
         let progress = Mutex::new(Progress::new(snap.total_size));
         let dl_event = |e: DownloadEvent| self.on_download_event(id, e, &progress, on_event);
@@ -720,7 +754,12 @@ impl Engine {
         let digest = done.info.digest.clone();
         let owned_id = id.to_owned();
         let platform = self.platform.clone();
+        // Dropped while this runs (a digest check can take seconds), it
+        // still finishes, and a rerun waits for it.
         let finalized = tokio::task::spawn_blocking(move || {
+            let _hold = hold;
+            #[cfg(test)]
+            crate::download::hold::park::at("finalize", &part);
             let target = Target {
                 part: &part,
                 sidecar: &sidecar,

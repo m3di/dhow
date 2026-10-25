@@ -95,6 +95,11 @@ impl Journal {
         &self.committed
     }
 
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn byte_len(&self) -> u64 {
         self.len
     }
