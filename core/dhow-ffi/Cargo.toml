@@ -6,5 +6,29 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# Only `lib` here, so `cargo test` never links a static archive of the
+# whole tree; `build-swift.sh` asks for `staticlib` with `cargo rustc`.
+[lib]
+name = "dhow_ffi"
+
+# Generates the Swift/Kotlin sources from the built library (library mode).
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli"]
+
 [dependencies]
 dhow-core.workspace = true
+jiff.workspace = true
+reqwest.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uniffi.workspace = true
+
+[dev-dependencies]
+dhow-testserver.workspace = true
+tempfile.workspace = true

@@ -1,0 +1,12 @@
+[bindings.swift]
+# The SwiftPM package's module, and the C module of the static library.
+module_name = "DhowCore"
+ffi_module_name = "DhowCoreFFI"
+ffi_module_filename = "DhowCoreFFI"
+# Error messages are diagnostics: shells word errors from the case.
+omit_localized_error_conformance = true
+# `Category.allCases` and the like, for pickers.
+generate_case_iterable_conformance = true
+
+[bindings.kotlin]
+package_name = "app.dhow.core"

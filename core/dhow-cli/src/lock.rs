@@ -1,72 +1,17 @@
-//! One process runs a download at a time. The runner holds an exclusive
-//! lock on `<data>/locks/<id>.lock` containing its PID; the lock dies with
-//! the process (also on `kill -9`), so a crashed run never blocks a resume.
+//! Run locks ([`dhow_core::runlock`]) holding this process's PID, and the
+//! signals `dhow`s send each other through them.
 
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-pub struct RunLock {
-    _file: File,
-}
+use dhow_core::runlock::{self, read_pid};
+pub use dhow_core::runlock::{Held, RunLock, holder};
 
-pub enum Held {
-    By(u32),
-    Io(io::Error),
-}
-
-impl From<io::Error> for Held {
-    fn from(e: io::Error) -> Self {
-        Held::Io(e)
-    }
-}
-
-fn path(data_dir: &Path, id: &str) -> PathBuf {
-    data_dir.join("locks").join(format!("{id}.lock"))
-}
-
-fn open(data_dir: &Path, id: &str) -> io::Result<File> {
-    let p = path(data_dir, id);
-    std::fs::create_dir_all(p.parent().expect("has a parent"))?;
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(p)
-}
-
-fn read_pid(file: &mut File) -> u32 {
-    let mut s = String::new();
-    let _ = file.seek(SeekFrom::Start(0));
-    let _ = file.read_to_string(&mut s);
-    s.trim().parse().unwrap_or(0)
-}
-
+/// Takes `id`'s lock with this process's PID in it.
 pub fn acquire(data_dir: &Path, id: &str) -> Result<RunLock, Held> {
-    let mut file = open(data_dir, id)?;
-    match file.try_lock() {
-        Ok(()) => {
-            file.set_len(0)?;
-            file.seek(SeekFrom::Start(0))?;
-            write!(file, "{}", std::process::id())?;
-            file.flush()?;
-            Ok(RunLock { _file: file })
-        }
-        Err(TryLockError::WouldBlock) => Err(Held::By(read_pid(&mut file))),
-        Err(TryLockError::Error(e)) => Err(Held::Io(e)),
-    }
-}
-
-/// The PID running `id`, if any process is.
-pub fn holder(data_dir: &Path, id: &str) -> io::Result<Option<u32>> {
-    let mut file = open(data_dir, id)?;
-    match file.try_lock() {
-        Ok(()) => Ok(None),
-        Err(TryLockError::WouldBlock) => Ok(Some(read_pid(&mut file))),
-        Err(TryLockError::Error(e)) => Err(e),
-    }
+    runlock::acquire(data_dir, id, Some(std::process::id()))
 }
 
 /// Wakes the process running a download so it re-reads that download's

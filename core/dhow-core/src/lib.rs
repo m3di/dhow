@@ -11,6 +11,7 @@ pub mod naming;
 pub mod platform;
 pub mod probe;
 pub mod rangeset;
+pub mod runlock;
 pub mod schedule;
 pub mod speed;
 pub mod storage;
