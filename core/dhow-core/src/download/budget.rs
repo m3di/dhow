@@ -65,6 +65,28 @@ impl State {
         debug_assert!(self.used() <= config.global, "over the budget: {self:?}");
     }
 
+    /// A slot given up for `target`: reserved for it if its host has room
+    /// (the per-host cap stays absolute); otherwise it is simply free, and
+    /// the newcomer, no longer anyone's to serve, asks again when woken.
+    fn pay(&mut self, target: Key, config: &BudgetConfig) {
+        let Some(host) = self.entries.get(&target).map(|t| t.host.clone()) else {
+            return;
+        };
+        if self.host_used(&host) < config.per_host {
+            self.entries.get_mut(&target).expect("found above").reserved += 1;
+        }
+    }
+
+    /// `key` got its first slot, or is gone: nobody owes it one any more.
+    fn withdraw(&mut self, key: Key) {
+        for v in self.entries.values_mut() {
+            if let Some(i) = v.shed_for.iter().position(|k| *k == key) {
+                v.shed_for.remove(i);
+                v.shed -= 1;
+            }
+        }
+    }
+
     fn used(&self) -> u32 {
         self.entries.values().map(|e| e.held + e.reserved).sum()
     }
@@ -193,11 +215,15 @@ impl Ticket {
         if e.reserved > 0 {
             e.reserved -= 1;
             e.held += 1;
+            s.withdraw(key);
             return true;
         }
         if s.can_start(key, &config) {
             let e = s.entries.get_mut(&key).expect("registered");
             e.held += 1;
+            // In by the caps: a slot still owed to it would sit reserved
+            // and unused, and its giver would stop a connection for nothing.
+            s.withdraw(key);
             drop(s);
             self.budget.changed.notify_waiters();
             return true;
@@ -277,8 +303,8 @@ impl Ticket {
         } else {
             None
         };
-        if let Some(t) = target.and_then(|t| s.entries.get_mut(&t)) {
-            t.reserved += 1;
+        if let Some(t) = target {
+            s.pay(t, &config);
         }
         s.check(&config);
         drop(s);
@@ -306,20 +332,25 @@ impl Ticket {
 
 impl Drop for Ticket {
     fn drop(&mut self) {
+        let config = self.budget.config;
         let mut s = self.budget.state();
         if let Some(e) = s.entries.remove(&self.key) {
             // Slots promised away by this download, never handed over:
             // hand them over now. A release pays these first, so each
             // comes out of a slot still held.
-            debug_assert!(e.shed_for.len() as u32 <= e.held, "{e:?}");
+            if !std::thread::panicking() {
+                debug_assert!(e.shed_for.len() as u32 <= e.held, "{e:?}");
+            }
             for t in e.shed_for {
-                if let Some(t) = s.entries.get_mut(&t) {
-                    t.reserved += 1;
-                }
+                s.pay(t, &config);
             }
         }
-        // Reservations made for it are simply free again.
-        s.check(&self.budget.config);
+        // Reservations made for it are simply free again, and nobody
+        // needs to give one up for it.
+        s.withdraw(self.key);
+        if !std::thread::panicking() {
+            s.check(&config);
+        }
         drop(s);
         self.budget.changed.notify_waiters();
     }
@@ -482,6 +513,61 @@ mod tests {
         drop(g);
         assert!(n.try_first());
         assert_eq!(b.usage("").0, 3);
+    }
+
+    /// §10.1: a slot given up for a newcomer is reserved only if its host
+    /// still has room; otherwise it is free and the newcomer asks again.
+    #[test]
+    fn a_paid_slot_respects_the_newcomers_host_cap() {
+        let b = budget(4, 2);
+        let b1 = ticket(&b, 1, "b:80", 4);
+        let g = ticket(&b, 2, "a:80", 4);
+        let c = ticket(&b, 3, "c:80", 4);
+        assert!(b1.try_first());
+        b1.stop_wanting();
+        assert!(g.try_first() && g.try_grow() && c.try_first());
+        let n = ticket(&b, 4, "b:80", 4);
+        assert!(!n.try_first());
+        assert_eq!(g.shed_requested(), 1);
+        c.release();
+        assert!(b1.try_grow(), "b:80 at its cap");
+        g.release();
+        assert!(!n.try_first(), "b:80 is full");
+        assert_eq!(b.usage("b:80"), (3, 2));
+        b1.release();
+        assert!(n.try_first());
+        assert_eq!(b.usage("b:80").1, 2);
+    }
+
+    /// A newcomer let in by the caps withdraws its request: its giver keeps
+    /// its connection, and no reservation sits unused.
+    #[test]
+    fn a_newcomer_that_gets_in_withdraws_its_request() {
+        let b = budget(3, 4);
+        let g = ticket(&b, 1, "g:80", 4);
+        let c = ticket(&b, 2, "c:80", 4);
+        assert!(g.try_first() && g.try_grow() && c.try_first());
+        let n = ticket(&b, 3, "n:80", 4);
+        assert!(!n.try_first());
+        assert_eq!(g.shed_requested(), 1);
+        c.release();
+        assert!(n.try_first());
+        assert_eq!(g.shed_requested(), 0, "nothing to give up any more");
+        g.release();
+        let m = ticket(&b, 4, "m:80", 4);
+        assert!(m.try_first(), "the freed slot is free: {:?}", b.usage(""));
+    }
+
+    #[test]
+    fn a_newcomer_that_goes_away_withdraws_its_request() {
+        let b = budget(2, 4);
+        let a = ticket(&b, 1, "a:80", 4);
+        assert!(a.try_first() && a.try_grow());
+        let n = ticket(&b, 2, "n:80", 4);
+        assert!(!n.try_first());
+        assert_eq!(a.shed_requested(), 1);
+        drop(n);
+        assert_eq!(a.shed_requested(), 0);
     }
 
     #[tokio::test]
