@@ -10,12 +10,10 @@ use super::{Engine, EngineError};
 use crate::http::{self, Lease, Route};
 use crate::platform::{AdapterError, ProxyConfig, ProxyMode};
 
-const PROXY_KEY: &str = "proxy_mode";
-
 /// `proxy_mode` as stored; URLs as strings (`url` has no serde here).
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Stored {
+pub(super) enum Stored {
     System,
     None,
     Custom {
@@ -26,39 +24,12 @@ enum Stored {
     },
 }
 
-impl Engine {
-    /// `System` unless set otherwise.
-    pub fn proxy_mode(&self) -> Result<ProxyMode, EngineError> {
-        let parse = |u: Option<String>| u.map(|u| Url::parse(&u)).transpose();
-        Ok(match self.setting(PROXY_KEY)? {
-            None | Some(Stored::System) => ProxyMode::System,
-            Some(Stored::None) => ProxyMode::None,
-            Some(Stored::Custom {
-                http,
-                https,
-                all,
-                no_proxy,
-            }) => match (parse(http), parse(https), parse(all)) {
-                (Ok(http), Ok(https), Ok(all)) => ProxyMode::Custom(Box::new(ProxyConfig {
-                    http,
-                    https,
-                    all,
-                    no_proxy,
-                    pac: None,
-                })),
-                _ => {
-                    tracing::warn!(key = PROXY_KEY, "ignoring unreadable setting");
-                    ProxyMode::System
-                }
-            },
-        })
-    }
-
+impl Stored {
     /// A `Custom` mode needs at least one `http://`, `https://`,
     /// `socks5://` or `socks5h://` proxy and no PAC script (the core
     /// doesn't run PAC).
-    pub fn set_proxy_mode(&self, mode: ProxyMode) -> Result<ProxyMode, EngineError> {
-        let stored = match &mode {
+    pub(super) fn new(mode: &ProxyMode) -> Result<Self, EngineError> {
+        Ok(match mode {
             ProxyMode::System => Stored::System,
             ProxyMode::None => Stored::None,
             ProxyMode::Custom(c) => {
@@ -85,18 +56,39 @@ impl Engine {
                     no_proxy: c.no_proxy.clone(),
                 }
             }
-        };
-        self.put_setting(PROXY_KEY, &stored)?;
-        self.proxy_mode()
+        })
     }
 
+    /// `None`: an unreadable URL.
+    pub(super) fn mode(self) -> Option<ProxyMode> {
+        let parse = |u: Option<String>| u.map(|u| Url::parse(&u)).transpose().ok();
+        Some(match self {
+            Stored::System => ProxyMode::System,
+            Stored::None => ProxyMode::None,
+            Stored::Custom {
+                http,
+                https,
+                all,
+                no_proxy,
+            } => ProxyMode::Custom(Box::new(ProxyConfig {
+                http: parse(http)?,
+                https: parse(https)?,
+                all: parse(all)?,
+                no_proxy,
+                pac: None,
+            })),
+        })
+    }
+}
+
+impl Engine {
     /// The proxy the HTTP client uses now, or would for the next request
     /// when none is built (`system`: the adapter's current view).
     pub(super) fn proxy_in_use(&self, system: Option<&ProxyConfig>) -> ProxyMode {
         if let Some(mode) = self.client.in_use() {
             return mode;
         }
-        let mode = self.proxy_mode().unwrap_or(ProxyMode::System);
+        let mode = self.settings().map_or(ProxyMode::System, |s| s.proxy_mode);
         Route::new(&mode, Some(Ok(system.cloned().unwrap_or_default()))).in_use
     }
 
@@ -106,7 +98,7 @@ impl Engine {
     /// client for the leases from then on. When the adapter fails, the
     /// last answer it gave stands: an unknown proxy is not a direct one.
     pub(super) async fn lease(&self, url: &Url) -> Result<Lease<'_>, EngineError> {
-        let mode = self.proxy_mode()?;
+        let mode = self.settings()?.proxy_mode;
         let system = match mode {
             ProxyMode::System => {
                 let (platform, url) = (self.platform.clone(), url.clone());

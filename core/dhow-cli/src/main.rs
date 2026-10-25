@@ -10,6 +10,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use dhow_core::download::DownloadConfig;
 use dhow_core::engine::queues::{OnComplete, QueueSpec};
+use dhow_core::engine::settings::{CategoryExtensions, LimitPatch, SettingsPatch};
 use dhow_core::engine::{AddRequest, Engine, EngineError, EngineEvent, Snapshot, State};
 use dhow_core::http::{Header, Url};
 use dhow_core::logging;
@@ -37,10 +38,6 @@ struct Cli {
     #[arg(long, env = "DHOW_DATA_DIR", global = true)]
     data_dir: Option<PathBuf>,
 
-    /// Consecutive failed attempts per connection before giving up
-    #[arg(long, env = "DHOW_MAX_RETRIES", global = true, default_value_t = 10)]
-    max_retries: u32,
-
     /// First retry delay in milliseconds (doubles each time, capped at 60 s)
     #[arg(
         long,
@@ -50,14 +47,15 @@ struct Cli {
     )]
     retry_base_ms: u64,
 
-    /// Longest time received bytes stay uncommitted, in milliseconds
+    /// Commit interval in milliseconds while the `commit_interval_ms`
+    /// setting isn't stored (see `dhow settings`)
     #[arg(
         long,
         env = "DHOW_COMMIT_INTERVAL_MS",
         global = true,
         default_value_t = 2000
     )]
-    commit_interval_ms: u64,
+    default_commit_interval_ms: u64,
 
     /// Ramp-up measurement window in milliseconds (ENGINE-SPEC §4.4)
     #[arg(
@@ -101,7 +99,8 @@ enum Command {
         /// Add it paused
         #[arg(long)]
         paused: bool,
-        /// Connections for this download [default: 8]
+        /// Connections for this download [default: the `default_connections`
+        /// setting, 8]
         #[arg(short = 'c', long)]
         connections: Option<u8>,
         /// Queue (name or id) [default: the default queue]
@@ -154,8 +153,8 @@ enum Command {
     /// Completed downloads by category: bytes and files still on disk,
     /// ids of those whose file is gone
     Storage,
-    /// Show or change the global speed limit, headroom, extra category
-    /// extensions and proxy
+    /// Show or change settings; all given at once apply together or not at
+    /// all. Prints every setting
     Settings {
         /// Limit for all downloads together (see `dhow limit`)
         #[arg(long)]
@@ -164,6 +163,49 @@ enum Command {
         /// on the link (0–99)
         #[arg(long)]
         headroom: Option<u8>,
+        /// Connections of all downloads together (applies to runners
+        /// started from then on)
+        #[arg(long)]
+        global_connections: Option<u32>,
+        /// Connections per server (`host:port`), same as above
+        #[arg(long)]
+        per_host_connections: Option<u32>,
+        /// 1: a new download gets a connection from another one when none
+        /// is free; 0: it waits (same as above)
+        #[arg(long)]
+        min_connections_for_new: Option<u32>,
+        /// Connections of a download added without `-c`
+        #[arg(long)]
+        default_connections: Option<u8>,
+        /// Most connections any download uses, `-c` included
+        #[arg(long)]
+        max_connections_per_download: Option<u8>,
+        /// From sending a request to its response headers, before the
+        /// attempt counts as failed
+        #[arg(long, value_name = "MS")]
+        first_byte_timeout_ms: Option<u64>,
+        /// Longest silence while reading a body, same as above
+        #[arg(long, value_name = "MS")]
+        idle_timeout_ms: Option<u64>,
+        /// Consecutive failed attempts per connection before giving up
+        #[arg(long)]
+        max_retries: Option<u32>,
+        /// Longest time received bytes stay uncommitted
+        #[arg(long, value_name = "MS")]
+        commit_interval_ms: Option<u64>,
+        /// Probe with a one-byte `GET` when `HEAD` doesn't tell size and
+        /// resumability (`false` for links that count every `GET`)
+        #[arg(long, value_name = "true|false")]
+        probe_range_get: Option<bool>,
+        /// Name files from the server's `Content-Disposition`
+        #[arg(long, value_name = "true|false")]
+        use_content_disposition: Option<bool>,
+        /// Give a name without an extension the one its `Content-Type` has
+        #[arg(long, value_name = "true|false")]
+        append_type_extension: Option<bool>,
+        /// Put related downloads in groups when they are added
+        #[arg(long, value_name = "true|false")]
+        auto_grouping: Option<bool>,
         /// `CATEGORY=ext,ext`: extensions to put in a category, replacing
         /// its earlier extras (`CATEGORY=` clears them); repeatable
         #[arg(long = "extensions", value_name = "CATEGORY=EXTS")]
@@ -272,9 +314,8 @@ fn main() -> ExitCode {
         Err(e) => return fail(&e),
     };
     let mut config = DownloadConfig::default();
-    config.transfer.retry.max_failures = cli.max_retries.max(1);
     config.transfer.retry.base = Duration::from_millis(cli.retry_base_ms);
-    config.writer.commit_interval = Duration::from_millis(cli.commit_interval_ms.max(1));
+    config.writer.commit_interval = Duration::from_millis(cli.default_commit_interval_ms.max(1));
     config.ramp.window = Duration::from_millis(cli.ramp_window_ms.max(1));
     config.ramp.min_chunk = cli.min_chunk_kib.max(1) * 1024;
     match runtime.block_on(run(command, &cli.data_dir, config)) {
@@ -547,35 +588,53 @@ async fn run(
         Command::Settings {
             global_limit,
             headroom,
+            global_connections,
+            per_host_connections,
+            min_connections_for_new,
+            default_connections,
+            max_connections_per_download,
+            first_byte_timeout_ms,
+            idle_timeout_ms,
+            max_retries,
+            commit_interval_ms,
+            probe_range_get,
+            use_content_disposition,
+            append_type_extension,
+            auto_grouping,
             extensions,
             proxy,
         } => {
-            // All parsed before any is applied.
-            let global_limit = global_limit.map(|v| parse_rate(&v)).transpose()?;
-            let proxy = proxy.map(|v| parse_proxy(&v)).transpose()?;
-            let extensions = extensions
-                .iter()
-                .map(|v| parse_extensions(v))
-                .collect::<Res<Vec<_>>>()?;
-            // First: the core may still reject it.
-            if let Some(mode) = proxy {
-                engine.set_proxy_mode(mode)?;
+            let patch = SettingsPatch {
+                global_speed_limit: global_limit
+                    .map(|v| parse_rate(&v).map(LimitPatch::from_rate))
+                    .transpose()?,
+                headroom_percent: headroom,
+                global_connections,
+                per_host_connections,
+                min_connections_for_new,
+                default_connections,
+                max_connections_per_download,
+                first_byte_timeout_ms,
+                idle_timeout_ms,
+                max_retries,
+                commit_interval_ms,
+                probe_range_get,
+                use_content_disposition,
+                append_type_extension,
+                auto_grouping,
+                extra_extensions: extensions
+                    .iter()
+                    .map(|v| parse_extensions(v))
+                    .collect::<Res<_>>()?,
+                proxy_mode: proxy.map(|v| parse_proxy(&v)).transpose()?,
+            };
+            let changed = patch != SettingsPatch::default();
+            // Printed once, below, not also as an event. `Ok` means stored.
+            let settings = engine.set_settings(patch, &|_| {})?;
+            output::emit(output::settings("settings", &settings));
+            if changed {
+                lock::poke_runners(&data_dir);
             }
-            for (category, exts) in extensions {
-                engine.set_extra_extensions(category, &exts)?;
-            }
-            if let Some(rate) = global_limit {
-                engine.set_global_limit(rate)?;
-            }
-            if let Some(p) = headroom {
-                engine.set_headroom(p)?;
-            }
-            output::emit(output::settings(
-                &engine.limit_settings()?,
-                &engine.extra_extensions()?,
-                &engine.proxy_mode()?,
-            ));
-            lock::poke_runners(&data_dir);
             Ok(ExitCode::SUCCESS)
         }
         Command::Reorder { id, before } => {
@@ -638,8 +697,8 @@ fn parse_rate(v: &str) -> Res<Option<u64>> {
     Ok(Some((n * unit as f64).round() as u64))
 }
 
-/// `video=mkv,webm` → `(Video, ["mkv", "webm"])`; `video=` clears.
-fn parse_extensions(v: &str) -> Res<(Category, Vec<String>)> {
+/// `video=mkv,webm`: `Video` gets `mkv` and `webm`; `video=` clears.
+fn parse_extensions(v: &str) -> Res<CategoryExtensions> {
     let (category, exts) = v
         .split_once('=')
         .ok_or_else(|| format!("{v:?}: expected CATEGORY=ext,ext"))?;
@@ -651,7 +710,10 @@ fn parse_extensions(v: &str) -> Res<(Category, Vec<String>)> {
         .filter(|e| !e.is_empty())
         .map(|e| normalize_extension(e).ok_or_else(|| format!("{e:?} is not a file extension")))
         .collect::<Result<_, _>>()?;
-    Ok((category, exts))
+    Ok(CategoryExtensions {
+        category,
+        extensions: exts,
+    })
 }
 
 fn parse_action(v: &str) -> Res<Action> {

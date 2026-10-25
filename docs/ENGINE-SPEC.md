@@ -4,6 +4,8 @@
 
 Keywords MUST / MUST NOT / SHOULD / MAY as in RFC 2119.
 
+`settings.x` names a setting. These are **user settings**, stored and patched through `SetSettings` (ARCHITECTURE §3.1, §5.1), with their keys: `global_speed_limit`, `headroom_percent`, `global_connections`, `per_host_connections`, `min_connections_for_new`, `default_connections`, `max_connections_per_download`, `first_byte_timeout_ms` and `idle_timeout_ms` (§7), `max_retries`, `commit_interval_ms` (`settings.commit_interval`), `probe_range_get`, `use_content_disposition` and `append_type_extension` (§3), `auto_grouping` (§13.2), `extra_extensions` (§13.1), `proxy_mode`. Any other `settings.x` (`min_chunk_size`, `min_steal_gain`, `rampup_window`, `rampup_min_gain`, `saturation_ttl`) is engine configuration (`DownloadConfig`), fixed for an engine's life, with the default given here.
+
 ---
 
 ## 1. Terms
@@ -69,6 +71,8 @@ Compute `suggested_name` in this order; stop at the first candidate that is non-
 3. Last non-empty path segment of `effective_url`, percent-decoded (a stray `%` is literal; bytes that aren't UTF-8 are read as ISO-8859-1).
 4. Last non-empty path segment of the original URL, percent-decoded.
 5. `hostname` + `-download`.
+
+With `settings.use_content_disposition` off (default on), steps 1–2 are skipped; with `settings.append_type_extension` off (default on), no extension is appended from `Content-Type` below.
 
 Then:
 
@@ -217,7 +221,7 @@ loop:
   req = GET original_url, Range: bytes={pos}-{end-1}, If-Range: <identity>, user headers
                                          // redirects are re-followed on every request: signed
                                          // redirect targets expire mid-download
-  resp = send(req)                       // timeout: connect 15s, first byte 30s, idle 30s
+  resp = send(req)                       // timeout: connect 15s, first byte 30s, idle 30s (settings)
   validate(resp):                        // I4
     206: Content-Range is {pos}-{last}/{total} with last <= end-1
          (a server may cap a range: a shorter prefix is accepted and the rest re-requested)
@@ -283,7 +287,7 @@ The scheduler decides which downloads are `Active` and how many connections each
 
 #### 10.1 Global connection budget
 
-`settings.global_connections` (default 16). The sum of all active connections across all downloads never exceeds it. The budget belongs to one engine instance (one process); every download in it holds a ticket and asks it for each connection.
+`settings.global_connections` (default 16). The sum of all active connections across all downloads never exceeds it. The budget belongs to one engine instance (one process); every download in it holds a ticket and asks it for each connection. The budget settings (`global_connections`, `per_host_connections`, `min_connections_for_new`) are read when the engine opens; a change applies to engines opened after it.
 
 #### 10.3 Allocation rule: oldest first, newcomers ramp
 
@@ -380,7 +384,7 @@ Derived at `Add` from the file name's extension first, `Content-Type` second:
 
 Goal: `Movie.Part1.rar`, `Movie.Part2.rar`, `Movie.Part3.rar` appear as one group.
 
-Algorithm on each `Add` (and on `Renamed`):
+Algorithm on each `Add` (and on `Renamed`), unless `settings.auto_grouping` (default on) is off: then no download is grouped automatically, existing groups stay as they are, and `SetGroup` still works.
 1. Split the final name into stem and extension as §3 does (` (n)` lands in the stem). An all-digit extension (`x.7z.001`) is the sequence, not a type: the whole name is the stem and the extension is empty; a collision mark §3 put before it (`x.7z (2).001`) is dropped first.
 2. Normalize the stem: replace `[._\-\s]+` with a single space and trim; then strip, in this order and each at most once, at the end: a collision or index mark `\(\d{1,3}\)` or `\[\d{1,3}\]` (four digits are a year: `Film (1999)` and `Film (2021)` stay apart); `of \d+`; a sequence token, which is 1–4 digits, together with the word right before them if that word is one of `part pt cd disc disk vol episode ep e` or `s\d+e` (so `s01e02`, `CD 2`, `Part3`, but `deep 3` keeps `deep`). Words match case-insensitively and only whole words (after a space or at the start). Five or more digits are not a sequence number (dates, ids). Trim again.
 3. Key = normalized stem, lowercased, **plus extension**, lowercased (parts of one subject share an extension; `foo.mp4` and `foo.srt` are related but not a group).

@@ -82,7 +82,7 @@ impl Engine {
         // from the `Content-Type`.
         let category = match path.file_name() {
             Some(name) if Some(name) != snap.final_path.file_name() => {
-                naming::categorize_name(&name.to_string_lossy(), &self.extra_extensions()?)
+                naming::categorize_name(&name.to_string_lossy(), &self.settings()?.extra_extensions)
                     .unwrap_or(snap.category)
             }
             _ => snap.category,
@@ -105,10 +105,14 @@ impl Engine {
                 id: id.clone(),
                 path,
             });
-            // Grouping takes the lock itself.
-            let grouped = self
-                .auto_group(id)
-                .and_then(|changed| self.announce_groups(&changed, on_event));
+            // Grouping takes the lock itself; off, groups stay as they are.
+            let grouped = self.settings().and_then(|s| {
+                if !s.auto_grouping {
+                    return Ok(());
+                }
+                self.auto_group(id)
+                    .and_then(|changed| self.announce_groups(&changed, on_event))
+            });
             if let Err(e) = grouped {
                 tracing::warn!(id, error = %e, "could not regroup a moved download");
             }

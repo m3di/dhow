@@ -117,6 +117,8 @@ Groups (same order everywhere):
 8. **Advanced**: logging level, show segment map by default, open logs folder, reset engine (with confirmation).
 9. **About**: version, license (GPL-3.0), credits, link to repo.
 
+Items the core owns are `Settings` fields, changed with one `SetSettings` patch (ARCHITECTURE §3.1, §5.1): connections, timeouts and retries, speed limit and headroom, commit interval, proxy mode, auto-grouping, naming toggles, extra extensions. General, Notifications and Advanced items (default folder, ask where to save, launch at login, sounds, log level, segment map, …) are shell-owned settings, stored by the shell, unless ARCHITECTURE §5.1 lists them.
+
 ## 8. Per-platform specifics
 
 ### macOS

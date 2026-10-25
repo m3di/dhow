@@ -835,33 +835,38 @@ mod schedule_tests {
 
 mod limit_tests {
     use super::*;
-    use crate::engine::limits::LimitSettings;
     use crate::engine::queues::QueueSpec;
+    use crate::engine::settings::{LimitPatch, SettingsPatch};
 
     #[tokio::test(flavor = "multi_thread")]
     async fn limits_are_stored() {
         let server = TestServer::start().unwrap();
         let fx = Fx::new();
+        let set = |patch| fx.engine.set_settings(patch, &|_| {});
+        let s = set(SettingsPatch {
+            global_speed_limit: Some(LimitPatch::Rate(1_000_000)),
+            headroom_percent: Some(20),
+            ..SettingsPatch::default()
+        })
+        .unwrap();
         assert_eq!(
-            fx.engine.limit_settings().unwrap(),
-            LimitSettings::default()
-        );
-        fx.engine.set_global_limit(Some(1_000_000)).unwrap();
-        let s = fx.engine.set_headroom(20).unwrap();
-        assert_eq!(
-            s,
-            LimitSettings {
-                global: Some(1_000_000),
-                headroom_percent: 20
-            }
+            (s.global_speed_limit, s.headroom_percent),
+            (Some(1_000_000), 20)
         );
         assert!(matches!(
-            fx.engine.set_headroom(100),
+            set(SettingsPatch {
+                headroom_percent: Some(100),
+                ..SettingsPatch::default()
+            }),
             Err(EngineError::InvalidSetting(_))
         ));
         assert_eq!(fx.engine.shared.global.rate(), Some(1_000_000));
-        fx.engine.set_global_limit(None).unwrap();
-        assert_eq!(fx.engine.limit_settings().unwrap().global, None);
+        set(SettingsPatch {
+            global_speed_limit: Some(LimitPatch::Unlimited),
+            ..SettingsPatch::default()
+        })
+        .unwrap();
+        assert_eq!(fx.engine.settings().unwrap().global_speed_limit, None);
         assert_eq!(fx.engine.shared.global.rate(), None);
 
         let mut req = fx.request(&server, "/blob/10");
@@ -1041,6 +1046,23 @@ mod speed_tests {
 mod category_tests {
     use super::*;
     use crate::engine::categories::CategoryUsage;
+    use crate::engine::settings::{CategoryExtensions, SettingsPatch};
+    use crate::naming::ExtraExtensions;
+
+    fn set_extras(
+        fx: &Fx,
+        category: Category,
+        extensions: &[&str],
+    ) -> Result<ExtraExtensions, EngineError> {
+        let patch = SettingsPatch {
+            extra_extensions: vec![CategoryExtensions {
+                category,
+                extensions: extensions.iter().map(|e| e.to_string()).collect(),
+            }],
+            ..SettingsPatch::default()
+        };
+        Ok(fx.engine.set_settings(patch, &|_| {})?.extra_extensions)
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn category_from_name_then_type_with_user_extras() {
@@ -1067,10 +1089,7 @@ mod category_tests {
         let unknown = add("/blob/10".into(), Some("thing.qqq"));
         assert_eq!(unknown.await.unwrap().category, Category::Other);
 
-        let extra = fx
-            .engine
-            .set_extra_extensions(Category::Data, &[".QQQ".into(), "mkv".into()])
-            .unwrap();
+        let extra = set_extras(&fx, Category::Data, &[".QQQ", "mkv"]).unwrap();
         assert_eq!(extra[&Category::Data], ["mkv", "qqq"]);
         let qqq = add("/blob/10".into(), Some("thing2.qqq"));
         assert_eq!(qqq.await.unwrap().category, Category::Data);
@@ -1083,24 +1102,18 @@ mod category_tests {
         );
 
         // Moving an extension takes it out of its old category.
-        let extra = fx
-            .engine
-            .set_extra_extensions(Category::Code, &["qqq".into()])
-            .unwrap();
+        let extra = set_extras(&fx, Category::Code, &["qqq"]).unwrap();
         assert_eq!(extra[&Category::Data], ["mkv"]);
         assert_eq!(extra[&Category::Code], ["qqq"]);
-        let extra = fx.engine.set_extra_extensions(Category::Data, &[]).unwrap();
+        let extra = set_extras(&fx, Category::Data, &[]).unwrap();
         assert!(!extra.contains_key(&Category::Data));
-        assert_eq!(fx.engine.extra_extensions().unwrap(), extra);
+        assert_eq!(fx.engine.settings().unwrap().extra_extensions, extra);
         assert!(matches!(
-            fx.engine
-                .set_extra_extensions(Category::Video, &["a/b".into()]),
+            set_extras(&fx, Category::Video, &["a/b"]),
             Err(EngineError::InvalidSetting(_))
         ));
         // `Other` takes a built-in back out of its category.
-        fx.engine
-            .set_extra_extensions(Category::Other, &["bin".into()])
-            .unwrap();
+        set_extras(&fx, Category::Other, &["bin"]).unwrap();
         let bin = add("/blob/10".into(), Some("firmware.bin"));
         assert_eq!(bin.await.unwrap().category, Category::Other);
     }
@@ -1111,9 +1124,7 @@ mod category_tests {
     async fn a_name_collision_keeps_the_category() {
         let server = TestServer::start().unwrap();
         let fx = Fx::new();
-        fx.engine
-            .set_extra_extensions(Category::Data, &["safetensors".into(), "tar.lz".into()])
-            .unwrap();
+        set_extras(&fx, Category::Data, &["safetensors", "tar.lz"]).unwrap();
         for name in ["model.safetensors", "src.tar.lz"] {
             let path = format!("/blob/10?{}", disposition(name));
             let first = fx

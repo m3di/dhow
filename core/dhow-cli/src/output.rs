@@ -4,11 +4,10 @@
 use dhow_core::download::ResetReason;
 use dhow_core::engine::categories::CategoryUsage;
 use dhow_core::engine::groups::GroupSnapshot;
-use dhow_core::engine::limits::LimitSettings;
 use dhow_core::engine::queues::QueueSnapshot;
+use dhow_core::engine::settings::Settings;
 use dhow_core::engine::speed::SpeedSample;
 use dhow_core::engine::{EngineEvent, Snapshot, WarningKind};
-use dhow_core::naming::ExtraExtensions;
 use dhow_core::platform::{InterfaceKind, NetworkInfo, ProxyConfig, ProxyMode, redact_proxy_url};
 use dhow_core::probe::Resumable;
 use serde_json::{Value, json};
@@ -67,6 +66,7 @@ pub fn event(e: &EngineEvent) -> Value {
         EngineEvent::GroupChanged { id, group } => json!({
             "event": "group_changed", "id": id, "group": group.as_ref().map(group_fields),
         }),
+        EngineEvent::SettingsChanged { settings: s } => settings("settings_changed", s),
     }
 }
 
@@ -123,13 +123,26 @@ pub fn sample(id: Option<&str>, s: &SpeedSample) -> Value {
     })
 }
 
-pub fn settings(s: &LimitSettings, extra: &ExtraExtensions, proxy: &ProxyMode) -> Value {
+pub fn settings(event: &str, s: &Settings) -> Value {
     json!({
-        "event": "settings",
-        "global_speed_limit": s.global,
+        "event": event,
+        "global_speed_limit": s.global_speed_limit,
         "headroom_percent": s.headroom_percent,
-        "extra_extensions": extra,
-        "proxy": proxy_mode(proxy),
+        "global_connections": s.global_connections,
+        "per_host_connections": s.per_host_connections,
+        "min_connections_for_new": s.min_connections_for_new,
+        "default_connections": s.default_connections,
+        "max_connections_per_download": s.max_connections_per_download,
+        "first_byte_timeout_ms": s.first_byte_timeout_ms,
+        "idle_timeout_ms": s.idle_timeout_ms,
+        "max_retries": s.max_retries,
+        "commit_interval_ms": s.commit_interval_ms,
+        "probe_range_get": s.probe_range_get,
+        "use_content_disposition": s.use_content_disposition,
+        "append_type_extension": s.append_type_extension,
+        "auto_grouping": s.auto_grouping,
+        "extra_extensions": s.extra_extensions,
+        "proxy": proxy_mode(&s.proxy_mode),
     })
 }
 

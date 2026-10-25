@@ -42,7 +42,7 @@ All shells sit on `dhow-core`, a Rust library that owns downloading, queuing, sc
 
 ## Status
 
-Pre-alpha. The engine and CLI come first; see `docs/ROADMAP.md`. Done so far (M0–M2): bulletproof single and multi-connection downloads (journal, resume, kill -9 safe), the connection budget and ramp-up, queues, schedules, speed limits, speed history. No GUI yet.
+Pre-alpha. The engine and CLI come first; see `docs/ROADMAP.md`. Done so far (M0–M3): bulletproof single and multi-connection downloads (journal, resume, kill -9 safe), the connection budget and ramp-up, queues, schedules, speed limits, speed history; categories and a storage breakdown, auto-grouping of related files, network and proxy awareness (system, direct or custom proxy), moved-file tracking hooks, and persistent settings. No GUI yet.
 
 ### Try the CLI
 
@@ -54,6 +54,15 @@ cd core && cargo build --release
 ```
 
 `add --queue` only records a download; `dhow watch` runs everything queued. `dhow queue …` manages queues and their schedules (`--window "mon-fri 22:00-06:00"`), `dhow limit <id> 500K` and `dhow settings --global-limit 2M` set speed limits, `dhow history` shows speed samples. Output is one JSON event per line.
+
+```sh
+./target/release/dhow storage                                  # completed downloads by category
+./target/release/dhow group ls                                 # auto-grouped parts, progress together
+./target/release/dhow group set <id> none                      # take one out of its group
+./target/release/dhow network                                  # interface, VPN, system proxy, proxy in use
+./target/release/dhow settings --proxy socks5h://127.0.0.1:1080 --per-host-connections 2
+./target/release/dhow settings                                 # every setting; flags apply together or not at all
+```
 
 ## Contributing
 
