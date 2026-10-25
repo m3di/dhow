@@ -23,7 +23,13 @@ fn settings_persist_across_invocations() {
             "event": "settings", "global_speed_limit": null, "headroom_percent": 0,
             "global_connections": 16, "per_host_connections": 4,
             "min_connections_for_new": 1, "default_connections": 8,
-            "probe_range_get": true, "extra_extensions": {}, "proxy": "system",
+            "max_connections_per_download": 16, "first_byte_timeout_ms": 30000,
+            "idle_timeout_ms": 30000, "max_retries": 10,
+            // The harness's DHOW_COMMIT_INTERVAL_MS, the process default.
+            "commit_interval_ms": 100,
+            "probe_range_get": true, "use_content_disposition": true,
+            "append_type_extension": true, "auto_grouping": true,
+            "extra_extensions": {}, "proxy": "system",
         })
     );
     let out = sb.dhow([
@@ -40,7 +46,23 @@ fn settings_persist_across_invocations() {
         "0",
         "--default-connections",
         "4",
+        "--max-connections-per-download",
+        "6",
+        "--first-byte-timeout-ms",
+        "5000",
+        "--idle-timeout-ms",
+        "7000",
+        "--max-retries",
+        "3",
+        "--commit-interval-ms",
+        "1000",
         "--probe-range-get",
+        "false",
+        "--use-content-disposition",
+        "false",
+        "--append-type-extension",
+        "false",
+        "--auto-grouping",
         "false",
         "--extensions",
         "data=qqq",
@@ -52,7 +74,11 @@ fn settings_persist_across_invocations() {
         "event": "settings", "global_speed_limit": 2 << 20, "headroom_percent": 10,
         "global_connections": 12, "per_host_connections": 3,
         "min_connections_for_new": 0, "default_connections": 4,
-        "probe_range_get": false, "extra_extensions": { "data": ["qqq"] }, "proxy": "none",
+        "max_connections_per_download": 6, "first_byte_timeout_ms": 5000,
+        "idle_timeout_ms": 7000, "max_retries": 3, "commit_interval_ms": 1000,
+        "probe_range_get": false, "use_content_disposition": false,
+        "append_type_extension": false, "auto_grouping": false,
+        "extra_extensions": { "data": ["qqq"] }, "proxy": "none",
     });
     assert_eq!(out.events(), std::slice::from_ref(&changed));
     assert_eq!(settings(&sb), changed);
@@ -76,6 +102,10 @@ fn a_bad_flag_applies_nothing() {
         &["--headroom", "5", "--proxy", "ftp://p.test:21"],
         &["--headroom", "5", "--extensions", "films=x"],
         &["--headroom", "5", "--probe-range-get", "maybe"],
+        &["--headroom", "5", "--max-connections-per-download", "4"],
+        &["--headroom", "5", "--idle-timeout-ms", "10"],
+        &["--headroom", "5", "--max-retries", "0"],
+        &["--headroom", "5", "--commit-interval-ms", "0"],
     ] {
         let out = sb.dhow([&["settings"][..], bad].concat());
         assert!(!out.status.success(), "{bad:?}");

@@ -105,10 +105,14 @@ impl Engine {
                 id: id.clone(),
                 path,
             });
-            // Grouping takes the lock itself.
-            let grouped = self
-                .auto_group(id)
-                .and_then(|changed| self.announce_groups(&changed, on_event));
+            // Grouping takes the lock itself; off, groups stay as they are.
+            let grouped = self.settings().and_then(|s| {
+                if !s.auto_grouping {
+                    return Ok(());
+                }
+                self.auto_group(id)
+                    .and_then(|changed| self.announce_groups(&changed, on_event))
+            });
             if let Err(e) = grouped {
                 tracing::warn!(id, error = %e, "could not regroup a moved download");
             }

@@ -372,15 +372,21 @@ impl Engine {
             .unwrap_or_else(|| DEFAULT_QUEUE_ID.to_owned());
         self.queue(&queue_id)?;
         let lease = self.lease(&req.url).await?;
-        let probe = self.run_config()?.probe;
+        let settings = self.settings()?;
+        let probe = settings.apply(self.config).probe;
         let info = probe::probe(&lease.client, &req.url, &req.headers, probe).await?;
         drop(lease);
         let base = match &req.filename {
             Some(name) => naming::sanitize(name, req.target_fs)
                 .ok_or_else(|| EngineError::InvalidName(name.clone()))?,
+            // The naming toggles (§3) only hide what the server said.
             None => naming::base_name(
-                info.content_disposition.as_deref(),
-                info.content_type.as_deref(),
+                info.content_disposition
+                    .as_deref()
+                    .filter(|_| settings.use_content_disposition),
+                info.content_type
+                    .as_deref()
+                    .filter(|_| settings.append_type_extension),
                 &info.effective_url,
                 &req.url,
                 req.target_fs,
@@ -397,7 +403,7 @@ impl Engine {
         let category = naming::categorize(
             &base,
             info.content_type.as_deref(),
-            &self.settings()?.extra_extensions,
+            &settings.extra_extensions,
         );
         let name = naming::deduplicate(&base, &taken);
         let final_path = req.directory.join(&name);
@@ -455,10 +461,14 @@ impl Engine {
         )?;
         drop(db);
         // A download that can't be grouped is still added.
-        let grouped = self.auto_group(&id).and_then(|changed| {
-            let others: Vec<DownloadId> = changed.into_iter().filter(|c| *c != id).collect();
-            self.announce_groups(&others, on_event)
-        });
+        let grouped = if !settings.auto_grouping {
+            Ok(())
+        } else {
+            self.auto_group(&id).and_then(|changed| {
+                let others: Vec<DownloadId> = changed.into_iter().filter(|c| *c != id).collect();
+                self.announce_groups(&others, on_event)
+            })
+        };
         if let Err(e) = grouped {
             tracing::warn!(id, error = %e, "could not group download");
         }
