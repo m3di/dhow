@@ -208,7 +208,7 @@ struct NetworkTab: View {
                     .foregroundStyle(.secondary)
             }
             Section(tr("settings.currentNetwork")) {
-                NetworkCard(info: model.store.network)
+                NetworkCard(info: model.store.network, facts: model.networkFacts)
                 HStack {
                     Spacer()
                     Button(tr("settings.redetect")) { model.readNetwork(announce: true) }
@@ -223,6 +223,7 @@ struct NetworkTab: View {
 /// What the adapter sees, read-only (§7.4).
 private struct NetworkCard: View {
     var info: NetworkInfo?
+    var facts: NetworkFacts?
 
     var body: some View {
         if let info {
@@ -233,6 +234,14 @@ private struct NetworkCard: View {
                 tr("settings.systemProxy"),
                 value: info.systemProxy == nil ? tr("settings.no") : tr("settings.yes"))
             LabeledContent(tr("settings.proxyInUse"), value: Self.mode(info.proxyInUse))
+            if let facts {
+                LabeledContent(
+                    tr("settings.metered"),
+                    value: facts.expensive ? tr("settings.yes") : tr("settings.no"))
+                LabeledContent(
+                    tr("settings.lowData"),
+                    value: facts.constrained ? tr("settings.yes") : tr("settings.no"))
+            }
         } else {
             Text(tr("settings.networkUnknown")).foregroundStyle(.secondary)
         }

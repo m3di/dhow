@@ -301,6 +301,10 @@
 "network.cellular" = "Cellular";
 "network.vpn" = "VPN";
 "network.unknown" = "Unknown";
+"settings.metered" = "Metered connection";
+"settings.lowData" = "Low Data Mode";
+/* Why the Mac stays awake, as Activity Monitor and pmset show it. */
+"power.reason" = "Dhow is downloading";
 
 /* Menus (UI-GUIDELINES §8 macOS) */
 "menu.newDownload" = "New Download…";
