@@ -142,7 +142,8 @@ pub struct Ramp {
     /// (headroom's peak, §10.6), until taken.
     aggregate: Option<f64>,
     /// When the step being measured began (the connection was asked for)
-    /// and the aggregate then: the peak spans the whole step.
+    /// and the aggregate then: the peak spans the whole step. `None`: the
+    /// window alone (the first, a re-measured one, or after `Blocked`).
     step: Option<(Instant, u64)>,
     pub next_check: Instant,
     pub done: bool,
@@ -195,8 +196,11 @@ impl Ramp {
                 self.remeasure(now, sample, config);
                 return Step::Wait;
             }
+            // While held back it wasn't probing, so the headroom cap applied
+            // and left a backlog that drains once it lifts: this step counts
+            // its window alone.
             Phase::Blocked => {
-                self.step = Some((now, sample.aggregate));
+                self.step = None;
                 self.phase = Phase::Settling;
                 self.next_check = now + settle(config);
                 return Step::Open;
@@ -383,6 +387,38 @@ mod tests {
         // headroom's peak.
         assert_eq!(r.take_aggregate(), Some(4_150_000.0));
         assert_eq!(r.take_aggregate(), None);
+    }
+
+    #[test]
+    fn a_window_measured_again_starts_its_step_over() {
+        let c = RampConfig::default();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut r = Ramp::new(t0, &c);
+        r.check(at(1), s(0, 0), &c);
+        assert!(matches!(r.check(at(4), s(3_000_000, 0), &c), Step::Open));
+        r.check(at(5), s(4_000_000, 0), &c);
+        // Limited: measured again, and the limited time doesn't count.
+        assert!(matches!(r.check(at(8), s(5_000_000, 1), &c), Step::Wait));
+        assert!(matches!(r.check(at(11), s(11_000_000, 1), &c), Step::Open));
+        assert_eq!(r.take_aggregate(), Some(4_000_000.0), "the window alone");
+    }
+
+    #[test]
+    fn a_step_the_budget_held_back_counts_its_window_alone() {
+        let c = RampConfig::default();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut r = Ramp::new(t0, &c);
+        r.check(at(1), s(0, 0), &c);
+        assert!(matches!(r.check(at(4), s(3_000_000, 0), &c), Step::Open));
+        r.blocked(at(4), &c);
+        assert!(!r.probing(), "the headroom cap applies meanwhile");
+        // Asked again: settling drains what the cap held back (4 MB in 1 s).
+        assert!(matches!(r.check(at(7), s(6_000_000, 0), &c), Step::Open));
+        r.check(at(8), s(10_000_000, 0), &c);
+        assert!(matches!(r.check(at(11), s(16_000_000, 0), &c), Step::Open));
+        assert_eq!(r.take_aggregate(), Some(4_000_000.0), "the window alone");
     }
 
     #[test]

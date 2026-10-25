@@ -238,7 +238,7 @@ impl GlobalLimit {
         self.total.load(Ordering::Relaxed)
     }
 
-    /// Aggregate throughput a ramp-up window measured. Raises the peak only
+    /// Aggregate throughput over a ramp-up step. Raises the peak only
     /// while someone is ramping up (the cap is lifted then).
     pub fn offer_peak(&self, rate: f64) {
         let mut s = lock(&self.state);
