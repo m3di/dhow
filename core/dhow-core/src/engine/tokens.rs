@@ -82,7 +82,7 @@ impl Engine {
         // from the `Content-Type`.
         let category = match path.file_name() {
             Some(name) if Some(name) != snap.final_path.file_name() => {
-                naming::categorize_name(&name.to_string_lossy(), &self.extra_extensions()?)
+                naming::categorize_name(&name.to_string_lossy(), &self.settings()?.extra_extensions)
                     .unwrap_or(snap.category)
             }
             _ => snap.category,

@@ -1,12 +1,8 @@
-//! Categories (ENGINE-SPEC §13.1): the user's extra extensions and the
-//! storage breakdown of completed downloads.
-
-use rusqlite::{OptionalExtension, params};
+//! The storage breakdown of completed downloads by category (ENGINE-SPEC
+//! §13.1). The user's extra extensions are a setting ([`super::settings`]).
 
 use super::{DownloadId, Engine, EngineError, EngineEvent};
-use crate::naming::{Category, ExtraExtensions, normalize_extension};
-
-const EXTRA_KEY: &str = "extra_extensions";
+use crate::naming::Category;
 
 /// Completed downloads of one category.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,54 +16,6 @@ pub struct CategoryUsage {
 }
 
 impl Engine {
-    pub fn extra_extensions(&self) -> Result<ExtraExtensions, EngineError> {
-        Ok(self.setting(EXTRA_KEY)?.unwrap_or_default())
-    }
-
-    /// Replaces `category`'s extra extensions (empty clears them). An
-    /// extension belongs to one category, so it leaves any other; `Other`
-    /// takes built-ins back out of theirs.
-    pub fn set_extra_extensions(
-        &self,
-        category: Category,
-        extensions: &[String],
-    ) -> Result<ExtraExtensions, EngineError> {
-        let mut exts = extensions
-            .iter()
-            .map(|e| normalize_extension(e))
-            .collect::<Option<Vec<_>>>()
-            .ok_or(EngineError::InvalidSetting("not a file extension"))?;
-        exts.sort();
-        exts.dedup();
-        let db = self.db();
-        let tx = db.conn().unchecked_transaction()?;
-        let stored: Option<String> = tx
-            .query_row(
-                "SELECT value FROM settings WHERE key = ?1",
-                [EXTRA_KEY],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let mut extra: ExtraExtensions = stored
-            .and_then(|j| serde_json::from_str(&j).ok())
-            .unwrap_or_default();
-        for list in extra.values_mut() {
-            list.retain(|e| !exts.contains(e));
-        }
-        extra.insert(category, exts);
-        extra.retain(|_, list| !list.is_empty());
-        tx.execute(
-            "INSERT INTO settings (key, value) VALUES (?1, ?2)
-             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-            params![
-                EXTRA_KEY,
-                serde_json::to_string(&extra).expect("settings serialize")
-            ],
-        )?;
-        tx.commit()?;
-        Ok(extra)
-    }
-
     /// `total_size` of `Completed` downloads by category, in
     /// [`Category::ALL`] order; categories without any are left out. Moved
     /// files are found as in [`Engine::get`].

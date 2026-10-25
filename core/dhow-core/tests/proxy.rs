@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use dhow_core::download::DownloadConfig;
+use dhow_core::engine::settings::{Settings, SettingsPatch};
 use dhow_core::engine::{AddRequest, Engine, EngineError, State};
 use dhow_core::naming::TargetFs;
 use dhow_core::platform::{
@@ -13,6 +14,14 @@ use dhow_core::platform::{
 use dhow_testserver::{SocksProxy, TestServer};
 use reqwest::Url;
 use tokio::sync::watch;
+
+fn set_proxy(engine: &Engine, mode: ProxyMode) -> Result<Settings, EngineError> {
+    let patch = SettingsPatch {
+        proxy_mode: Some(mode),
+        ..SettingsPatch::default()
+    };
+    engine.set_settings(patch, &|_| {})
+}
 
 fn proxied(proxy: &TestServer) -> usize {
     proxy
@@ -53,9 +62,9 @@ async fn custom_routes_through_the_proxy_none_bypasses_it() {
     let proxy = TestServer::start().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::open(&dir.path().join("data"), DownloadConfig::default()).unwrap();
-    assert_eq!(engine.proxy_mode().unwrap(), ProxyMode::System);
+    assert_eq!(engine.settings().unwrap().proxy_mode, ProxyMode::System);
 
-    engine.set_proxy_mode(custom(&proxy)).unwrap();
+    set_proxy(&engine, custom(&proxy)).unwrap();
     fetch(&engine, &origin, dir.path(), 1).await;
     assert!(origin.requests().is_empty(), "went direct");
     let target = format!("http://{}/blob/100000?seed=1", origin.addr());
@@ -66,15 +75,15 @@ async fn custom_routes_through_the_proxy_none_bypasses_it() {
     );
 
     // Takes effect at the next download, the client being rebuilt.
-    engine.set_proxy_mode(ProxyMode::None).unwrap();
+    set_proxy(&engine, ProxyMode::None).unwrap();
     fetch(&engine, &origin, dir.path(), 2).await;
     assert!(!origin.requests().is_empty());
     assert_eq!(proxy.requests().len(), seen.len(), "went through the proxy");
 
     // Stored: another engine on the same data sees it.
-    engine.set_proxy_mode(custom(&proxy)).unwrap();
+    set_proxy(&engine, custom(&proxy)).unwrap();
     let other = Engine::open(&dir.path().join("data"), DownloadConfig::default()).unwrap();
-    assert_eq!(other.proxy_mode().unwrap(), custom(&proxy));
+    assert_eq!(other.settings().unwrap().proxy_mode, custom(&proxy));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -83,7 +92,7 @@ async fn a_change_while_running_applies_to_the_next_lease() {
     let proxy = TestServer::start().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::open(&dir.path().join("data"), DownloadConfig::default()).unwrap();
-    engine.set_proxy_mode(ProxyMode::None).unwrap();
+    set_proxy(&engine, ProxyMode::None).unwrap();
     let req = AddRequest {
         url: Url::parse(&origin.url("/blob/400000?seed=5&throttle=1000000")).unwrap(),
         headers: vec![],
@@ -102,7 +111,7 @@ async fn a_change_while_running_applies_to_the_next_lease() {
         while origin.requests().len() == probed {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        engine.set_proxy_mode(custom(&proxy)).unwrap();
+        set_proxy(&engine, custom(&proxy)).unwrap();
         // The running download keeps its client; this one gets the new.
         fetch(&engine, &origin, dir.path(), 6).await;
     };
@@ -131,10 +140,10 @@ fn custom_needs_a_usable_proxy() {
             ..ProxyConfig::default()
         },
     ] {
-        let r = engine.set_proxy_mode(ProxyMode::Custom(Box::new(bad.clone())));
+        let r = set_proxy(&engine, ProxyMode::Custom(Box::new(bad.clone())));
         assert!(matches!(r, Err(EngineError::InvalidSetting(_))), "{bad:?}");
     }
-    assert_eq!(engine.proxy_mode().unwrap(), ProxyMode::System);
+    assert_eq!(engine.settings().unwrap().proxy_mode, ProxyMode::System);
 }
 
 /// A platform whose system proxy is a test server, asked per URL.
@@ -202,7 +211,7 @@ async fn system_uses_the_adapters_proxy_and_its_bypass_list() {
     assert_eq!(proxy.requests().len(), before);
 
     // `None` overrides the system.
-    engine.set_proxy_mode(ProxyMode::None).unwrap();
+    set_proxy(&engine, ProxyMode::None).unwrap();
     assert_eq!(engine.network_info().unwrap().proxy_in_use, ProxyMode::None);
 }
 
@@ -215,12 +224,14 @@ async fn socks5_proxies_relay_with_and_without_auth() {
 
     let open = SocksProxy::start(None).unwrap();
     let all = Url::parse(&format!("socks5://{}", open.addr())).ok();
-    engine
-        .set_proxy_mode(ProxyMode::Custom(Box::new(ProxyConfig {
+    set_proxy(
+        &engine,
+        ProxyMode::Custom(Box::new(ProxyConfig {
             all,
             ..ProxyConfig::default()
-        })))
-        .unwrap();
+        })),
+    )
+    .unwrap();
     fetch(&engine, &origin, dir.path(), 1).await;
     let connects = open.connects();
     assert!(
@@ -232,12 +243,14 @@ async fn socks5_proxies_relay_with_and_without_auth() {
 
     let authed = SocksProxy::start(Some(("u", "s3cret"))).unwrap();
     let all = Url::parse(&format!("socks5h://u:s3cret@{}", authed.addr())).ok();
-    engine
-        .set_proxy_mode(ProxyMode::Custom(Box::new(ProxyConfig {
+    set_proxy(
+        &engine,
+        ProxyMode::Custom(Box::new(ProxyConfig {
             all,
             ..ProxyConfig::default()
-        })))
-        .unwrap();
+        })),
+    )
+    .unwrap();
     fetch(&engine, &origin, dir.path(), 2).await;
     let connects = authed.connects();
     assert!(!connects.is_empty(), "not relayed");

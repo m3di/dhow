@@ -4,6 +4,8 @@
 
 Keywords MUST / MUST NOT / SHOULD / MAY as in RFC 2119.
 
+`settings.x` is a user setting, stored and patched through `SetSettings` (ARCHITECTURE §3.1, §5.1), when ARCHITECTURE §5.1 lists it; any other `settings.x` is engine configuration (`DownloadConfig`), fixed for an engine's life, with the default given here.
+
 ---
 
 ## 1. Terms
@@ -283,7 +285,7 @@ The scheduler decides which downloads are `Active` and how many connections each
 
 #### 10.1 Global connection budget
 
-`settings.global_connections` (default 16). The sum of all active connections across all downloads never exceeds it. The budget belongs to one engine instance (one process); every download in it holds a ticket and asks it for each connection.
+`settings.global_connections` (default 16). The sum of all active connections across all downloads never exceeds it. The budget belongs to one engine instance (one process); every download in it holds a ticket and asks it for each connection. The budget settings (`global_connections`, `per_host_connections`, `min_connections_for_new`) are read when the engine opens; a change applies to engines opened after it.
 
 #### 10.3 Allocation rule: oldest first, newcomers ramp
 

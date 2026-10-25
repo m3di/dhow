@@ -84,6 +84,9 @@ impl Shared {
     }
 }
 
+/// Tuning fixed for an engine's life. In an engine, `probe.range_get`,
+/// `ramp.connections` and `budget` are only the defaults of their settings
+/// (`engine::settings`).
 #[derive(Clone, Copy, Debug)]
 pub struct DownloadConfig {
     pub probe: ProbeOptions,

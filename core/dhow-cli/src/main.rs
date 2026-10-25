@@ -10,6 +10,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use dhow_core::download::DownloadConfig;
 use dhow_core::engine::queues::{OnComplete, QueueSpec};
+use dhow_core::engine::settings::{CategoryExtensions, LimitPatch, SettingsPatch};
 use dhow_core::engine::{AddRequest, Engine, EngineError, EngineEvent, Snapshot, State};
 use dhow_core::http::{Header, Url};
 use dhow_core::logging;
@@ -101,7 +102,8 @@ enum Command {
         /// Add it paused
         #[arg(long)]
         paused: bool,
-        /// Connections for this download [default: 8]
+        /// Connections for this download [default: the `default_connections`
+        /// setting, 8]
         #[arg(short = 'c', long)]
         connections: Option<u8>,
         /// Queue (name or id) [default: the default queue]
@@ -154,8 +156,8 @@ enum Command {
     /// Completed downloads by category: bytes and files still on disk,
     /// ids of those whose file is gone
     Storage,
-    /// Show or change the global speed limit, headroom, extra category
-    /// extensions and proxy
+    /// Show or change settings; all given at once apply together or not at
+    /// all. Prints every setting
     Settings {
         /// Limit for all downloads together (see `dhow limit`)
         #[arg(long)]
@@ -164,6 +166,24 @@ enum Command {
         /// on the link (0–99)
         #[arg(long)]
         headroom: Option<u8>,
+        /// Connections of all downloads together (applies to runners
+        /// started from then on)
+        #[arg(long)]
+        global_connections: Option<u32>,
+        /// Connections per server (`host:port`), same as above
+        #[arg(long)]
+        per_host_connections: Option<u32>,
+        /// 1: a new download gets a connection from another one when none
+        /// is free; 0: it waits (same as above)
+        #[arg(long)]
+        min_connections_for_new: Option<u32>,
+        /// Connections of a download added without `-c`
+        #[arg(long)]
+        default_connections: Option<u8>,
+        /// Probe with a one-byte `GET` when `HEAD` doesn't tell size and
+        /// resumability (`false` for links that count every `GET`)
+        #[arg(long, value_name = "true|false")]
+        probe_range_get: Option<bool>,
         /// `CATEGORY=ext,ext`: extensions to put in a category, replacing
         /// its earlier extras (`CATEGORY=` clears them); repeatable
         #[arg(long = "extensions", value_name = "CATEGORY=EXTS")]
@@ -547,35 +567,37 @@ async fn run(
         Command::Settings {
             global_limit,
             headroom,
+            global_connections,
+            per_host_connections,
+            min_connections_for_new,
+            default_connections,
+            probe_range_get,
             extensions,
             proxy,
         } => {
-            // All parsed before any is applied.
-            let global_limit = global_limit.map(|v| parse_rate(&v)).transpose()?;
-            let proxy = proxy.map(|v| parse_proxy(&v)).transpose()?;
-            let extensions = extensions
-                .iter()
-                .map(|v| parse_extensions(v))
-                .collect::<Res<Vec<_>>>()?;
-            // First: the core may still reject it.
-            if let Some(mode) = proxy {
-                engine.set_proxy_mode(mode)?;
+            let patch = SettingsPatch {
+                global_speed_limit: global_limit
+                    .map(|v| parse_rate(&v).map(LimitPatch::from_rate))
+                    .transpose()?,
+                headroom_percent: headroom,
+                global_connections,
+                per_host_connections,
+                min_connections_for_new,
+                default_connections,
+                probe_range_get,
+                extra_extensions: extensions
+                    .iter()
+                    .map(|v| parse_extensions(v))
+                    .collect::<Res<_>>()?,
+                proxy_mode: proxy.map(|v| parse_proxy(&v)).transpose()?,
+            };
+            let changed = patch != SettingsPatch::default();
+            // Printed once, below, not also as an event.
+            let settings = engine.set_settings(patch, &|_| {})?;
+            output::emit(output::settings("settings", &settings));
+            if changed {
+                lock::poke_runners(&data_dir);
             }
-            for (category, exts) in extensions {
-                engine.set_extra_extensions(category, &exts)?;
-            }
-            if let Some(rate) = global_limit {
-                engine.set_global_limit(rate)?;
-            }
-            if let Some(p) = headroom {
-                engine.set_headroom(p)?;
-            }
-            output::emit(output::settings(
-                &engine.limit_settings()?,
-                &engine.extra_extensions()?,
-                &engine.proxy_mode()?,
-            ));
-            lock::poke_runners(&data_dir);
             Ok(ExitCode::SUCCESS)
         }
         Command::Reorder { id, before } => {
@@ -638,8 +660,8 @@ fn parse_rate(v: &str) -> Res<Option<u64>> {
     Ok(Some((n * unit as f64).round() as u64))
 }
 
-/// `video=mkv,webm` → `(Video, ["mkv", "webm"])`; `video=` clears.
-fn parse_extensions(v: &str) -> Res<(Category, Vec<String>)> {
+/// `video=mkv,webm`: `Video` gets `mkv` and `webm`; `video=` clears.
+fn parse_extensions(v: &str) -> Res<CategoryExtensions> {
     let (category, exts) = v
         .split_once('=')
         .ok_or_else(|| format!("{v:?}: expected CATEGORY=ext,ext"))?;
@@ -651,7 +673,10 @@ fn parse_extensions(v: &str) -> Res<(Category, Vec<String>)> {
         .filter(|e| !e.is_empty())
         .map(|e| normalize_extension(e).ok_or_else(|| format!("{e:?} is not a file extension")))
         .collect::<Result<_, _>>()?;
-    Ok((category, exts))
+    Ok(CategoryExtensions {
+        category,
+        extensions: exts,
+    })
 }
 
 fn parse_action(v: &str) -> Res<Action> {

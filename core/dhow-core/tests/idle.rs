@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use dhow_core::download::DownloadConfig;
 use dhow_core::engine::queues::QueueSpec;
+use dhow_core::engine::settings::{LimitPatch, SettingsPatch};
 use dhow_core::engine::{AddRequest, Engine, EngineEvent, State};
 use dhow_core::naming::TargetFs;
 use dhow_testserver::TestServer;
@@ -56,8 +57,12 @@ fn t_idle_nothing_runs_after_the_last_download() {
         let engine = Engine::open(&dir.path().join("data"), config).unwrap();
         // Everything that keeps state between reads: limits, headroom, a
         // queue bucket, several connections, sampling.
-        engine.set_global_limit(Some(8 << 20)).unwrap();
-        engine.set_headroom(10).unwrap();
+        let limits = SettingsPatch {
+            global_speed_limit: Some(LimitPatch::Rate(8 << 20)),
+            headroom_percent: Some(10),
+            ..SettingsPatch::default()
+        };
+        engine.set_settings(limits, &|_| {}).unwrap();
         let q = engine
             .create_queue(&QueueSpec {
                 name: "q".into(),
