@@ -83,7 +83,12 @@ final class AddModel {
     /// The http(s) links in pasted text, in order, once each.
     nonisolated static func links(in text: String) -> [String] {
         var seen = Set<String>()
-        return text.split(whereSeparator: \.isWhitespace).map(String.init).filter { s in
+        // A link in prose ends before the sentence's punctuation.
+        let trailing: Set<Character> = [",", ".", ";", ":", "!", "?", "\"", "'", ">"]
+        let words = text.split(whereSeparator: \.isWhitespace).map {
+            String($0.reversed().drop(while: trailing.contains).reversed())
+        }
+        return words.filter { s in
             guard let url = URL(string: s), let scheme = url.scheme?.lowercased(),
                 scheme == "http" || scheme == "https", url.host() != nil
             else { return false }

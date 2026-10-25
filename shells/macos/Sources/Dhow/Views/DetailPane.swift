@@ -8,6 +8,7 @@ struct DetailPane: View {
     @Environment(AppModel.self) private var model
     /// The downloads the selection stands for.
     var ids: Set<String>
+    @AppStorage(Prefs.showSegmentMap) private var segmentMap = true
 
     private var shown: DownloadSnapshot? {
         ids.count == 1 ? ids.first.flatMap { model.store.downloads[$0] } : nil
@@ -24,8 +25,9 @@ struct DetailPane: View {
             }
         }
         // The segment map is watched while this shows a running download.
-        .onChange(of: WatchKey(id: shown?.id, state: shown?.state), initial: true) { _, key in
-            model.showDetail(key.id)
+        .onChange(of: WatchKey(id: shown?.id, state: shown?.state, map: segmentMap), initial: true)
+        { _, key in
+            model.showDetail(key.id, ranges: key.map)
         }
         .onDisappear { model.showDetail(nil) }
     }
@@ -33,13 +35,14 @@ struct DetailPane: View {
     private struct WatchKey: Equatable {
         var id: String?
         var state: DownloadState?
+        var map: Bool
     }
 }
 
 private struct DownloadDetail: View {
     @Environment(AppModel.self) private var model
     var download: DownloadSnapshot
-    @State private var confirmingCancel = false
+    @AppStorage(Prefs.showSegmentMap) private var segmentMap = true
 
     var body: some View {
         let d = download
@@ -50,7 +53,7 @@ private struct DownloadDetail: View {
             }
             if !d.state.isFinished {
                 Section(tr("detail.progress")) {
-                    ProgressSection(download: d, map: store.rangeMaps[d.id])
+                    ProgressSection(download: d, map: segmentMap ? store.rangeMaps[d.id] : nil)
                 }
             }
             if d.state != .completed || store.speedTrail.count > 1 {
@@ -73,7 +76,9 @@ private struct DownloadDetail: View {
                         }
                         Spacer()
                         if Actions.canCancel(d.state) {
-                            Button(tr("menu.cancelEllipsis")) { confirmingCancel = true }
+                            Button(tr("menu.cancelEllipsis")) {
+                                model.confirmation = .cancel([d.id])
+                            }
                         }
                     }
                 }
@@ -83,11 +88,6 @@ private struct DownloadDetail: View {
             }
         }
         .formStyle(.grouped)
-        .confirmationDialog(tr("confirm.cancelTitle"), isPresented: $confirmingCancel) {
-            Button(tr("menu.cancel"), role: .destructive) { model.cancel([d.id]) }
-        } message: {
-            Text(tr("confirm.cancelMessage"))
-        }
     }
 }
 
@@ -119,13 +119,13 @@ private struct DetailHeader: View {
             Button {
                 model.showInFinder([d.id])
             } label: {
-                Text(Self.folder(d.finalPath))
-                    .lineLimit(2)
-                    .truncationMode(.head)
-                    .multilineTextAlignment(.trailing)
+                // The folder's name on one line; the whole path on hover.
+                Label(Self.folderName(d.finalPath), systemImage: "folder")
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
             .buttonStyle(.link)
-            .help(tr("menu.showInFinder"))
+            .help(Self.folder(d.finalPath))
         }
         LabeledContent(tr("detail.queue"), value: store.queue(d.queueId)?.title ?? "")
         if let g = d.group {
@@ -138,6 +138,10 @@ private struct DetailHeader: View {
             return d.state == .completed ? Format.bytes(d.downloaded) : tr("detail.sizeUnknown")
         }
         return Format.bytes(total)
+    }
+
+    static func folderName(_ path: String) -> String {
+        FileManager.default.displayName(atPath: (path as NSString).deletingLastPathComponent)
     }
 
     /// The folder, with the home folder as "~".

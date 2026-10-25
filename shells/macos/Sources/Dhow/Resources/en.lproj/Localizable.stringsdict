@@ -34,6 +34,54 @@
 			<string>%lld downloads selected</string>
 		</dict>
 	</dict>
+	<key>note.queueBody %lld</key>
+	<dict>
+		<key>NSStringLocalizedFormatKey</key>
+		<string>%#@downloads@</string>
+		<key>downloads</key>
+		<dict>
+			<key>NSStringFormatSpecTypeKey</key>
+			<string>NSStringPluralRuleType</string>
+			<key>NSStringFormatValueTypeKey</key>
+			<string>lld</string>
+			<key>one</key>
+			<string>%lld download finished.</string>
+			<key>other</key>
+			<string>%lld downloads finished.</string>
+		</dict>
+	</dict>
+	<key>countdown.sleep %lld</key>
+	<dict>
+		<key>NSStringLocalizedFormatKey</key>
+		<string>%#@seconds@</string>
+		<key>seconds</key>
+		<dict>
+			<key>NSStringFormatSpecTypeKey</key>
+			<string>NSStringPluralRuleType</string>
+			<key>NSStringFormatValueTypeKey</key>
+			<string>lld</string>
+			<key>one</key>
+			<string>Your Mac will sleep in %lld second.</string>
+			<key>other</key>
+			<string>Your Mac will sleep in %lld seconds.</string>
+		</dict>
+	</dict>
+	<key>countdown.shutDown %lld</key>
+	<dict>
+		<key>NSStringLocalizedFormatKey</key>
+		<string>%#@seconds@</string>
+		<key>seconds</key>
+		<dict>
+			<key>NSStringFormatSpecTypeKey</key>
+			<string>NSStringPluralRuleType</string>
+			<key>NSStringFormatValueTypeKey</key>
+			<string>lld</string>
+			<key>one</key>
+			<string>Your Mac will shut down in %lld second.</string>
+			<key>other</key>
+			<string>Your Mac will shut down in %lld seconds.</string>
+		</dict>
+	</dict>
 	<key>storage.files %lld</key>
 	<dict>
 		<key>NSStringLocalizedFormatKey</key>

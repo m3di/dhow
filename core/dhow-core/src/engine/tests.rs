@@ -816,6 +816,28 @@ mod schedule_tests {
             fx.engine.create_queue(&with(vec![])),
             Err(EngineError::InvalidQueue(_))
         ));
+        // An empty name gives the default queue back to the shell's name;
+        // other queues need one.
+        let edit = |name: &str| QueueSpec {
+            name: name.into(),
+            max_concurrent: 5,
+            ..QueueSpec::default()
+        };
+        let renamed = fx
+            .engine
+            .update_queue(DEFAULT_QUEUE_ID, &edit("Main"))
+            .unwrap();
+        assert_eq!(renamed.name.as_deref(), Some("Main"));
+        let unnamed = fx
+            .engine
+            .update_queue(DEFAULT_QUEUE_ID, &edit(" "))
+            .unwrap();
+        assert_eq!((unnamed.name, unnamed.max_concurrent), (None, 5));
+        let other = fx.engine.create_queue(&edit("other")).unwrap();
+        assert!(matches!(
+            fx.engine.update_queue(&other.id, &edit("")),
+            Err(EngineError::InvalidQueue(_))
+        ));
         let q = fx
             .engine
             .create_queue(&with(vec![Window::parse("daily 01:00-02:00").unwrap()]))

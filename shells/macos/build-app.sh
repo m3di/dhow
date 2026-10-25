@@ -38,6 +38,8 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin/Dhow" "$app/Contents/MacOS/Dhow"
 cp -R "$bin/Dhow_Dhow.bundle" "$app/Contents/Resources/"
+# What macOS reads from the app's own bundle: the Services menu's title.
+cp -R Bundle/*.lproj "$app/Contents/Resources/"
 
 # The icon, redrawn only when its script changes.
 icns="$out/Dhow.icns"
@@ -92,6 +94,27 @@ cat > "$app/Contents/Info.plist" <<EOF
 	<string>NSApplication</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>GPL-3.0</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Dhow asks macOS to shut down when a queue you set to do so has finished.</string>
+	<key>NSServices</key>
+	<array>
+		<dict>
+			<key>NSMenuItem</key>
+			<dict>
+				<key>default</key>
+				<string>Download with Dhow</string>
+			</dict>
+			<key>NSMessage</key>
+			<string>downloadURLs</string>
+			<key>NSPortName</key>
+			<string>Dhow</string>
+			<key>NSSendTypes</key>
+			<array>
+				<string>public.url</string>
+				<string>public.utf8-plain-text</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>
 EOF

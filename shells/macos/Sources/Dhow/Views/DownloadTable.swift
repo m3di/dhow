@@ -18,7 +18,6 @@ struct DownloadTable: View {
     @Binding var selection: Set<ListRow.ID>
     @State private var sortOrder: [KeyPathComparator<ListRow>] = []
     @State private var expanded = Set<ListRow.ID>()
-    @State private var confirmation: Confirmation?
 
     var body: some View {
         Table(of: ListRow.self, selection: $selection, sortOrder: $sortOrder) {
@@ -83,7 +82,7 @@ struct DownloadTable: View {
             }
         }
         .contextMenu(forSelectionType: ListRow.ID.self) { ids in
-            RowMenu(ids: downloads(ids), confirmation: $confirmation)
+            RowMenu(ids: downloads(ids))
         } primaryAction: { ids in
             // A group opens or closes; a download opens its file.
             if ids.count == 1, let id = ids.first,
@@ -92,23 +91,6 @@ struct DownloadTable: View {
                 expanded.formSymmetricDifference([id])
             } else {
                 model.open(downloads(ids))
-            }
-        }
-        .confirmationDialog(
-            confirmTitle, isPresented: confirmShown, presenting: confirmation
-        ) { c in
-            switch c {
-            case .delete(let ids):
-                Button(tr("menu.removeAndDelete"), role: .destructive) {
-                    model.remove(ids, deleteFiles: true)
-                }
-            case .cancel(let ids):
-                Button(tr("menu.cancel"), role: .destructive) { model.cancel(ids) }
-            }
-        } message: { c in
-            switch c {
-            case .delete: Text(tr("confirm.deleteMessage"))
-            case .cancel: Text(tr("confirm.cancelMessage"))
             }
         }
         .onDeleteCommand { model.remove(downloads(selection), deleteFiles: false) }
@@ -127,15 +109,42 @@ struct DownloadTable: View {
     private func downloads(_ ids: Set<ListRow.ID>) -> Set<String> {
         rows.downloadIds(ids)
     }
+}
 
-    private var confirmTitle: String {
-        switch confirmation {
+/// Asks before Cancel and Remove and Delete File, whichever of the list,
+/// the detail pane or the Download menu asked.
+struct ConfirmationDialogs: ViewModifier {
+    @Bindable var model: AppModel
+
+    func body(content: Content) -> some View {
+        content.confirmationDialog(
+            title, isPresented: shown, presenting: model.confirmation
+        ) { c in
+            switch c {
+            case .delete(let ids):
+                Button(tr("menu.removeAndDelete"), role: .destructive) {
+                    model.remove(ids, deleteFiles: true)
+                }
+            case .cancel(let ids):
+                Button(tr("menu.cancel"), role: .destructive) { model.cancel(ids) }
+            }
+        } message: { c in
+            switch c {
+            case .delete: Text(tr("confirm.deleteMessage"))
+            case .cancel: Text(tr("confirm.cancelMessage"))
+            }
+        }
+    }
+
+    private var title: String {
+        switch model.confirmation {
         case .cancel: tr("confirm.cancelTitle")
         case .delete, nil: tr("confirm.deleteTitle")
         }
     }
 
-    private var confirmShown: Binding<Bool> {
-        Binding(get: { confirmation != nil }, set: { if !$0 { confirmation = nil } })
+    private var shown: Binding<Bool> {
+        Binding(
+            get: { model.confirmation != nil }, set: { if !$0 { model.confirmation = nil } })
     }
 }

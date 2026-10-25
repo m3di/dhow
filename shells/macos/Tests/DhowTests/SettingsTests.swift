@@ -21,7 +21,7 @@ import Testing
     }
 
     @Test func anUneditedDraftPatchesNothing() async throws {
-        #expect(try SettingsDraft(settings, folder: "/x").patch(over: settings) == SettingsPatch())
+        #expect(try SettingsDraft(settings).patch(over: settings) == SettingsPatch())
         // Values the window shows rounded (a limit in bytes, set by the CLI)
         // stay as they are; milliseconds survive as seconds.
         var p = SettingsPatch()
@@ -31,15 +31,15 @@ import Testing
         p.proxyMode = .custom(
             config: ProxyConfig(http: "http://p.test:8080", noProxy: ["localhost", ".lan"]))
         let s = try core.engine.setSettings(patch: p)
-        #expect(try SettingsDraft(s, folder: "/x").patch(over: s) == SettingsPatch())
+        #expect(try SettingsDraft(s).patch(over: s) == SettingsPatch())
         let form = SettingsForm()
-        form.load(s, folder: "/x")
+        form.load(s)
         #expect(!form.isDirty)
         await core.close()
     }
 
     @Test func aDraftPatchesWhatChangedInTheCoresUnits() async throws {
-        var d = SettingsDraft(settings, folder: "/x")
+        var d = SettingsDraft(settings)
         d.limitOn = true
         d.limitKB = 500
         d.firstByteTimeout = 2.5
@@ -63,8 +63,7 @@ import Testing
     /// 300 for a byte, -5 for a count: refused at the field, never clamped.
     @Test func aValueItsTypeCantHoldIsRefusedNotClamped() async throws {
         let form = SettingsForm()
-        form.load(settings, folder: "/x")
-        var stored: [String] = []
+        form.load(settings)
         for (edit, key, tab) in [
             (
                 { (d: inout SettingsDraft) in d.maxConnectionsPerDownload = 300 },
@@ -83,50 +82,45 @@ import Testing
             form.revert()
             edit(&form.draft)
             #expect(form.isDirty)
-            let shown = await form.save(send, folder: { stored.append($0) })
+            let shown = await form.save(send)
             #expect(shown == tab, "\(key)")
             #expect(form.error(for: key) != nil, "\(key)")
         }
         #expect(try core.engine.settings() == settings)
-        #expect(stored.isEmpty)
         await core.close()
     }
 
     @Test func theCoresRefusalShowsAtTheFieldItNamesAndStoresNothing() async throws {
         let form = SettingsForm()
-        form.load(settings, folder: "/old")
+        form.load(settings)
         form.draft.maxConnectionsPerDownload = 2
-        form.draft.defaultFolder = "/new"
-        var stored: [String] = []
-        var tab = await form.save(send, folder: { stored.append($0) })
+        var tab = await form.save(send)
         #expect(tab == .connections)
         #expect(form.error(for: "max_connections_per_download") != nil)
         #expect(form.error(for: "default_connections") == nil)
-        #expect(stored.isEmpty)
         #expect(try core.engine.settings() == settings)
         #expect(form.isDirty)
 
         form.draft.maxConnectionsPerDownload = 20
         form.draft.proxy = .custom
         form.draft.proxyHttp = "not a url"
-        tab = await form.save(send, folder: { stored.append($0) })
+        tab = await form.save(send)
         #expect(tab == .network)
         #expect(form.error(for: "proxy_mode") != nil)
 
         // An extension refused: at the category edited.
         form.draft.proxy = .system
         form.draft.extraExtensions[.video] = "a/b"
-        tab = await form.save(send, folder: { stored.append($0) })
+        tab = await form.save(send)
         #expect(tab == .categories)
         #expect(form.error(for: DhowCore.Category.video) != nil)
         #expect(form.error(for: DhowCore.Category.audio) == nil)
 
         form.draft.extraExtensions[.video] = ""
-        tab = await form.save(send, folder: { stored.append($0) })
+        tab = await form.save(send)
         #expect(tab == nil)
         #expect(form.failure == nil)
         #expect(try core.engine.settings().maxConnectionsPerDownload == 20)
-        #expect(stored == ["/new"])
         #expect(!form.isDirty)
         await core.close()
     }
@@ -135,17 +129,17 @@ import Testing
     /// sends the edits only, and the draft shows the others' new values.
     @Test func savingAfterAnOutsideChangeKeepsIt() async throws {
         let form = SettingsForm()
-        form.load(settings, folder: "/x")
+        form.load(settings)
         form.draft.idleTimeout = 99
         var other = SettingsPatch()
         other.maxRetries = 11
         let changed = try core.engine.setSettings(patch: other)
-        form.load(changed, folder: "/x")
+        form.load(changed)
         #expect(form.draft.maxRetries == 11)
         #expect(form.draft.idleTimeout == 99)
         #expect(form.isDirty)
 
-        await form.save(send, folder: { _ in })
+        await form.save(send)
         let now = try core.engine.settings()
         #expect(now.maxRetries == 11)
         #expect(now.idleTimeoutMs == 99_000)
@@ -155,14 +149,14 @@ import Testing
 
     @Test func theDraftFollowsTheCoreUnlessEdited() async {
         let form = SettingsForm()
-        form.load(settings, folder: "/x")
+        form.load(settings)
         var changed = settings
         changed.maxRetries = 9
-        form.load(changed, folder: "/x")
+        form.load(changed)
         #expect(form.draft.maxRetries == 9)
         form.draft.maxRetries = 5
         changed.maxRetries = 11
-        form.load(changed, folder: "/x")
+        form.load(changed)
         #expect(form.draft.maxRetries == 5)
         form.revert()
         #expect(form.draft.maxRetries == 11)

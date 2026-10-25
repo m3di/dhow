@@ -5,7 +5,6 @@ import SwiftUI
 struct RowMenu: View {
     @Environment(AppModel.self) private var model
     var ids: Set<String>
-    @Binding var confirmation: Confirmation?
 
     /// Per-download limits offered here; the detail pane has a slider.
     static let limits: [UInt64] = [256, 512, 1000, 2000, 5000, 10_000].map { $0 * 1000 }
@@ -16,7 +15,7 @@ struct RowMenu: View {
         let states = selected.map(\.state)
         if !selected.isEmpty {
             if states.contains(where: Actions.canResume) {
-                Button(resumeTitle(states)) { model.resume(ids) }
+                Button(Self.resumeTitle(states)) { model.resume(ids) }
             }
             if states.contains(where: Actions.canPause) {
                 Button(tr("menu.pause")) { model.pause(ids) }
@@ -50,10 +49,10 @@ struct RowMenu: View {
             }
             Divider()
             if states.contains(where: Actions.canCancel) {
-                Button(tr("menu.cancelEllipsis")) { confirmation = .cancel(ids) }
+                Button(tr("menu.cancelEllipsis")) { model.confirmation = .cancel(ids) }
             }
             Button(tr("menu.remove")) { model.remove(ids, deleteFiles: false) }
-            Button(tr("menu.removeAndDeleteEllipsis")) { confirmation = .delete(ids) }
+            Button(tr("menu.removeAndDeleteEllipsis")) { model.confirmation = .delete(ids) }
         }
     }
 
@@ -67,7 +66,7 @@ struct RowMenu: View {
                 set: { _ in model.setSpeedLimit(ids, limit) }))
     }
 
-    private func resumeTitle(_ states: [DownloadState]) -> String {
+    static func resumeTitle(_ states: [DownloadState]) -> String {
         if states.allSatisfy({ $0 == .failed || !Actions.canResume($0) }) {
             return tr("menu.retry")
         }

@@ -14,7 +14,6 @@ struct MainToolbar: ToolbarContent {
             } label: {
                 Label(tr("toolbar.add"), systemImage: "plus")
             }
-            .keyboardShortcut("n")
             .help(tr("toolbar.addHelp"))
             .disabled(model.engine == nil)
             Button {
@@ -47,7 +46,7 @@ struct SpeedReadout: View {
     var body: some View {
         HStack(spacing: 6) {
             // Idle shows nothing (UI-GUIDELINES §2).
-            Text(samples.isEmpty ? "" : Format.speed(speed))
+            Text(samples.isEmpty || speed == 0 ? "" : Format.speed(speed))
                 .monospacedDigit()
                 .font(.callout)
                 .foregroundStyle(.secondary)

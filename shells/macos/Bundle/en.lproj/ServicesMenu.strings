@@ -1,0 +1,3 @@
+/* The Services menu item (Info.plist NSServices): links selected in any app
+   open Dhow's Add dialog. */
+"Download with Dhow" = "Download with Dhow";
