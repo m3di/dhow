@@ -704,6 +704,8 @@ async fn fetch(
                 }
                 match step {
                     Step::Wait => {}
+                    // Downgraded earlier in this pass: `can_ramp` is stale.
+                    Step::Open if single.load(Ordering::Relaxed) => {}
                     // The budget decides whether ramp-up may have it.
                     Step::Open if !ticket.try_grow() => ramp.blocked(now, rc),
                     Step::Open => {
@@ -740,7 +742,9 @@ async fn fetch(
                 Tuned::Connections(n) => {
                     let before = limit;
                     // Downgraded (§2.3, §9 Protocol): one, whatever is asked.
-                    limit = match single_now {
+                    // Read afresh: a connection may have downgraded it
+                    // earlier in this pass, after `single_now` was taken.
+                    limit = match single.load(Ordering::Relaxed) {
                         true => 1,
                         false => ramp::connection_limit(total, can_range, n, rc, link),
                     };
@@ -1261,7 +1265,9 @@ mod tests {
         let (stop_tx, stop) = watch::channel(false);
         let s = shared.clone();
         let ask = connections.clone();
-        let elder = tokio::spawn(async move {
+        // No coop budget: once the connection spent it, the pass's watch
+        // receivers would yield and leave the request to the next pass.
+        let elder = tokio::spawn(tokio::task::unconstrained(async move {
             let mut config = DownloadConfig::default();
             config.probe.range_get = false;
             config.ramp.min_chunk = 128 * 1024;
@@ -1273,7 +1279,7 @@ mod tests {
             };
             let client = crate::http::client().unwrap();
             download(&req, &client, &config, &s, &on_event, &stop).await
-        });
+        }));
         let mut until = async |what: &str, pred: &dyn Fn(&DownloadEvent) -> bool| {
             let wait = async {
                 while let Some(e) = events.recv().await {
