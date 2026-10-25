@@ -29,6 +29,14 @@ struct LogEntry: Identifiable, Equatable {
     var kind: Kind
 }
 
+/// A change the app acts on beyond drawing it.
+enum StoreChange: Equatable {
+    /// Completed or failed, as it is now.
+    case finished(DownloadSnapshot)
+    /// Its queue ran dry after `finished` downloads ended in this run.
+    case queueRanDry(QueueSnapshot, finished: Int)
+}
+
 /// A point of the detail pane's speed chart.
 struct SpeedPoint: Equatable {
     var at: Date
@@ -70,6 +78,16 @@ final class DownloadStore {
     nonisolated static let trailWindow: TimeInterval = 600
     /// Asked for when a download names a group the store hasn't seen.
     @ObservationIgnored var unknownGroup: (() -> Void)?
+    /// What the app acts on besides drawing: notifications, `on_complete`.
+    @ObservationIgnored var onChange: ((StoreChange) -> Void)?
+    /// Per queue, downloads that completed or failed since it was last
+    /// idle (a queue notifies after several).
+    private var finishedInRun: [String: Int] = [:]
+    /// Per queue: its last change was a download finishing. `QueueChanged`
+    /// follows every change to a queue's counts (ARCHITECTURE §3.2), so a
+    /// drop to 0 ends a run only when this is set; a pause, cancel, removal
+    /// or move that empties it doesn't.
+    private var lastWasFinish: [String: Bool] = [:]
     /// Events that came while a `list()` was being read (at launch, or
     /// reconciling): replayed over it, as they may be newer than it.
     private var early: [Event] = []
@@ -143,6 +161,7 @@ final class DownloadStore {
         }
         switch event {
         case .downloadAdded(let snapshot):
+            lastWasFinish[snapshot.queueId] = false
             if downloads[snapshot.id] == nil {
                 order.append(snapshot.id)
             }
@@ -152,13 +171,16 @@ final class DownloadStore {
                 unknownGroup?()
             }
         case .removed(let id):
+            if let q = downloads[id]?.queueId {
+                lastWasFinish[q] = false
+            }
             downloads[id] = nil
             live[id] = nil
             logs[id] = nil
             rangeMaps[id] = nil
             order.removeAll { $0 == id }
             sampleSpeed()
-        case .stateChanged(let id, _, let to, let reason):
+        case .stateChanged(let id, let from, let to, let reason):
             if downloads[id] != nil {
                 log(id, .state(to, reason))
             }
@@ -174,6 +196,16 @@ final class DownloadStore {
                 live[id] = nil
             }
             sampleSpeed()
+            // The event's own `from`: a `list()` read meanwhile (reconcile)
+            // may already hold the new state.
+            if from != to, let d = downloads[id] {
+                let finished = to == .completed || to == .failed
+                lastWasFinish[d.queueId] = finished
+                if finished {
+                    finishedInRun[d.queueId, default: 0] += 1
+                    onChange?(.finished(d))
+                }
+            }
         case .progress(let id, let downloaded, let total, let connections, let speed, let eta):
             guard downloads[id] != nil else { return }
             update(id) {
@@ -207,6 +239,15 @@ final class DownloadStore {
         case .settingsChanged(let settings):
             self.settings = settings
         case .queueChanged(let snapshot):
+            // Ran dry (ARCHITECTURE §3.2) because its last download
+            // finished: not emptied by a pause, cancel, removal or move.
+            let endedByFinish = lastWasFinish.removeValue(forKey: snapshot.id) ?? false
+            if snapshot.queued + snapshot.running == 0 {
+                let finished = finishedInRun.removeValue(forKey: snapshot.id) ?? 0
+                if let old = queue(snapshot.id), old.queued + old.running > 0, endedByFinish {
+                    onChange?(.queueRanDry(snapshot, finished: max(finished, 1)))
+                }
+            }
             if let i = queues.firstIndex(where: { $0.id == snapshot.id }) {
                 queues[i] = snapshot
             } else {
@@ -244,6 +285,15 @@ final class DownloadStore {
 
     var activeCount: Int {
         downloads.values.count { $0.state.isRunning }
+    }
+
+    /// The running downloads' progress together (the Dock's bar); `nil`
+    /// with none running or no size known.
+    var runningFraction: Double? {
+        let sized = downloads.values.filter { $0.state.isRunning && $0.totalSize != nil }
+        let total = sized.reduce(0) { $0 + ($1.totalSize ?? 0) }
+        let done = sized.reduce(0) { $0 + min($1.downloaded, $1.totalSize ?? 0) }
+        return Self.fraction(done, total)
     }
 
     /// The pane now shows `id` (or nothing); its trail is empty until

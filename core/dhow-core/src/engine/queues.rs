@@ -192,20 +192,32 @@ impl Engine {
         self.queue(&id)
     }
 
+    /// The default queue given an empty name goes back to none, which the
+    /// shell localizes (ARCHITECTURE §5.1).
     pub fn update_queue(&self, id: &str, spec: &QueueSpec) -> Result<QueueSnapshot, EngineError> {
-        validate(spec)?;
-        if self.queue(id)?.is_default && spec.schedule.is_some() {
+        let is_default = self.queue(id)?.is_default;
+        let unnamed = is_default && spec.name.trim().is_empty();
+        if unnamed {
+            validate(&QueueSpec {
+                name: "default".into(),
+                ..spec.clone()
+            })?;
+        } else {
+            validate(spec)?;
+        }
+        if is_default && spec.schedule.is_some() {
             return Err(EngineError::InvalidQueue(
                 "the default queue has no schedule",
             ));
         }
+        let name = (!unnamed).then_some(spec.name.as_str());
         self.db().conn().execute(
             "UPDATE queues SET name = ?2, max_concurrent = ?3, speed_limit = ?4, schedule = ?5,
                  on_complete = ?6
              WHERE id = ?1",
             params![
                 id,
-                spec.name,
+                name,
                 spec.max_concurrent,
                 spec.speed_limit.map(|v| v as i64),
                 schedule_json(spec),

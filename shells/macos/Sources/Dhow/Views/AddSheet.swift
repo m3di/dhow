@@ -19,10 +19,10 @@ struct AddSheet: View {
 
     /// The shell's default folder setting (Settings, General), else
     /// Downloads.
-    static let defaultFolderKey = "defaultFolder"
+    static let defaultFolderKey = Prefs.defaultFolder
 
     static var defaultFolder: URL {
-        if let path = UserDefaults.standard.string(forKey: defaultFolderKey) {
+        if let path = UserDefaults.standard.string(forKey: defaultFolderKey), !path.isEmpty {
             return URL(fileURLWithPath: path, isDirectory: true)
         }
         return FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
@@ -80,6 +80,12 @@ struct AddSheet: View {
         .fileImporter(isPresented: $choosingFolder, allowedContentTypes: [.folder]) { result in
             if case .success(let url) = result {
                 add.directory = url
+            }
+        }
+        // Settings (General): the folder is asked for as the dialog opens.
+        .onAppear {
+            if UserDefaults.standard.bool(forKey: Prefs.askWhereToSave) {
+                choosingFolder = true
             }
         }
         .task(id: add.probeKey) {

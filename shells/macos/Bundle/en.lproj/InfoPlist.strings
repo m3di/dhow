@@ -1,0 +1,3 @@
+/* Shown when macOS asks whether Dhow may send the shut-down request
+   (a queue's "When the queue is done: Shut down"). */
+"NSAppleEventsUsageDescription" = "Dhow asks macOS to shut down when a queue you set to do so has finished.";

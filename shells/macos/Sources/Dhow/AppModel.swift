@@ -1,6 +1,7 @@
 import AppKit
 import DhowCore
 import Observation
+import os
 
 /// Hands the core's events, which arrive on its event thread, to the store
 /// on the main queue, in order. Holds the store weakly; nothing here holds
@@ -69,9 +70,166 @@ final class AppModel {
     /// While the engine opens: quitting waits for it.
     @ObservationIgnored private(set) var opening: Task<Void, Never>?
 
+    /// The sidebar's choice: a filter, queue or category, or Storage.
+    var sidebar: SidebarItem? = .filter(.all)
+    /// A destructive action waiting for the user's yes (the list, the
+    /// pane and the Download menu ask the same way).
+    var confirmation: Confirmation?
+    /// A sheet or dialog is up in the main window: the Download menu's
+    /// shortcuts (⌘. is also Cancel) stay out of its way.
+    var isModal: Bool { add != nil || confirmation != nil || alert != nil }
+    /// `on_complete`'s countdown while it runs.
+    private(set) var countdown: Countdown?
+
+    /// Posts notifications; `nil` outside Dhow.app (tests set their own).
+    @ObservationIgnored var notifier: Notifier?
+    @ObservationIgnored var system: SystemActions = MacSystemActions()
+    @ObservationIgnored var countdownPanel: CountdownPanel?
+    @ObservationIgnored var countdownLength = 60
+    @ObservationIgnored var countdownTick = Duration.seconds(1)
+    @ObservationIgnored private var countdownTask: Task<Void, Never>?
+    /// Opens (or brings back) the main window; set by the window.
+    @ObservationIgnored var openMainWindow: (() -> Void)?
+    @ObservationIgnored private var pendingNoteClick: (String, Bool)?
+
     init() {
+        Prefs.register()
         listener.store = store
         store.unknownGroup = { [weak self] in self?.refreshGroups() }
+        store.onChange = { [weak self] in self?.handle($0) }
+    }
+
+    /// `DHOW_LOG_DIR`, else the platform's (ARCHITECTURE §5.3).
+    nonisolated static var logDirectory: String? {
+        ProcessInfo.processInfo.environment["DHOW_LOG_DIR"] ?? defaultLogDir()
+    }
+
+    // MARK: Notifications, on_complete
+
+    private func handle(_ change: StoreChange) {
+        for note in NotePolicy.notes(for: change, in: store, .read()) {
+            notifier?.post(note)
+        }
+        if case .queueRanDry(let q, _) = change, let action = Countdown.action(for: q.onComplete) {
+            startCountdown(action, queue: q.title)
+        }
+    }
+
+    /// A notification clicked: the file opens (or shows in Finder).
+    func openFromNote(_ id: String, reveal: Bool) {
+        // Dhow launched by the click: once the list is read.
+        guard store.loaded else {
+            pendingNoteClick = (id, reveal)
+            return
+        }
+        if !reveal, UserDefaults.standard.bool(forKey: Prefs.openFromNotification),
+            store.downloads[id]?.state == .completed
+        {
+            open([id])
+        } else {
+            showInFinder([id])
+        }
+    }
+
+    /// `on_complete` never acts silently: a countdown shows, can be
+    /// cancelled, and stops if anything starts downloading meanwhile.
+    func startCountdown(_ action: Countdown.Action, queue: String) {
+        // Another queue still at work: the Mac isn't done.
+        guard store.activeCount == 0 else { return }
+        if let running = countdown {
+            // Two queues ran dry: shutting down wins over sleeping, with
+            // the full time to cancel it.
+            if action == .shutDown, running.action == .sleep {
+                countdown = Countdown(action: action, queue: queue, secondsLeft: countdownLength)
+                notifier?.post(Self.countdownNote(countdown!))
+            }
+            return
+        }
+        countdown = Countdown(action: action, queue: queue, secondsLeft: countdownLength)
+        countdownPanel?.show(self)
+        // Said twice: the panel, and a notification in case it's missed.
+        notifier?.post(Self.countdownNote(countdown!))
+        let tick = countdownTick
+        countdownTask = Task { [weak self] in
+            while let self, let left = self.countdown?.secondsLeft, left > 0 {
+                try? await Task.sleep(for: tick)
+                guard !Task.isCancelled else { return }
+                if self.store.activeCount > 0 {
+                    self.cancelCountdown()
+                    return
+                }
+                self.countdown?.secondsLeft -= 1
+            }
+            self?.finishCountdown()
+        }
+    }
+
+    func cancelCountdown() {
+        countdownTask?.cancel()
+        countdownTask = nil
+        countdown = nil
+        countdownPanel?.hide()
+    }
+
+    /// Its time is up, or the user chose to go now.
+    func finishCountdown() {
+        guard let action = countdown?.action else { return }
+        cancelCountdown()
+        let failure: String?
+        switch action {
+        case .sleep: failure = system.sleep()
+        case .shutDown: failure = system.shutDown()
+        }
+        // Never fail silently either: logged, and said.
+        if let failure {
+            Self.log.error("on_complete \(String(describing: action)) failed: \(failure)")
+            let message =
+                action == .sleep ? tr("countdown.sleepFailed") : tr("countdown.shutDownFailed")
+            notifier?.post(
+                Note(kind: .queue, title: message, body: "", downloadId: nil, sound: true))
+            alert = AppAlert(message: message)
+        }
+    }
+
+    static let log = Logger(subsystem: "app.dhow.Dhow", category: "on-complete")
+
+    /// Asked when a queue is set to shut down: macOS may want the user's
+    /// consent (Automation) to let Dhow send the request, better now than
+    /// unattended at the end of a night's downloads.
+    func mayShutDown() async -> Bool {
+        let system = system
+        return await Task.detached { system.mayShutDown(ask: true) }.value
+    }
+
+    static func countdownNote(_ c: Countdown) -> Note {
+        Note(
+            kind: .queue,
+            title: c.action == .sleep
+                ? tr("countdown.sleepNote \(c.queue)") : tr("countdown.shutDownNote \(c.queue)"),
+            body: tr("countdown.noteBody"), downloadId: nil, sound: true)
+    }
+
+    // MARK: Windows
+
+    func showMainWindow() {
+        // No app outside Dhow.app (tests).
+        NSApp?.activate()
+        openMainWindow?()
+    }
+
+    /// Links from a drop, the Services menu or the clipboard: the Add
+    /// dialog, prefilled (UI-GUIDELINES §2).
+    func add(links: [String]) {
+        guard engine != nil, !links.isEmpty else { return }
+        showMainWindow()
+        add = AddPrefill(text: links.joined(separator: "\n"))
+    }
+
+    /// The queue the Add dialog preselects: Settings' (General), else the
+    /// default queue.
+    var queueForAdd: String {
+        let chosen = UserDefaults.standard.string(forKey: Prefs.defaultQueue)
+        return store.queues.first { $0.id == chosen }?.id ?? store.defaultQueue?.id ?? ""
     }
 
     func start() {
@@ -98,9 +256,12 @@ final class AppModel {
         let data =
             env["DHOW_DATA_DIR"] ?? defaultDataDir()
             ?? support[0].appendingPathComponent("Dhow").path
-        if let logs = env["DHOW_LOG_DIR"] ?? defaultLogDir() {
-            // Once per process; a failure only loses the log.
-            try? initLogging(dir: logs, filter: env["DHOW_LOG"])
+        if let logs = logDirectory {
+            // Once per process; a failure only loses the log. The level is
+            // Settings' (Advanced), read here: it applies after a restart.
+            let level = UserDefaults.standard.string(forKey: Prefs.logLevel)
+                .flatMap(LogLevel.init(rawValue:))
+            try? initLogging(dir: logs, filter: env["DHOW_LOG"] ?? level?.filter)
         }
         return try Engine.open(
             dataDir: data, config: EngineConfig(), listener: listener, adapter: nil)
@@ -124,6 +285,10 @@ final class AppModel {
         store.load(
             downloads: loaded.downloads, queues: loaded.queues, groups: loaded.groups,
             settings: loaded.settings)
+        if let (id, reveal) = pendingNoteClick {
+            pendingNoteClick = nil
+            openFromNote(id, reveal: reveal)
+        }
     }
 
     /// Stops every run cleanly; the next launch continues them. A quit
@@ -425,7 +590,7 @@ final class AppModel {
 
     /// The pane shows `id` (`nil`: nothing, or it closed): its speed
     /// history is read, and its segment map watched while it runs.
-    func showDetail(_ id: String?) {
+    func showDetail(_ id: String?, ranges: Bool = true) {
         if id != store.trailId {
             store.showTrail(id)
             if let id, let engine {
@@ -435,7 +600,9 @@ final class AppModel {
                 }
             }
         }
-        let calls = rangeWatch.show(id, state: id.flatMap { store.downloads[$0]?.state })
+        // With the map turned off (Settings, Advanced) no ranges are watched.
+        let state = ranges ? id.flatMap { store.downloads[$0]?.state } : nil
+        let calls = rangeWatch.show(id, state: state)
         guard let engine, !calls.isEmpty else { return }
         // In order: an off overtaken by its on would leave a map ticking.
         watchQueue.async {
@@ -456,6 +623,17 @@ final class AppModel {
         inOrder(
             [id], { _ = try $0.setConnections(id: $1, connections: connections) },
             done: { [store] in store.adjust($0) { $0.connections = connections } })
+    }
+
+    // MARK: Queues (Settings)
+
+    /// Runs a queue command off the main thread; `QueueChanged` and
+    /// `QueueRemoved` bring the result to the store.
+    func queueCommand<T: Sendable>(_ op: @escaping @Sendable (Engine) throws -> T) async throws
+        -> T?
+    {
+        guard let engine else { return nil }
+        return try await Task.detached { try op(engine) }.value
     }
 
     // MARK: Storage, settings

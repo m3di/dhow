@@ -301,3 +301,110 @@
 "network.cellular" = "Cellular";
 "network.vpn" = "VPN";
 "network.unknown" = "Unknown";
+
+/* Menus (UI-GUIDELINES §8 macOS) */
+"menu.newDownload" = "New Download…";
+"menu.download" = "Download";
+"menu.showInspector" = "Show Details";
+"menu.hideInspector" = "Hide Details";
+"menu.website" = "Dhow Website";
+
+/* Notifications: a title, then a short body. */
+"note.completed" = "Download complete";
+"note.failed" = "Download stopped";
+/* A file name, then why, e.g. "Server error 404". */
+"note.failedBody %@ %@" = "%1$@: %2$@";
+"note.groupCompleted" = "Downloads complete";
+/* A group's name, then how many files it has. */
+"note.groupBody %@ %lld" = "%1$@: all %2$lld files are done.";
+/* A queue's name. */
+"note.queueFinished %@" = "Queue “%@” is done";
+
+/* on_complete: never silent, always cancellable. */
+/* A queue's name. */
+"countdown.because %@" = "Queue “%@” has finished.";
+/* A queue's name. */
+"countdown.sleepNote %@" = "Queue “%@” is done: your Mac will sleep in a minute";
+/* A queue's name. */
+"countdown.shutDownNote %@" = "Queue “%@” is done: your Mac will shut down in a minute";
+"countdown.noteBody" = "Open Dhow to cancel.";
+"countdown.sleepFailed" = "Dhow couldn't put your Mac to sleep. The log has the details.";
+"countdown.shutDownFailed" = "Dhow couldn't shut down your Mac. If macOS asked whether Dhow may control “loginwindow”, allow it in System Settings > Privacy & Security > Automation.";
+"countdown.sleepNow" = "Sleep Now";
+"countdown.shutDownNow" = "Shut Down Now";
+
+/* Settings: General */
+"settings.askWhereToSave" = "Ask where to save each download";
+"settings.defaultQueue" = "Add downloads to";
+"settings.openFromNotification" = "Open a completed file when its notification is clicked";
+"settings.launchAtLogin" = "Open Dhow at login";
+"settings.loginApproval" = "Allow Dhow in System Settings to finish turning this on.";
+"settings.openLoginItems" = "Open Login Items";
+"settings.loginFailed" = "Dhow couldn't change this. Try again in System Settings > General > Login Items.";
+
+/* Settings: tabs */
+"settings.queues" = "Queues";
+"settings.categoriesTab" = "Categories";
+"settings.notifications" = "Notifications";
+"settings.about" = "About";
+
+/* Settings: Notifications */
+"settings.notifyCompleted" = "When a download completes";
+"settings.notifyFailed" = "When a download stops with an error";
+"settings.notifyGroups" = "When a group of downloads completes";
+"settings.notifyQueues" = "When a queue finishes several downloads";
+"settings.notifySound" = "Play a sound";
+"settings.notifyNote" = "A download in a group doesn't notify on its own; the group does, once all of it is done.";
+"settings.notificationsOff" = "Notifications are turned off for Dhow in System Settings.";
+"settings.openNotifications" = "Open Notifications Settings";
+
+/* Settings: Advanced */
+"settings.logLevel" = "Log";
+"settings.logErrors" = "Errors only";
+"settings.logStandard" = "Standard";
+"settings.logDetailed" = "Detailed";
+"settings.logNote" = "The log level applies after Dhow restarts. Logs never hold cookies, passwords or link parameters.";
+"settings.openLogs" = "Open Logs Folder";
+"settings.showSegmentMap" = "Show the segment map in details";
+"settings.segmentMapNote" = "Off, details show a plain progress bar.";
+
+/* Settings: About */
+/* The app's version, then the core's. */
+"about.version %@ %@" = "Version %1$@ (core %2$@)";
+"about.license" = "Dhow is free software under the GNU General Public License, version 3.";
+"about.licenseLink" = "License";
+"about.source" = "Source Code";
+"about.credits" = "Dhow uses UniFFI by Mozilla, under the Mozilla Public License 2.0, and other open-source Rust libraries whose licenses come with the source code.";
+"about.uniffiSource" = "UniFFI Source Code";
+
+/* Settings: Queues */
+"queue.add" = "Add Queue";
+"queue.delete" = "Delete Queue";
+/* A queue's name. */
+"queue.deleteTitle %@" = "Delete the queue “%@”?";
+"queue.deleteMessage" = "Its downloads move to the Default queue.";
+"queue.newName" = "New Queue";
+/* A queue's name. */
+"queue.unsavedTitle %@" = "Save your changes to “%@”?";
+"queue.discard" = "Don't Save";
+"queue.shutDownBlocked" = "macOS doesn't let Dhow shut down your Mac. Allow Dhow to control “loginwindow” in System Settings > Privacy & Security > Automation.";
+"queue.none" = "Select a queue.";
+"queue.name" = "Name";
+"queue.maxConcurrent" = "Downloads at once";
+"queue.limit" = "Limit this queue's speed";
+"queue.whenDone" = "When the queue is done";
+"queue.whenDoneNothing" = "Do nothing";
+"queue.whenDoneSleep" = "Sleep";
+"queue.whenDoneShutDown" = "Shut down";
+"queue.whenDoneHibernate" = "Hibernate (sleeps on a Mac)";
+"queue.whenDoneNote" = "Dhow counts down for a minute first, and you can cancel. It doesn't if something else is still downloading.";
+"queue.schedule" = "Schedule";
+"queue.scheduled" = "Run on a schedule";
+"queue.scheduleAction" = "Outside these hours";
+"queue.actionStart" = "Keep going once started";
+"queue.actionWithin" = "Stop";
+"queue.addWindow" = "Add Hours";
+"queue.removeWindow" = "Remove Hours";
+"queue.from" = "From";
+"queue.to" = "To";
+"queue.invalid" = "Check the queue: it needs a name, at least one download at once, and a day for each set of hours.";

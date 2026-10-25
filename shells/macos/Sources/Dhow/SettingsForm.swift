@@ -4,7 +4,8 @@ import Observation
 
 /// The Settings window's fields (UI-GUIDELINES §7) in the units it shows:
 /// kB/s (1000 bytes, as `Format` shows them), seconds, lists as text. Every
-/// `DhowSettings` field, plus the shell's default folder.
+/// `DhowSettings` field; the shell's own settings apply as they change
+/// (`Prefs`).
 struct SettingsDraft: Equatable {
     enum Proxy: Hashable { case system, direct, custom }
 
@@ -14,7 +15,6 @@ struct SettingsDraft: Equatable {
         var key: String
     }
 
-    var defaultFolder = ""
     var limitOn = false
     var limitKB = 0
     var headroomPercent = 0
@@ -40,8 +40,7 @@ struct SettingsDraft: Equatable {
 
     init() {}
 
-    init(_ s: DhowSettings, folder: String) {
-        defaultFolder = folder
+    init(_ s: DhowSettings) {
         limitOn = s.globalSpeedLimit != nil
         limitKB = Int(clamping: (s.globalSpeedLimit ?? 1_000_000) / 1000)
         headroomPercent = Int(s.headroomPercent)
@@ -83,7 +82,7 @@ struct SettingsDraft: Equatable {
             return x
         }
         // Compared as shown: a limit the CLI set in bytes stays unless edited.
-        let shown = SettingsDraft(s, folder: "")
+        let shown = SettingsDraft(s)
         if limitOn != shown.limitOn || limitKB != shown.limitKB {
             if limitOn {
                 let kb: UInt64 = try fit(limitKB, "global_speed_limit")
@@ -147,7 +146,6 @@ struct SettingsDraft: Equatable {
                 d[keyPath: field] = new[keyPath: field]
             }
         }
-        follow(\.defaultFolder)
         follow(\.limitOn)
         follow(\.limitKB)
         follow(\.headroomPercent)
@@ -195,7 +193,15 @@ struct SettingsDraft: Equatable {
 
 /// The tabs of the Settings window, in UI-GUIDELINES §7's order.
 enum SettingsTab: Hashable, CaseIterable {
-    case general, connections, speed, network, categories
+    case general, connections, speed, network, queues, categories, notifications, advanced, about
+
+    /// Its fields are the core's, saved together (the others apply at once).
+    var savesDraft: Bool {
+        switch self {
+        case .connections, .speed, .network, .categories: true
+        default: false
+        }
+    }
 
     /// The tab showing a setting the core named in an error.
     static func of(key: String) -> SettingsTab? {
@@ -231,31 +237,25 @@ final class SettingsForm {
 
     var draft = SettingsDraft()
     private(set) var base: DhowSettings?
-    private(set) var baseFolder = ""
     /// `base` as the draft shows it: what edits are measured from.
     private var origin = SettingsDraft()
     private(set) var failure: Failure?
     private(set) var saving = false
 
-    /// Something to save: the patch isn't empty (or can't be made), or the
-    /// folder changed.
+    /// Something to save: the patch isn't empty, or can't be made.
     var isDirty: Bool {
         guard let base else { return false }
-        if draft.defaultFolder != baseFolder {
-            return true
-        }
         guard let patch = try? draft.patch(over: base) else { return true }
         return patch != SettingsPatch()
     }
 
     /// What the core has now. Fields the user hasn't edited follow it;
     /// edited ones stay.
-    func load(_ settings: DhowSettings, folder: String) {
-        let shown = SettingsDraft(settings, folder: folder)
+    func load(_ settings: DhowSettings) {
+        let shown = SettingsDraft(settings)
         draft = base == nil ? shown : draft.rebased(from: origin, to: shown)
         origin = shown
         base = settings
-        baseFolder = folder
     }
 
     func revert() {
@@ -271,11 +271,10 @@ final class SettingsForm {
         failure?.categories.contains(category) == true ? failure?.message : nil
     }
 
-    /// Sends the patch; on success the folder is stored too and the draft
-    /// is what the core now has. Returns the tab to show an error on.
+    /// Sends the patch; on success the draft is what the core now has. Returns the tab to show an error on.
     @discardableResult
     func save(
-        _ send: (SettingsPatch) async throws -> DhowSettings?, folder store: (String) -> Void
+        _ send: (SettingsPatch) async throws -> DhowSettings?
     ) async -> SettingsTab? {
         guard let base, !saving else { return nil }
         let patch: SettingsPatch
@@ -285,7 +284,6 @@ final class SettingsForm {
             failure = Failure(key: error.key, message: SettingsText.invalid(error.key, error))
             return SettingsTab.of(key: error.key)
         }
-        let folder = draft.defaultFolder
         saving = true
         defer { saving = false }
         do {
@@ -293,13 +291,9 @@ final class SettingsForm {
             if patch != SettingsPatch() {
                 stored = try await send(patch) ?? base
             }
-            if folder != baseFolder {
-                store(folder)
-            }
             failure = nil
             self.base = stored
-            baseFolder = folder
-            origin = SettingsDraft(stored, folder: folder)
+            origin = SettingsDraft(stored)
             draft = origin
             return nil
         } catch {
