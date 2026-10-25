@@ -22,6 +22,8 @@ pub(super) enum Stored {
         https: Option<String>,
         all: Option<String>,
         no_proxy: Vec<String>,
+        #[serde(default)]
+        exclude_simple_hosts: bool,
     },
 }
 
@@ -60,6 +62,7 @@ impl Stored {
                     https: s(&c.https),
                     all: s(&c.all),
                     no_proxy: c.no_proxy.clone(),
+                    exclude_simple_hosts: c.exclude_simple_hosts,
                 }
             }
         })
@@ -76,12 +79,14 @@ impl Stored {
                 https,
                 all,
                 no_proxy,
+                exclude_simple_hosts,
             } => ProxyMode::Custom(Box::new(ProxyConfig {
                 http: parse(http)?,
                 https: parse(https)?,
                 all: parse(all)?,
                 no_proxy,
                 pac: None,
+                exclude_simple_hosts,
             })),
         })
     }

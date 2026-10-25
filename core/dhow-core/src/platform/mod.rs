@@ -43,6 +43,9 @@ pub struct ProxyConfig {
     pub no_proxy: Vec<String>,
     /// Auto-configuration script. Informational: the core doesn't run PAC.
     pub pac: Option<Url>,
+    /// Hosts without a dot (`intranet`, `nas`) go direct: macOS's "Exclude
+    /// simple hostnames". Linux desktops have no such setting.
+    pub exclude_simple_hosts: bool,
 }
 
 impl fmt::Debug for ProxyConfig {
@@ -54,6 +57,7 @@ impl fmt::Debug for ProxyConfig {
             .field("all", &url(&self.all))
             .field("no_proxy", &self.no_proxy)
             .field("pac", &url(&self.pac))
+            .field("exclude_simple_hosts", &self.exclude_simple_hosts)
             .finish()
     }
 }
@@ -170,6 +174,7 @@ mod tests {
             all: secret("socks5://p.test:3"),
             no_proxy: vec!["lan".into()],
             pac: secret("http://cfg.test/p.pac?auth=s3cret"),
+            exclude_simple_hosts: false,
         };
         assert_eq!(
             redact_proxy_url(config.http.as_ref().unwrap()),

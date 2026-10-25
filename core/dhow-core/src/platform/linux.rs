@@ -201,6 +201,7 @@ fn env_proxy(env: &Lookup) -> Option<ProxyConfig> {
         all: get("all_proxy").and_then(|v| proxy_url(&v, "http")),
         no_proxy: get("no_proxy").map_or_else(Vec::new, |v| split_hosts(&v)),
         pac: None,
+        exclude_simple_hosts: false,
     };
     (!config.is_direct()).then_some(config)
 }
@@ -257,6 +258,7 @@ fn gnome_proxy(listing: &str) -> Option<ProxyConfig> {
                 .and_then(gvariant_strings)
                 .unwrap_or_default(),
             pac: None,
+            exclude_simple_hosts: false,
         },
         "auto" => ProxyConfig {
             pac: wpad_or(gvariant_strings(get("", "autoconfig-url")?)?.pop()),
@@ -337,6 +339,7 @@ fn kde_proxy(text: &str, env: &Lookup) -> Option<ProxyConfig> {
                 all: field("socksProxy", "socks5"),
                 no_proxy: no_proxy.map_or_else(Vec::new, |v| split_hosts(&v)),
                 pac: None,
+                exclude_simple_hosts: false,
             }
         }
         "2" => ProxyConfig {
@@ -470,6 +473,7 @@ mod tests {
                     "10.0.0.0/8".into()
                 ],
                 pac: None,
+                exclude_simple_hosts: false,
             })
         );
     }
@@ -521,6 +525,7 @@ org.gnome.system.proxy.socks port 0
                     "it's.example".into()
                 ],
                 pac: None,
+                exclude_simple_hosts: false,
             })
         );
     }
@@ -612,6 +617,7 @@ org.gnome.system.proxy.socks port 0
                 all: url("socks5://s.test:1080"),
                 no_proxy: vec!["localhost".into(), ".lan".into()],
                 pac: None,
+                exclude_simple_hosts: false,
             })
         );
         let script = "[Proxy Settings]\nProxyType=2\nProxy Config Script=http://cfg.test/p.pac\n";

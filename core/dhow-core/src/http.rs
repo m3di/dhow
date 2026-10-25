@@ -34,20 +34,58 @@ pub fn client_via(proxy: &ProxyConfig) -> Result<Client, reqwest::Error> {
         .no_proxy();
     let list = bypass_list(&proxy.no_proxy);
     let bypass = || NoProxy::from_string(&list);
-    // Scheme-specific first: reqwest takes the first that matches.
-    if let Some(url) = &proxy.http {
+    if proxy.exclude_simple_hosts {
+        // reqwest's proxies can't skip dotless hosts, so one custom proxy
+        // decides it all, `no_proxy` included.
+        let config = proxy.clone();
+        let no_proxy = no_proxy_matcher(&list);
+        builder = builder.proxy(Proxy::custom(move |url| proxy_for(&config, &no_proxy, url)));
+    } else if let Some(url) = &proxy.http {
+        // Scheme-specific first: reqwest takes the first that matches.
         builder = builder.proxy(Proxy::http(url.clone())?.no_proxy(bypass()));
     }
-    if let Some(url) = &proxy.https {
-        builder = builder.proxy(Proxy::https(url.clone())?.no_proxy(bypass()));
-    }
-    if let Some(url) = &proxy.all {
-        builder = builder.proxy(Proxy::all(url.clone())?.no_proxy(bypass()));
+    if !proxy.exclude_simple_hosts {
+        if let Some(url) = &proxy.https {
+            builder = builder.proxy(Proxy::https(url.clone())?.no_proxy(bypass()));
+        }
+        if let Some(url) = &proxy.all {
+            builder = builder.proxy(Proxy::all(url.clone())?.no_proxy(bypass()));
+        }
     }
     if let Some(pac) = &proxy.pac {
         tracing::warn!(pac = %redact_proxy_url(pac), "proxy auto-config is not evaluated");
     }
     builder.build()
+}
+
+/// Matches what `list` sends direct, with reqwest's own rules (domains and
+/// their subdomains, IPs, CIDRs, `*`): a stand-in proxy it skips for them.
+fn no_proxy_matcher(list: &str) -> hyper_util::client::proxy::matcher::Matcher {
+    hyper_util::client::proxy::matcher::Matcher::builder()
+        .all("http://no-proxy.invalid:1")
+        .no(list)
+        .build()
+}
+
+/// The proxy for `url` when dotless hosts go direct: none for those and
+/// for `no_proxy`, else the scheme's own, then `all`.
+fn proxy_for(
+    config: &ProxyConfig,
+    no_proxy: &hyper_util::client::proxy::matcher::Matcher,
+    url: &Url,
+) -> Option<Url> {
+    // A name without a dot; IPv6 literals ("[::1]") have colons.
+    let host = url.host_str()?;
+    if !host.contains('.') && !host.contains(':') {
+        return None;
+    }
+    let uri: http::Uri = url.as_str().parse().ok()?;
+    no_proxy.intercept(&uri)?;
+    match url.scheme() {
+        "http" => config.http.clone().or_else(|| config.all.clone()),
+        "https" => config.https.clone().or_else(|| config.all.clone()),
+        _ => config.all.clone(),
+    }
 }
 
 /// `no_proxy` as reqwest reads it: it knows `example.com`,
@@ -198,6 +236,30 @@ mod tests {
     fn redact_drops_credentials() {
         let url = Url::parse("https://user:pw@example.com:8443/a/b.zip?token=s3cret#frag").unwrap();
         assert_eq!(redact(&url), "https://example.com:8443/a/b.zip");
+    }
+
+    #[test]
+    fn simple_hosts_and_no_proxy_go_direct_the_rest_by_scheme() {
+        let p = |s: &str| Url::parse(s).ok();
+        let config = ProxyConfig {
+            http: p("http://web.proxy:3128"),
+            all: p("socks5h://socks.proxy:1080"),
+            no_proxy: vec!["*.corp.test".into(), "10.0.0.0/8".into()],
+            exclude_simple_hosts: true,
+            ..ProxyConfig::default()
+        };
+        let matcher = no_proxy_matcher(&bypass_list(&config.no_proxy));
+        let route = |u: &str| proxy_for(&config, &matcher, &Url::parse(u).unwrap());
+        assert_eq!(route("http://intranet/a"), None);
+        assert_eq!(route("http://nas:8080/a"), None);
+        assert_eq!(route("http://files.corp.test/a"), None);
+        assert_eq!(route("http://10.1.2.3/a"), None);
+        assert_eq!(route("http://example.com/a"), config.http);
+        // HTTPS has no proxy of its own: SOCKS.
+        assert_eq!(route("https://example.com/a"), config.all);
+        // IP literals aren't names.
+        assert_eq!(route("http://192.168.1.1/a"), config.http);
+        assert_eq!(route("http://[fd00::1]/a"), config.http);
     }
 
     #[test]

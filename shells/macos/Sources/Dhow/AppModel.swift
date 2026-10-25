@@ -81,6 +81,12 @@ final class AppModel {
     /// `on_complete`'s countdown while it runs.
     private(set) var countdown: Countdown?
 
+    /// The network path as macOS last reported it (metered, Low Data Mode:
+    /// what the core's `NetworkInfo` doesn't carry), for Settings.
+    private(set) var networkFacts: NetworkFacts?
+    /// The platform adapter given to the engine (M4.3).
+    @ObservationIgnored private(set) var adapter: MacAdapter?
+
     /// Posts notifications; `nil` outside Dhow.app (tests set their own).
     @ObservationIgnored var notifier: Notifier?
     @ObservationIgnored var system: SystemActions = MacSystemActions()
@@ -235,9 +241,16 @@ final class AppModel {
     func start() {
         guard engine == nil, opening == nil, openFailure == nil else { return }
         let listener = listener
+        let adapter = MacAdapter()
+        self.adapter = adapter
         opening = Task {
             do {
-                let engine = try await Task.detached { try Self.open(listener) }.value
+                let engine = try await Task.detached { try Self.open(listener, adapter) }.value
+                // The network monitor tells the engine of changes; the first
+                // path seen fills the Settings card.
+                adapter.network.engine = engine
+                adapter.network.onChange = { [weak self] in self?.networkFacts = $0 }
+                adapter.network.start()
                 try await attach(engine)
                 observeSystem()
             } catch {
@@ -249,7 +262,9 @@ final class AppModel {
 
     /// The CLI's directories (shared on purpose, ARCHITECTURE §2), or
     /// `DHOW_DATA_DIR` / `DHOW_LOG_DIR` as the CLI reads them.
-    private nonisolated static func open(_ listener: Listener) throws -> Engine {
+    private nonisolated static func open(_ listener: Listener, _ adapter: MacAdapter) throws
+        -> Engine
+    {
         let env = ProcessInfo.processInfo.environment
         let support = FileManager.default.urls(
             for: .applicationSupportDirectory, in: .userDomainMask)
@@ -264,7 +279,7 @@ final class AppModel {
             try? initLogging(dir: logs, filter: env["DHOW_LOG"] ?? level?.filter)
         }
         return try Engine.open(
-            dataDir: data, config: EngineConfig(), listener: listener, adapter: nil)
+            dataDir: data, config: EngineConfig(), listener: listener, adapter: adapter)
     }
 
     private struct Loaded: Sendable {
@@ -296,6 +311,7 @@ final class AppModel {
     func shutdown() async {
         await opening?.value
         removeObservers()
+        adapter?.network.stop()
         await engine?.shutdown()
     }
 

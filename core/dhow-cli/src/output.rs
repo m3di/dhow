@@ -205,5 +205,6 @@ fn proxy(c: &ProxyConfig) -> Value {
     json!({
         "http": url(&c.http), "https": url(&c.https), "all": url(&c.all),
         "no_proxy": c.no_proxy, "pac": url(&c.pac),
+        "exclude_simple_hosts": c.exclude_simple_hosts,
     })
 }
