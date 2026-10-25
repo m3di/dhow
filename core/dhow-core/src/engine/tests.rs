@@ -859,7 +859,7 @@ mod limit_tests {
                 headroom_percent: Some(100),
                 ..SettingsPatch::default()
             }),
-            Err(EngineError::InvalidSetting(_))
+            Err(EngineError::InvalidSetting { .. })
         ));
         assert_eq!(fx.engine.shared.global.rate(), Some(1_000_000));
         set(SettingsPatch {
@@ -1142,7 +1142,7 @@ mod category_tests {
         assert_eq!(fx.engine.settings().unwrap().extra_extensions, extra);
         assert!(matches!(
             set_extras(&fx, Category::Video, &["a/b"]),
-            Err(EngineError::InvalidSetting(_))
+            Err(EngineError::InvalidSetting { .. })
         ));
         // `Other` takes a built-in back out of its category.
         set_extras(&fx, Category::Other, &["bin"]).unwrap();

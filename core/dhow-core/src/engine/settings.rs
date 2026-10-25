@@ -35,7 +35,7 @@ const USE_CONTENT_DISPOSITION: &str = "use_content_disposition";
 const APPEND_TYPE_EXTENSION: &str = "append_type_extension";
 const AUTO_GROUPING: &str = "auto_grouping";
 const EXTRA_EXTENSIONS: &str = "extra_extensions";
-const PROXY_MODE: &str = "proxy_mode";
+pub(super) const PROXY_MODE: &str = "proxy_mode";
 
 /// Every setting, as in effect. Speed limits apply to running downloads at
 /// once (in another process at its next [`Engine::refresh_limits`]); the
@@ -260,11 +260,11 @@ fn put(conn: &Connection, key: &str, value: &Value) -> Result<(), EngineError> {
     Ok(())
 }
 
-fn invalid(ok: bool, why: &'static str) -> Result<(), EngineError> {
+fn invalid(ok: bool, key: &'static str, why: &'static str) -> Result<(), EngineError> {
     if ok {
         Ok(())
     } else {
-        Err(EngineError::InvalidSetting(why))
+        Err(EngineError::InvalidSetting { key, why })
     }
 }
 
@@ -289,7 +289,7 @@ impl Engine {
             macro_rules! set {
                 ($field:ident, $key:expr, |$v:ident| $valid:expr, $why:expr) => {
                     if let Some($v) = patch.$field {
-                        invalid($valid, $why)?;
+                        invalid($valid, $key, $why)?;
                         s.$field = $v;
                         rows.push(($key, json!($v)));
                     }
@@ -371,8 +371,14 @@ impl Engine {
             );
             set!(append_type_extension, APPEND_TYPE_EXTENSION, |v| true, "");
             set!(auto_grouping, AUTO_GROUPING, |v| true, "");
+            // Blamed on the one the patch sets (the default, if both).
             invalid(
                 s.default_connections <= s.max_connections_per_download,
+                if patch.default_connections.is_some() {
+                    DEFAULT_CONNECTIONS
+                } else {
+                    MAX_CONNECTIONS_PER_DOWNLOAD
+                },
                 "default connections above the per-download maximum",
             )?;
             if !patch.extra_extensions.is_empty() {
@@ -382,7 +388,10 @@ impl Engine {
                         .iter()
                         .map(|e| normalize_extension(e))
                         .collect::<Option<Vec<_>>>()
-                        .ok_or(EngineError::InvalidSetting("not a file extension"))?;
+                        .ok_or(EngineError::InvalidSetting {
+                            key: EXTRA_EXTENSIONS,
+                            why: "not a file extension",
+                        })?;
                     exts.sort();
                     exts.dedup();
                     for list in s.extra_extensions.values_mut() {
@@ -572,74 +581,122 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = open(dir.path());
         let bad_proxy = ProxyMode::Custom(Box::default());
-        for bad in [
-            SettingsPatch {
-                headroom_percent: Some(100),
-                ..everything()
-            },
-            SettingsPatch {
-                global_connections: Some(0),
-                ..everything()
-            },
-            SettingsPatch {
-                per_host_connections: Some(0),
-                ..everything()
-            },
-            SettingsPatch {
-                min_connections_for_new: Some(2),
-                ..everything()
-            },
-            SettingsPatch {
-                default_connections: Some(0),
-                ..everything()
-            },
+        for (bad, key) in [
+            (
+                SettingsPatch {
+                    headroom_percent: Some(100),
+                    ..everything()
+                },
+                HEADROOM_PERCENT,
+            ),
+            (
+                SettingsPatch {
+                    global_connections: Some(0),
+                    ..everything()
+                },
+                GLOBAL_CONNECTIONS,
+            ),
+            (
+                SettingsPatch {
+                    per_host_connections: Some(0),
+                    ..everything()
+                },
+                PER_HOST_CONNECTIONS,
+            ),
+            (
+                SettingsPatch {
+                    min_connections_for_new: Some(2),
+                    ..everything()
+                },
+                MIN_CONNECTIONS_FOR_NEW,
+            ),
+            (
+                SettingsPatch {
+                    default_connections: Some(0),
+                    ..everything()
+                },
+                DEFAULT_CONNECTIONS,
+            ),
             // Above the maximum it sets, or the stored one.
-            SettingsPatch {
-                default_connections: Some(13),
-                ..everything()
-            },
-            SettingsPatch {
-                default_connections: Some(17),
-                ..SettingsPatch::default()
-            },
-            SettingsPatch {
-                max_connections_per_download: Some(0),
-                ..everything()
-            },
-            SettingsPatch {
-                max_connections_per_download: Some(2),
-                ..SettingsPatch::default()
-            },
-            SettingsPatch {
-                first_byte_timeout_ms: Some(50),
-                ..everything()
-            },
-            SettingsPatch {
-                idle_timeout_ms: Some(3_600_001),
-                ..everything()
-            },
-            SettingsPatch {
-                max_retries: Some(0),
-                ..everything()
-            },
-            SettingsPatch {
-                commit_interval_ms: Some(60_001),
-                ..everything()
-            },
-            SettingsPatch {
-                proxy_mode: Some(bad_proxy.clone()),
-                ..everything()
-            },
-            SettingsPatch {
-                extra_extensions: vec![CategoryExtensions {
-                    category: Category::Video,
-                    extensions: vec!["a/b".into()],
-                }],
-                ..everything()
-            },
+            (
+                SettingsPatch {
+                    default_connections: Some(13),
+                    ..everything()
+                },
+                DEFAULT_CONNECTIONS,
+            ),
+            (
+                SettingsPatch {
+                    default_connections: Some(17),
+                    ..SettingsPatch::default()
+                },
+                DEFAULT_CONNECTIONS,
+            ),
+            (
+                SettingsPatch {
+                    max_connections_per_download: Some(0),
+                    ..everything()
+                },
+                MAX_CONNECTIONS_PER_DOWNLOAD,
+            ),
+            (
+                SettingsPatch {
+                    max_connections_per_download: Some(2),
+                    ..SettingsPatch::default()
+                },
+                MAX_CONNECTIONS_PER_DOWNLOAD,
+            ),
+            (
+                SettingsPatch {
+                    first_byte_timeout_ms: Some(50),
+                    ..everything()
+                },
+                FIRST_BYTE_TIMEOUT_MS,
+            ),
+            (
+                SettingsPatch {
+                    idle_timeout_ms: Some(3_600_001),
+                    ..everything()
+                },
+                IDLE_TIMEOUT_MS,
+            ),
+            (
+                SettingsPatch {
+                    max_retries: Some(0),
+                    ..everything()
+                },
+                MAX_RETRIES,
+            ),
+            (
+                SettingsPatch {
+                    commit_interval_ms: Some(60_001),
+                    ..everything()
+                },
+                COMMIT_INTERVAL_MS,
+            ),
+            (
+                SettingsPatch {
+                    proxy_mode: Some(bad_proxy.clone()),
+                    ..everything()
+                },
+                PROXY_MODE,
+            ),
+            (
+                SettingsPatch {
+                    extra_extensions: vec![CategoryExtensions {
+                        category: Category::Video,
+                        extensions: vec!["a/b".into()],
+                    }],
+                    ..everything()
+                },
+                EXTRA_EXTENSIONS,
+            ),
         ] {
             let r = engine.set_settings(bad.clone(), &|_| panic!("event"));
-            assert!(matches!(r, Err(EngineError::InvalidSetting(_))), "{bad:?}");
+            assert!(
+                matches!(r, Err(EngineError::InvalidSetting { key: k, .. }) if k == key),
+                "{bad:?}: {r:?}"
+            );
             assert_eq!(engine.settings().unwrap(), Settings::default(), "{bad:?}");
         }
         assert_eq!(engine.shared.global.rate(), None);

@@ -12,6 +12,10 @@ struct DhowApp: App {
                 .environment(delegate.model)
         }
         .defaultSize(width: 1000, height: 560)
+        Settings {
+            SettingsView()
+                .environment(delegate.model)
+        }
     }
 }
 

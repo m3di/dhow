@@ -145,3 +145,158 @@
 "error.storage" = "Dhow couldn't read or write its files. Check the disk has space and try again.";
 "error.runningElsewhere" = "This download is running in the dhow command-line tool. Stop it there first.";
 "error.shutDown" = "Dhow is quitting.";
+
+/* Detail pane (UI-GUIDELINES §5) */
+"toolbar.inspector" = "Show or Hide Details";
+"detail.none" = "Select a download to see its details.";
+"detail.progress" = "Progress";
+"detail.speed" = "Speed, Last 10 Minutes";
+"detail.connection" = "Connection";
+"detail.controls" = "Controls";
+"detail.log" = "Activity";
+"detail.retry" = "Retry";
+"detail.saveTo" = "Saved to";
+"detail.queue" = "Queue";
+"detail.group" = "Group";
+"detail.sizeUnknown" = "Size not known yet";
+"detail.mapLabel" = "Downloaded parts of the file";
+"detail.mapDone" = "Downloaded";
+"detail.mapActive" = "Downloading";
+"detail.mapPending" = "Not yet";
+/* A byte count, e.g. "120 MB". */
+"detail.amountUnknown %@" = "%@ downloaded";
+/* Downloaded, total, percent: "450 MB of 1.2 GB (37%)". */
+"detail.amount %@ %@ %@" = "%1$@ of %2$@ (%3$@)";
+"chart.time" = "Time";
+"chart.speed" = "Speed";
+"detail.chartLabel" = "Speed over the last 10 minutes";
+"detail.noSpeed" = "Nothing downloaded in the last 10 minutes.";
+"detail.activeConnections" = "Connections open";
+"detail.resumable" = "Can pause and resume";
+"detail.resumableYes" = "Yes";
+"detail.resumableNo" = "No";
+"detail.resumableUnknown" = "Not known yet";
+"detail.server" = "Server";
+"detail.identity" = "Identity";
+"detail.url" = "URL";
+"detail.etag" = "ETag";
+"detail.lastModified" = "Last-Modified";
+"detail.notSent" = "Not sent";
+"detail.speedLimit" = "Speed limit";
+"detail.connectionsDefault %lld" = "Connections: %lld (default)";
+"detail.connections %lld" = "Connections: %lld";
+"detail.useDefault" = "Use Default";
+"detail.logEmpty" = "Nothing has happened since Dhow opened.";
+
+/* Activity log: a time, then what happened. */
+"log.line %@ %@" = "%1$@  %2$@";
+"log.added" = "Added";
+"log.queued" = "Queued";
+"log.waiting" = "Waiting for a free connection";
+"log.active" = "Downloading";
+"log.paused" = "Paused";
+"log.completing" = "Finishing";
+"log.completed" = "Done";
+/* Why it failed, e.g. "Lost the connection". */
+"log.failed %@" = "Stopped: %@";
+"log.cancelled" = "Cancelled";
+/* Attempt number, then a duration, e.g. "3 sec". */
+"log.retrying %lld %@" = "Reconnecting (attempt %1$lld) in %2$@";
+/* A file name. */
+"log.renamed %@" = "Saved as %@";
+"reset.serverFileChanged" = "The file on the server changed. Dhow started the download over to make sure you get a complete file.";
+"reset.unaccountable" = "Dhow couldn't vouch for the part already downloaded, so it started over to make sure you get a complete file.";
+"reset.cannotResume" = "The server can't continue from where the download stopped, so it started over.";
+"warning.notResumable" = "This server doesn't support pausing. If the download is interrupted it will start over.";
+"warning.sizeUnverified" = "The server didn't say how big the file is, so Dhow can't confirm it got all of it.";
+"warning.identityWeak" = "The server gives no reliable way to tell whether the file changes between connections.";
+"warning.serverIgnoredRange" = "The server sent the whole file when asked for a part of it.";
+
+/* Storage (UI-GUIDELINES §6) */
+"sidebar.storage" = "Storage";
+"storage.empty" = "No completed downloads yet.";
+/* A byte count, then a file count: "12 GB in 40 files". */
+"storage.total %@ %@" = "%1$@ in %2$@";
+/* A category name. */
+"storage.showCategory %@" = "Show %@ in the list";
+/* A category name, then a byte count. */
+"storage.segment %@ %@" = "%1$@: %2$@";
+"storage.barLabel" = "Space used by category";
+"storage.missing" = "Moved or Deleted";
+"storage.missingNote" = "Dhow can no longer find these files. Forget takes them off the list; nothing on disk changes.";
+"storage.forget" = "Forget";
+"storage.forgetAll" = "Forget All";
+
+/* Settings (UI-GUIDELINES §7) */
+"settings.general" = "General";
+"settings.connections" = "Connections";
+"settings.speed" = "Speed";
+"settings.network" = "Network";
+"settings.categories" = "Grouping & Categories";
+"settings.unavailable" = "Settings are available once Dhow has opened its downloads.";
+"settings.revert" = "Revert";
+"settings.save" = "Save";
+"settings.advanced" = "Advanced";
+"settings.yes" = "Yes";
+"settings.no" = "No";
+"settings.unit.seconds" = "s";
+"settings.unit.kbps" = "KB/s";
+"settings.unit.percent" = "%";
+"settings.defaultFolder" = "Save downloads to";
+"settings.defaultConnections" = "Connections per download";
+"settings.maxConnections" = "Most connections per download";
+"settings.globalConnections" = "Connections for all downloads together";
+"settings.perHostConnections" = "Connections per server";
+"settings.newcomerConnection" = "Give a new download a connection right away";
+"settings.appliesAfterRestart" = "These apply after Dhow restarts.";
+"settings.firstByteTimeout" = "Wait for a server to answer";
+"settings.idleTimeout" = "Wait when a download goes quiet";
+"settings.maxRetries" = "Tries before a connection gives up";
+"settings.probeRangeGet" = "Ask for one byte when a server doesn't say the size";
+"settings.appliesNextRun" = "These apply from each download's next start.";
+"settings.limitTotal" = "Limit total download speed";
+"settings.limit" = "Total speed limit";
+"settings.headroom" = "Leave free for other apps";
+"settings.headroomNote" = "Dhow keeps this share of your connection free while it downloads. Speed settings apply at once.";
+"settings.commitInterval" = "Save progress to disk at least every";
+"settings.commitNote" = "Shorter saves progress more often; longer is easier on the disk. Applies from each download's next start.";
+"settings.proxy" = "Proxy";
+"settings.proxySystem" = "System settings";
+"settings.proxyNone" = "None";
+"settings.proxyCustom" = "Custom";
+"settings.proxyHttp" = "HTTP proxy";
+"settings.proxyHttps" = "HTTPS proxy";
+"settings.proxyOther" = "Other links (SOCKS)";
+"settings.noProxy" = "Don't use a proxy for";
+"settings.proxyPrompt" = "http://proxy.example:8080";
+"settings.proxySocksPrompt" = "socks5://proxy.example:1080";
+"settings.noProxyPrompt" = "localhost, .example.com";
+"settings.proxyNote" = "Proxy changes apply from the next download.";
+"settings.currentNetwork" = "Current Network";
+"settings.interface" = "Connected through";
+"settings.vpn" = "VPN";
+"settings.systemProxy" = "System proxy";
+"settings.proxyInUse" = "Proxy in use";
+"settings.networkUnknown" = "Dhow can't see the network details yet.";
+"settings.redetect" = "Check Again";
+"settings.autoGrouping" = "Group related downloads";
+"settings.useContentDisposition" = "Use the file name the server suggests";
+"settings.appendTypeExtension" = "Add an extension from the file type when a name has none";
+"settings.namingNote" = "These apply to downloads added from now on.";
+"settings.extraExtensions" = "More Extensions";
+"settings.extensionsPrompt" = "None";
+"settings.extensionsNote" = "Files with these extensions go in that category. Listing a built-in extension under Other takes it out of its category.";
+"settings.invalid.headroom" = "Use a value from 0 to 99.";
+"settings.invalid.atLeastOne" = "Use 1 or more.";
+"settings.invalid.newcomer" = "Turn this on or off.";
+"settings.invalid.defaultConnections" = "Use 1 or more, up to the most connections per download.";
+"settings.invalid.maxConnections" = "Use 1 or more, and no fewer than the connections per download.";
+"settings.invalid.timeout" = "Use 0.1 seconds to 1 hour (3600).";
+"settings.invalid.commit" = "Use 0.1 to 60 seconds.";
+"settings.invalid.proxy" = "Enter at least one proxy as an http, https, socks5 or socks5h link, like http://proxy.example:8080.";
+"settings.invalid.extensions" = "Use extensions like mkv or tar.gz, separated by commas or spaces.";
+"network.wifi" = "Wi-Fi";
+"network.ethernet" = "Ethernet";
+"network.cellular" = "Cellular";
+"network.vpn" = "VPN";
+"network.unknown" = "Unknown";

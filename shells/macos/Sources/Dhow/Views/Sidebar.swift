@@ -35,6 +35,11 @@ struct Sidebar: View {
                     }
                 }
             }
+            // The footer (UI-GUIDELINES §6).
+            Section {
+                Label(tr("sidebar.storage"), systemImage: "internaldrive")
+                    .tag(SidebarItem.storage)
+            }
         }
     }
 }

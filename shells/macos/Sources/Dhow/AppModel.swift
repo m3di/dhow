@@ -52,7 +52,14 @@ final class AppModel {
     /// Set by Pause All until Resume All.
     private(set) var pausedAll: PauseAllRecord?
 
+    /// Bumped each time the app becomes active: views that read the disk
+    /// (Storage) read it again.
+    private(set) var activations = 0
+
     @ObservationIgnored let listener = Listener()
+    @ObservationIgnored private var rangeWatch = RangeWatch()
+    /// `watch_ranges` calls in the order made.
+    @ObservationIgnored private let watchQueue = DispatchQueue(label: "app.dhow.watch-ranges")
     @ObservationIgnored private var observers: [(NotificationCenter, NSObjectProtocol)] = []
     /// While the engine opens: quitting waits for it.
     @ObservationIgnored private(set) var opening: Task<Void, Never>?
@@ -164,6 +171,7 @@ final class AppModel {
     /// come as no event.
     func refresh() {
         guard let engine else { return }
+        activations += 1
         store.beginReconcile()
         Task {
             let list = await Task.detached { () -> [DownloadSnapshot]? in
@@ -187,33 +195,43 @@ final class AppModel {
 
     /// Runs `op` for each download at once, off the main thread; the first
     /// failure is shown. Of several, one the CLI runs is skipped quietly.
+    /// `done` gets each that succeeded, on the main actor: for changes no
+    /// event reports (speed limit, connections, queue).
     private func each(
-        _ ids: [String], _ op: @escaping @Sendable (Engine, String) async throws -> Void
+        _ ids: [String], _ op: @escaping @Sendable (Engine, String) async throws -> Void,
+        done: ((String) -> Void)? = nil
     ) {
         guard let engine, !ids.isEmpty else { return }
         let bulk = ids.count > 1
         Task {
-            let failure = await Task.detached { () -> Error? in
-                await withTaskGroup(of: Error?.self) { group in
+            let (succeeded, failure) = await Task.detached { () -> ([String], Error?) in
+                await withTaskGroup(of: (String, Error?).self) { group in
                     for id in ids {
                         group.addTask {
                             do {
                                 try await op(engine, id)
-                                return nil
+                                return (id, nil)
                             } catch DhowError.RunningElsewhere where bulk {
-                                return nil
+                                return ("", nil)
                             } catch {
-                                return error
+                                return ("", error)
                             }
                         }
                     }
+                    var ok: [String] = []
                     var first: Error?
-                    for await e in group where first == nil {
-                        first = e
+                    for await (id, e) in group {
+                        if !id.isEmpty {
+                            ok.append(id)
+                        }
+                        first = first ?? e
                     }
-                    return first
+                    return (ok, first)
                 }
             }.value
+            for id in succeeded {
+                done?(id)
+            }
             if let failure {
                 show(failure)
             }
@@ -251,13 +269,16 @@ final class AppModel {
     }
 
     func move(_ ids: Set<String>, toQueue queue: String) {
-        each(ids.filter { store.downloads[$0]?.queueId != queue }) {
-            _ = try $0.moveToQueue(id: $1, queue: queue)
-        }
+        each(
+            ids.filter { store.downloads[$0]?.queueId != queue },
+            { _ = try $0.moveToQueue(id: $1, queue: queue) },
+            done: { [store] in store.adjust($0) { $0.queueId = queue } })
     }
 
     func setSpeedLimit(_ ids: Set<String>, _ limit: UInt64?) {
-        each(Array(ids)) { _ = try $0.setSpeedLimit(id: $1, limit: limit) }
+        each(
+            Array(ids), { _ = try $0.setSpeedLimit(id: $1, limit: limit) },
+            done: { [store] in store.adjust($0) { $0.speedLimit = limit } })
     }
 
     // MARK: Pause All, Resume All
@@ -361,6 +382,73 @@ final class AppModel {
         NSPasteboard.general.setString(links.joined(separator: "\n"), forType: .string)
     }
 
+    // MARK: Detail pane
+
+    /// The pane shows `id` (`nil`: nothing, or it closed): its speed
+    /// history is read, and its segment map watched while it runs.
+    func showDetail(_ id: String?) {
+        if id != store.trailId {
+            store.showTrail(id)
+            if let id, let engine {
+                Task {
+                    let history = await Task.detached { try? engine.speedHistory(id: id) }.value
+                    store.setTrail(id, history: history ?? [])
+                }
+            }
+        }
+        let calls = rangeWatch.show(id, state: id.flatMap { store.downloads[$0]?.state })
+        guard let engine, !calls.isEmpty else { return }
+        // In order: an off overtaken by its on would leave a map ticking.
+        watchQueue.async {
+            for call in calls {
+                // One removed meanwhile is gone, and so is its watch.
+                try? engine.watchRanges(id: call.id, on: call.on)
+            }
+        }
+    }
+
+    /// `Failed` back to `Queued`, keeping what it has; its queue starts it.
+    func retry(_ id: String) {
+        each([id]) { engine, id in _ = try engine.retry(id: id) }
+    }
+
+    /// `nil`: the default connections setting.
+    func setConnections(_ id: String, _ connections: UInt8?) {
+        each(
+            [id], { _ = try $0.setConnections(id: $1, connections: connections) },
+            done: { [store] in store.adjust($0) { $0.connections = connections } })
+    }
+
+    // MARK: Storage, settings
+
+    /// `storage_breakdown`, which stats every completed file (and may ask
+    /// the adapter to find moved ones), off the main thread.
+    func storageBreakdown() async -> [CategoryUsage]? {
+        guard let engine else { return nil }
+        return await Task.detached { try? engine.storageBreakdown() }.value
+    }
+
+    /// One patch, validated whole by the core: it throws its
+    /// `InvalidSetting` (naming the setting) and stores nothing then.
+    func saveSettings(_ patch: SettingsPatch) async throws -> DhowSettings? {
+        guard let engine else { return nil }
+        return try await Task.detached { try engine.setSettings(patch: patch) }.value
+    }
+
+    /// The network as the adapter sees it now; `announce` also emits
+    /// `NetworkChanged` (Settings' "Re-detect").
+    func readNetwork(announce: Bool) {
+        guard let engine else { return }
+        Task {
+            let info = await Task.detached {
+                try? announce ? engine.networkChanged() : engine.networkInfo()
+            }.value
+            if let info {
+                store.setNetwork(info)
+            }
+        }
+    }
+
     // MARK: Add
 
     /// ⌘N and the toolbar: prefilled from the clipboard if it holds links
@@ -377,6 +465,36 @@ final class AppModel {
         let links = AddModel.links(in: clip)
         guard engine != nil, !links.isEmpty else { return }
         add = AddPrefill(text: links.joined(separator: "\n"))
+    }
+}
+
+/// Which download's segment map is watched (ARCHITECTURE §3.3): the one the
+/// detail pane shows, only while it runs. One that doesn't run gets its
+/// sidecar's map once (on, then off at once), so nothing stays watched.
+struct RangeWatch {
+    struct Call: Equatable {
+        var id: String
+        var on: Bool
+    }
+
+    private(set) var watched: String?
+    private var shown: String?
+
+    /// The `watch_ranges` calls that take it to showing `id` in `state`.
+    mutating func show(_ id: String?, state: DownloadState?) -> [Call] {
+        let want = state?.isRunning == true ? id : nil
+        var calls: [Call] = []
+        if let watched, watched != want {
+            calls.append(Call(id: watched, on: false))
+        }
+        if let want, want != watched {
+            calls.append(Call(id: want, on: true))
+        } else if want == nil, let id, id != shown, let state, !state.isFinished {
+            calls += [Call(id: id, on: true), Call(id: id, on: false)]
+        }
+        watched = want
+        shown = id
+        return calls
     }
 }
 

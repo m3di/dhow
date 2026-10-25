@@ -21,12 +21,15 @@ enum SidebarItem: Hashable {
     case filter(SmartFilter)
     case queue(String)
     case category(DhowCore.Category)
+    /// The Storage view (UI-GUIDELINES §6), not a list.
+    case storage
 
     func matches(_ d: DownloadSnapshot) -> Bool {
         switch self {
         case .filter(let f): f.matches(d.state)
         case .queue(let id): d.queueId == id
         case .category(let c): d.category == c
+        case .storage: false
         }
     }
 }
@@ -56,6 +59,23 @@ struct ListRow: Identifiable, Hashable {
     var isGroup: Bool { children != nil }
 
     static func groupId(_ group: String) -> String { "group:" + group }
+}
+
+extension [ListRow] {
+    /// Rows as downloads: a group stands for the members it shows.
+    func downloadIds(_ ids: Set<ListRow.ID>) -> Set<String> {
+        var out = Set<String>()
+        func visit(_ rows: [ListRow]) {
+            for row in rows {
+                if ids.contains(row.id) {
+                    out.formUnion(row.downloadIds)
+                }
+                visit(row.children ?? [])
+            }
+        }
+        visit(self)
+        return out
+    }
 }
 
 extension DownloadSnapshot {

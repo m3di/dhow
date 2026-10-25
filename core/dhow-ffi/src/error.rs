@@ -20,7 +20,9 @@ pub enum DhowError {
     #[error("the default queue cannot be deleted")]
     DefaultQueue,
     #[error("{message}")]
-    InvalidSetting { message: String },
+    /// `key` is the setting's (ARCHITECTURE §5.1), for the shell to say
+    /// which; `message` a diagnostic.
+    InvalidSetting { key: String, message: String },
     #[error("probe failed: {reason:?}")]
     Probe { reason: ProbeFailure },
     /// The database was written by a newer Dhow (ARCHITECTURE §5.1).
@@ -59,7 +61,10 @@ impl From<EngineError> for DhowError {
             EngineError::InvalidName(name) => Self::InvalidName { name },
             EngineError::DefaultQueue => Self::DefaultQueue,
             EngineError::InvalidQueue(m) => Self::InvalidQueue { message: m.into() },
-            EngineError::InvalidSetting(m) => Self::InvalidSetting { message: m.into() },
+            EngineError::InvalidSetting { key, why } => Self::InvalidSetting {
+                key: key.into(),
+                message: why.into(),
+            },
         }
     }
 }

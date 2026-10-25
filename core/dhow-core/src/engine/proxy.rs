@@ -6,6 +6,7 @@ use std::io;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 
+use super::settings::PROXY_MODE;
 use super::{Engine, EngineError};
 use crate::http::{self, Lease, Route};
 use crate::platform::{AdapterError, ProxyConfig, ProxyMode};
@@ -24,6 +25,13 @@ pub(super) enum Stored {
     },
 }
 
+fn invalid(why: &'static str) -> EngineError {
+    EngineError::InvalidSetting {
+        key: PROXY_MODE,
+        why,
+    }
+}
+
 impl Stored {
     /// A `Custom` mode needs at least one `http://`, `https://`,
     /// `socks5://` or `socks5h://` proxy and no PAC script (the core
@@ -35,18 +43,16 @@ impl Stored {
             ProxyMode::Custom(c) => {
                 let urls = [&c.http, &c.https, &c.all];
                 if c.pac.is_some() {
-                    return Err(EngineError::InvalidSetting("PAC scripts are not supported"));
+                    return Err(invalid("PAC scripts are not supported"));
                 }
                 if urls.iter().all(|u| u.is_none()) {
-                    return Err(EngineError::InvalidSetting("a custom proxy needs a URL"));
+                    return Err(invalid("a custom proxy needs a URL"));
                 }
                 if urls.iter().flat_map(|u| u.as_ref()).any(|u| {
                     !matches!(u.scheme(), "http" | "https" | "socks5" | "socks5h")
                         || u.host().is_none()
                 }) {
-                    return Err(EngineError::InvalidSetting(
-                        "proxies are http, https, socks5 or socks5h URLs",
-                    ));
+                    return Err(invalid("proxies are http, https, socks5 or socks5h URLs"));
                 }
                 let s = |u: &Option<Url>| u.as_ref().map(Url::to_string);
                 Stored::Custom {
