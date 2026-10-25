@@ -940,6 +940,37 @@ mod limit_tests {
             lifted.elapsed()
         );
     }
+
+    /// A shell cancels a run by dropping its future: nothing it registered
+    /// may outlive it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_run_leaves_nothing_behind() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let id = fx
+            .engine
+            .add(
+                fx.request(&server, "/blob/1000000?throttle=100000"),
+                &|_| {},
+            )
+            .await
+            .unwrap()
+            .id;
+        let (tx, mut flowing) = watch::channel(false);
+        let on_event = move |e: EngineEvent| {
+            if matches!(e, EngineEvent::Progress { downloaded, .. } if downloaded > 0) {
+                tx.send_replace(true);
+            }
+        };
+        let (_keep, stop) = watch::channel(false);
+        tokio::select! {
+            _ = fx.engine.run(&id, &on_event, &stop) => panic!("finished before the drop"),
+            _ = flowing.wait_for(|f| *f) => {}
+        }
+        assert_eq!(fx.engine.own_buckets(), 0);
+        assert_eq!(fx.engine.sampling_count(), 0);
+        assert_eq!(fx.engine.shared.budget.usage("").0, 0);
+    }
 }
 
 mod speed_tests {

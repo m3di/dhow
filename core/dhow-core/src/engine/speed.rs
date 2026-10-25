@@ -62,6 +62,11 @@ impl Engine {
         Sampling(self)
     }
 
+    #[cfg(test)]
+    pub(super) fn sampling_count(&self) -> u32 {
+        self.speed().running
+    }
+
     /// Records one download's sample taken at `now_ms`.
     pub(super) fn record_sample(
         &self,

@@ -638,6 +638,10 @@ impl Engine {
         let lease = self.lease(&url).await?;
         self.transition(id, State::Active, None, on_event)?;
 
+        // Everything a run registers is released by guards, also when this
+        // future is dropped mid-run: buckets, sampling, the lease, and in
+        // `download` the budget ticket, the learner and the writer.
+        let (limits, own_bucket) = self.take_buckets(id, &snap.queue_id)?;
         let req = Request {
             url,
             headers: self.headers(id)?,
@@ -645,7 +649,7 @@ impl Engine {
             sidecar: sidecar.clone(),
             connections: self.connections(id)?,
             started_at: self.started_at(id)?,
-            limits: self.take_buckets(id, &snap.queue_id)?,
+            limits,
         };
         let progress = Mutex::new(Progress::new(snap.total_size));
         let dl_event = |e: DownloadEvent| self.on_download_event(id, e, &progress, on_event);
@@ -666,7 +670,7 @@ impl Engine {
             _ = sampler => unreachable!("samples forever"),
         };
         drop(sampling);
-        self.drop_buckets(id);
+        drop(own_bucket);
         let done = match result {
             Ok(done) => done,
             Err(DownloadError::Stopped) => {
