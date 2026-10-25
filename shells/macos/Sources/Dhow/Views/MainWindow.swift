@@ -7,6 +7,7 @@ struct MainWindow: View {
     @State private var sidebar: SidebarItem? = .filter(.all)
     @State private var search = ""
     @State private var selection = Set<ListRow.ID>()
+    @AppStorage("inspectorShown") private var inspectorShown = true
 
     var body: some View {
         @Bindable var model = model
@@ -36,13 +37,33 @@ struct MainWindow: View {
             Message(text: failure)
         } else if !model.store.loaded {
             ProgressView().controlSize(.small)
+        } else if sidebar == .storage {
+            StorageView(sidebar: $sidebar)
         } else {
             let rows = model.store.rows(
                 for: sidebar ?? .filter(.all), search: search, now: .now)
-            if rows.isEmpty {
-                EmptyList(isEmpty: model.store.downloads.isEmpty, searching: !search.isEmpty)
-            } else {
-                DownloadTable(rows: rows, selection: $selection)
+            Group {
+                if rows.isEmpty {
+                    EmptyList(isEmpty: model.store.downloads.isEmpty, searching: !search.isEmpty)
+                } else {
+                    DownloadTable(rows: rows, selection: $selection)
+                }
+            }
+            // Selection fills the detail pane (UI-GUIDELINES §5).
+            .inspector(isPresented: $inspectorShown) {
+                DetailPane(ids: rows.downloadIds(selection))
+                    .inspectorColumnWidth(min: 260, ideal: 320, max: 480)
+            }
+            .toolbar {
+                ToolbarItem {
+                    Button {
+                        inspectorShown.toggle()
+                    } label: {
+                        Label(tr("toolbar.inspector"), systemImage: "sidebar.trailing")
+                    }
+                    .keyboardShortcut("i", modifiers: [.command, .option])
+                    .help(tr("toolbar.inspector"))
+                }
             }
         }
     }

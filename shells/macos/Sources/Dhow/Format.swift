@@ -3,7 +3,8 @@ import Foundation
 /// Numbers as the list shows them, in the user's locale.
 enum Format {
     static func bytes(_ n: UInt64) -> String {
-        Int64(clamping: n).formatted(.byteCount(style: .file))
+        // "0 bytes", not "Zero KB".
+        Int64(clamping: n).formatted(.byteCount(style: .file, spellsOutZero: false))
     }
 
     /// "4.1 MB/s".

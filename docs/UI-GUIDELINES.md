@@ -76,17 +76,19 @@ Desktop: inspector on the right (macOS `.inspector`), details pane (WinUI), `Adw
 
 Sections:
 1. **Header**: filename, category icon, size, destination path (clickable), queue, group.
-2. **Progress**: the segment map, a horizontal strip showing committed/active/pending ranges per connection, native-drawn, updated at ≤1 Hz, only while the pane is visible (shell toggles `WatchRanges`).
+2. **Progress**: the segment map, a horizontal strip showing committed/active/pending ranges per connection, native-drawn, updated at ≤1 Hz, only while the pane is visible (shell toggles `WatchRanges`). The watch is on only while the pane shows a running download; one that isn't running gets its sidecar's map once (`WatchRanges` on, then off at once), so nothing stays watched. A finished download shows no map.
 3. **Speed chart**: last 10 minutes, native-drawn (Swift Charts, WinUI/Win2D, Cairo, Compose Canvas). Y axis auto-scales; X axis labels every 2 minutes. Reads `speed_history`.
 4. **Connection info**: active connections, resumable yes/no, server (host), identity (ETag/Last-Modified) in a disclosure.
-5. **Controls**: per-download speed limit slider, connection count stepper (changes apply live via `SetSettings`-style patch on the download), retry/cancel.
-6. **Log**: last 20 engine events for this download (state changes, retries, warnings) with timestamps. Plain text, selectable.
+5. **Controls**: per-download speed limit slider, connection count stepper (changes apply live via `SetSettings`-style patch on the download), retry/cancel. The slider has fixed steps in decimal kB/s (as sizes are shown) ending in "no limit"; a limit of 0 set elsewhere is a step of its own while it lasts, labelled as the list labels it. It applies once it rests, not on every step of a drag, and a change still resting is sent when the selection moves or the pane closes. A download's limit and connection changes reach the core in the order made. "Retry" is `Retry` (back to `Queued`, its queue starts it); "Retry Now" starts it by hand (`Resume`), as "Start Now" does for a queued one. The pane offers both; the list's context menu offers "Retry Now".
+6. **Log**: last 20 engine events for this download (state changes, retries, warnings) with timestamps. Plain text, selectable. Events carry no time, so the shell stamps them on receipt and keeps them in memory: the log covers what happened since the app opened.
+
+With several downloads selected the pane says how many; it shows one download's detail only.
 
 The chart and segment map are the only place these visuals exist. They do not appear in list rows.
 
 ## 6. Storage view
 
-Reachable from the sidebar footer ("Storage") or settings. A single stacked horizontal bar of completed downloads by category, color-coded with a fixed accessible palette (color-blind safe; categories are also labeled, never color-only). Below it, a list of categories with size and count; tapping filters the main list. Files the engine can no longer find (path missing, token unresolvable) are shown in a muted "moved or deleted" bucket with a "Forget" action.
+Reachable from the sidebar footer ("Storage") or settings. A single stacked horizontal bar of completed downloads by category, color-coded with a fixed accessible palette (color-blind safe; categories are also labeled, never color-only). Below it, a list of categories with size and count; tapping filters the main list. Files the engine can no longer find (path missing, token unresolvable) are shown in a muted "moved or deleted" bucket with a "Forget" action. The bucket is the core's `missing` list from `StorageBreakdown` (it checks `final_path` and resolves tokens); Forget is `Remove` without `delete_files`. The view reads the breakdown again when a download completes, moves or goes, and when the app becomes active, never on a timer.
 
 Colors are the one place where shells share a decision: the category palette is defined once in `docs/UI-GUIDELINES.md` (here) so screenshots across platforms match:
 
@@ -120,6 +122,8 @@ Groups (same order everywhere):
 
 Items the core owns are `Settings` fields, changed with one `SetSettings` patch (ARCHITECTURE §3.1, §5.1): connections, timeouts and retries, speed limit and headroom, commit interval, proxy mode, auto-grouping, naming toggles, extra extensions. General, Notifications and Advanced items (default folder, ask where to save, launch at login, sounds, log level, segment map, …) are shell-owned settings, stored by the shell, unless ARCHITECTURE §5.1 lists them.
 
+Core settings are edited as a draft and saved together (Save / Revert), so one `SetSettings` patch carries the user's edits, only those, and the core validates it whole; the shell doesn't repeat the core's ranges. Settings another process changes meanwhile come into the fields the user hasn't edited. A value the setting's type can't hold (a negative count, 300 for a byte) is refused at the field, never clamped. Closing the window keeps unsaved edits for the next time it opens (macOS: the draft lives in the app, not the window). A refusal (`InvalidSetting`, which names the setting's key) is shown under that field, on its tab; for extra extensions, under the categories the refused patch changed. Speeds are entered in kB/s (1000 bytes). The connection budget (global, per host, newcomer) says "applies after restart": the engine reads it when it opens. `probe_range_get` sits with the connection timeouts (advanced).
+
 ## 8. Per-platform specifics
 
 ### macOS
@@ -127,6 +131,7 @@ Items the core owns are `Settings` fields, changed with one `SetSettings` patch 
 - Unified toolbar; the speed sparkline is a `ToolbarItem` view, keep it ≤ 120 pt wide.
 - Dock badge = number of active downloads; Dock progress bar for aggregate progress (via `NSDockTile` custom view).
 - Services and Share extension: "Download with Dhow" accepting URLs.
+- The inspector is toggled from the toolbar (⌥⌘I) and stays as the user left it; Storage is the sidebar's last item.
 - Settings via `Settings {}` scene. Menu bar has full menus (File/Edit/Download/View/Window/Help).
 - App Sandbox on with user-selected folder bookmarks; file tokens are security-scoped bookmarks.
 - Notarized DMG outside the App Store first; MAS later if sandboxing allows everything needed.

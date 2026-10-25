@@ -124,19 +124,8 @@ struct DownloadTable: View {
             set: { if $0 { expanded.insert(id) } else { expanded.remove(id) } })
     }
 
-    /// Rows as downloads: a group stands for the members it shows.
     private func downloads(_ ids: Set<ListRow.ID>) -> Set<String> {
-        var out = Set<String>()
-        func visit(_ rows: [ListRow]) {
-            for row in rows {
-                if ids.contains(row.id) {
-                    out.formUnion(row.downloadIds)
-                }
-                visit(row.children ?? [])
-            }
-        }
-        visit(rows)
-        return out
+        rows.downloadIds(ids)
     }
 
     private var confirmTitle: String {

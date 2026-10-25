@@ -8,7 +8,7 @@ struct RowMenu: View {
     @Binding var confirmation: Confirmation?
 
     /// Per-download limits offered here; the detail pane has a slider.
-    static let limits: [UInt64] = [256, 512, 1024, 2048, 5120, 10240].map { $0 * 1024 }
+    static let limits: [UInt64] = [256, 512, 1000, 2000, 5000, 10_000].map { $0 * 1000 }
 
     var body: some View {
         let store = model.store

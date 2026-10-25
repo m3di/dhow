@@ -294,7 +294,7 @@ fn settings_round_trip() {
         ..SettingsPatch::default()
     });
     assert!(
-        matches!(bad, Err(DhowError::InvalidSetting { .. })),
+        matches!(&bad, Err(DhowError::InvalidSetting { key, .. }) if key == "headroom_percent"),
         "{bad:?}"
     );
     let bad_url = engine.set_settings(SettingsPatch {

@@ -17,9 +17,12 @@ struct AddSheet: View {
             initialValue: AddModel(text: prefill.text, directory: Self.defaultFolder, queue: queue))
     }
 
-    /// The shell's default folder setting (M4.2, 2/3), else Downloads.
+    /// The shell's default folder setting (Settings, General), else
+    /// Downloads.
+    static let defaultFolderKey = "defaultFolder"
+
     static var defaultFolder: URL {
-        if let path = UserDefaults.standard.string(forKey: "defaultFolder") {
+        if let path = UserDefaults.standard.string(forKey: defaultFolderKey) {
             return URL(fileURLWithPath: path, isDirectory: true)
         }
         return FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]

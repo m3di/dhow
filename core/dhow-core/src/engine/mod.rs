@@ -314,8 +314,13 @@ pub enum EngineError {
     DefaultQueue,
     #[error("{0}")]
     InvalidQueue(&'static str),
-    #[error("{0}")]
-    InvalidSetting(&'static str),
+    /// `key` names the setting (ARCHITECTURE §5.1), so a shell can say
+    /// which one; `why` is a diagnostic.
+    #[error("{why}")]
+    InvalidSetting {
+        key: &'static str,
+        why: &'static str,
+    },
 }
 
 impl From<rusqlite::Error> for EngineError {

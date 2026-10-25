@@ -143,7 +143,16 @@ fn custom_needs_a_usable_proxy() {
         },
     ] {
         let r = set_proxy(&engine, ProxyMode::Custom(Box::new(bad.clone())));
-        assert!(matches!(r, Err(EngineError::InvalidSetting(_))), "{bad:?}");
+        assert!(
+            matches!(
+                r,
+                Err(EngineError::InvalidSetting {
+                    key: "proxy_mode",
+                    ..
+                })
+            ),
+            "{bad:?}"
+        );
     }
     assert_eq!(engine.settings().unwrap().proxy_mode, ProxyMode::System);
 }
