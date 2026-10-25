@@ -67,6 +67,7 @@ struct RowMenu: View {
     }
 
     static func resumeTitle(_ states: [DownloadState]) -> String {
+        guard states.contains(where: Actions.canResume) else { return tr("menu.resume") }
         if states.allSatisfy({ $0 == .failed || !Actions.canResume($0) }) {
             return tr("menu.retry")
         }

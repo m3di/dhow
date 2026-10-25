@@ -83,17 +83,35 @@ final class AddModel {
     /// The http(s) links in pasted text, in order, once each.
     nonisolated static func links(in text: String) -> [String] {
         var seen = Set<String>()
-        // A link in prose ends before the sentence's punctuation.
-        let trailing: Set<Character> = [",", ".", ";", ":", "!", "?", "\"", "'", ">"]
-        let words = text.split(whereSeparator: \.isWhitespace).map {
-            String($0.reversed().drop(while: trailing.contains).reversed())
-        }
+        let words = text.split(whereSeparator: \.isWhitespace).map { trimmed(String($0)) }
         return words.filter { s in
             guard let url = URL(string: s), let scheme = url.scheme?.lowercased(),
                 scheme == "http" || scheme == "https", url.host() != nil
             else { return false }
             return seen.insert(s).inserted
         }
+    }
+
+    /// A link as written in prose: "(https://x/a_(b).iso)," is
+    /// "https://x/a_(b).iso". Leading "(" and "<" go; at the end, the
+    /// sentence's punctuation, and ")" or "]" only when unmatched in it.
+    nonisolated static func trimmed(_ word: String) -> String {
+        var s = Substring(word)
+        while let first = s.first, "(<\"'".contains(first) {
+            s = s.dropFirst()
+        }
+        while let last = s.last {
+            if ",.;:!?\"'>".contains(last) {
+                s = s.dropLast()
+            } else if last == ")" || last == "]" {
+                let open: Character = last == ")" ? "(" : "["
+                guard s.count(where: { $0 == last }) > s.count(where: { $0 == open }) else { break }
+                s = s.dropLast()
+            } else {
+                break
+            }
+        }
+        return String(s)
     }
 
     /// Lines of "Name: value"; `nil` if one isn't (the core checks the

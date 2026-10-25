@@ -81,8 +81,13 @@ final class DownloadStore {
     /// What the app acts on besides drawing: notifications, `on_complete`.
     @ObservationIgnored var onChange: ((StoreChange) -> Void)?
     /// Per queue, downloads that completed or failed since it was last
-    /// idle: whether running dry ends a run.
+    /// idle (a queue notifies after several).
     private var finishedInRun: [String: Int] = [:]
+    /// Per queue: its last change was a download finishing. `QueueChanged`
+    /// follows every change to a queue's counts (ARCHITECTURE §3.2), so a
+    /// drop to 0 ends a run only when this is set; a pause, cancel, removal
+    /// or move that empties it doesn't.
+    private var lastWasFinish: [String: Bool] = [:]
     /// Events that came while a `list()` was being read (at launch, or
     /// reconciling): replayed over it, as they may be newer than it.
     private var early: [Event] = []
@@ -156,6 +161,7 @@ final class DownloadStore {
         }
         switch event {
         case .downloadAdded(let snapshot):
+            lastWasFinish[snapshot.queueId] = false
             if downloads[snapshot.id] == nil {
                 order.append(snapshot.id)
             }
@@ -165,13 +171,16 @@ final class DownloadStore {
                 unknownGroup?()
             }
         case .removed(let id):
+            if let q = downloads[id]?.queueId {
+                lastWasFinish[q] = false
+            }
             downloads[id] = nil
             live[id] = nil
             logs[id] = nil
             rangeMaps[id] = nil
             order.removeAll { $0 == id }
             sampleSpeed()
-        case .stateChanged(let id, _, let to, let reason):
+        case .stateChanged(let id, let from, let to, let reason):
             if downloads[id] != nil {
                 log(id, .state(to, reason))
             }
@@ -179,7 +188,6 @@ final class DownloadStore {
             if id == trailId, to != .active, downloads[id]?.state == .active {
                 appendTrail(0, force: true)
             }
-            let before = downloads[id]?.state
             update(id) {
                 $0.state = to
                 $0.failReason = reason
@@ -188,9 +196,15 @@ final class DownloadStore {
                 live[id] = nil
             }
             sampleSpeed()
-            if before != to, to == .completed || to == .failed, let d = downloads[id] {
-                finishedInRun[d.queueId, default: 0] += 1
-                onChange?(.finished(d))
+            // The event's own `from`: a `list()` read meanwhile (reconcile)
+            // may already hold the new state.
+            if from != to, let d = downloads[id] {
+                let finished = to == .completed || to == .failed
+                lastWasFinish[d.queueId] = finished
+                if finished {
+                    finishedInRun[d.queueId, default: 0] += 1
+                    onChange?(.finished(d))
+                }
             }
         case .progress(let id, let downloaded, let total, let connections, let speed, let eta):
             guard downloads[id] != nil else { return }
@@ -225,12 +239,13 @@ final class DownloadStore {
         case .settingsChanged(let settings):
             self.settings = settings
         case .queueChanged(let snapshot):
-            // Ran dry (ARCHITECTURE §3.2), having finished something: not
-            // a queue emptied by removing or cancelling what waited.
+            // Ran dry (ARCHITECTURE §3.2) because its last download
+            // finished: not emptied by a pause, cancel, removal or move.
+            let endedByFinish = lastWasFinish.removeValue(forKey: snapshot.id) ?? false
             if snapshot.queued + snapshot.running == 0 {
                 let finished = finishedInRun.removeValue(forKey: snapshot.id) ?? 0
-                if let old = queue(snapshot.id), old.queued + old.running > 0, finished > 0 {
-                    onChange?(.queueRanDry(snapshot, finished: finished))
+                if let old = queue(snapshot.id), old.queued + old.running > 0, endedByFinish {
+                    onChange?(.queueRanDry(snapshot, finished: max(finished, 1)))
                 }
             }
             if let i = queues.firstIndex(where: { $0.id == snapshot.id }) {

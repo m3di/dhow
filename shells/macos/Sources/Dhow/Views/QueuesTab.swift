@@ -9,13 +9,15 @@ struct QueuesTab: View {
     @State private var draft: QueueDraft?
     @State private var error: String?
     @State private var confirmingDelete = false
+    /// A queue chosen while the shown one has unsaved edits: asked first.
+    @State private var switchingTo: String?
 
     private var queue: QueueSnapshot? { selected.flatMap { model.store.queue($0) } }
 
     var body: some View {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
-                List(selection: $selected) {
+                List(selection: selection) {
                     ForEach(model.store.queues, id: \.id) { q in
                         Text(q.title).tag(q.id)
                     }
@@ -81,12 +83,43 @@ struct QueuesTab: View {
             }
         }
         .confirmationDialog(
+            Self.unsavedTitle(queue), isPresented: asking, presenting: switchingTo
+        ) { next in
+            Button(tr("settings.save")) {
+                if let id = selected { save(id, then: next) }
+            }
+            Button(tr("queue.discard"), role: .destructive) { selected = next }
+            Button(tr("button.cancel"), role: .cancel) {}
+        }
+        .confirmationDialog(
             Self.deleteTitle(queue), isPresented: $confirmingDelete
         ) {
             Button(tr("queue.delete"), role: .destructive) { delete() }
         } message: {
             Text(tr("queue.deleteMessage"))
         }
+    }
+
+    /// The list's selection; leaving a queue with unsaved edits asks.
+    private var selection: Binding<String?> {
+        Binding(
+            get: { selected },
+            set: { next in
+                if let queue, let draft, draft.differs(from: queue), next != selected {
+                    switchingTo = next
+                } else {
+                    selected = next
+                }
+            })
+    }
+
+    private var asking: Binding<Bool> {
+        Binding(get: { switchingTo != nil }, set: { if !$0 { switchingTo = nil } })
+    }
+
+    static func unsavedTitle(_ q: QueueSnapshot?) -> String {
+        let name = q?.title ?? ""
+        return tr("queue.unsavedTitle \(name)")
     }
 
     static func deleteTitle(_ q: QueueSnapshot?) -> String {
@@ -99,13 +132,17 @@ struct QueuesTab: View {
         error = nil
     }
 
-    private func save(_ id: String) {
+    /// Saves the queue's edits, then (once they're stored) shows `next`.
+    private func save(_ id: String, then next: String? = nil) {
         guard let draft else { return }
         Task {
             do {
                 let spec = try draft.spec()
                 _ = try await model.queueCommand { try $0.updateQueue(id: id, spec: spec) }
                 error = nil
+                if let next {
+                    selected = next
+                }
             } catch {
                 self.error = QueueText.invalid(error)
             }
@@ -159,7 +196,10 @@ enum QueueText {
 }
 
 private struct QueueEditor: View {
+    @Environment(AppModel.self) private var model
     @Binding var draft: QueueDraft
+    /// macOS won't let Dhow send the shut-down request (Automation).
+    @State private var shutDownBlocked = false
 
     var body: some View {
         Form {
@@ -174,7 +214,7 @@ private struct QueueEditor: View {
                         title: tr("settings.limit"), value: $draft.limitKB,
                         unit: tr("settings.unit.kbps"))
                 }
-                Picker(tr("queue.whenDone"), selection: $draft.onComplete) {
+                Picker(tr("queue.whenDone"), selection: whenDone) {
                     ForEach([OnComplete.nothing, .sleep, .shutdown], id: \.self) {
                         Text(QueueText.onComplete($0)).tag($0)
                     }
@@ -188,6 +228,9 @@ private struct QueueEditor: View {
                     Text(tr("queue.whenDoneNote"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                }
+                if draft.onComplete == .shutdown, shutDownBlocked {
+                    ErrorLine(message: tr("queue.shutDownBlocked"))
                 }
             }
             if !draft.isDefault {
@@ -213,6 +256,19 @@ private struct QueueEditor: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    /// Shut Down chosen by the user: macOS asks now (if it asks at all),
+    /// with them here, rather than at the end of the night.
+    private var whenDone: Binding<OnComplete> {
+        Binding(
+            get: { draft.onComplete },
+            set: { choice in
+                draft.onComplete = choice
+                if choice == .shutdown {
+                    Task { shutDownBlocked = !(await model.mayShutDown()) }
+                }
+            })
     }
 }
 

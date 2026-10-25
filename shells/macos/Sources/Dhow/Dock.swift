@@ -50,6 +50,7 @@ final class DockTile {
         tile.badgeLabel = now.badge
         if let percent = now.percent, now.active > 0 {
             view.fraction = Double(percent) / 100
+            view.frame = NSRect(origin: .zero, size: tile.size)
             tile.contentView = view
         } else {
             tile.contentView = nil

@@ -14,8 +14,16 @@ final class RecordingNotifier: Notifier {
 @MainActor
 final class RecordingSystem: SystemActions {
     var done: [String] = []
-    func sleep() { done.append("sleep") }
-    func shutDown() { done.append("shutDown") }
+    var fails = false
+    func sleep() -> String? {
+        done.append("sleep")
+        return fails ? "no" : nil
+    }
+    func shutDown() -> String? {
+        done.append("shutDown")
+        return fails ? "no" : nil
+    }
+    nonisolated func mayShutDown(ask: Bool) -> Bool { true }
 }
 
 /// Notifications, `on_complete` and the Dock (UI-GUIDELINES §2, §8 macOS),
@@ -154,23 +162,110 @@ final class RecordingSystem: SystemActions {
     }
 
     @Test func onCompleteCanBeCancelledAndStopsForNewWork() async throws {
-        let (model, _, system) = model([download("a", .active)], onComplete: .shutdown)
+        let (model, notifier, system) = model(
+            [download("a", .active), download("b", .paused)], onComplete: .shutdown)
         model.countdownLength = 1000
+        // Another queue still at work: no countdown at all.
         model.startCountdown(.shutDown, queue: "q")
+        #expect(model.countdown == nil)
+        model.store.apply(.stateChanged(id: "a", from: .active, to: .completed, reason: nil))
+        model.startCountdown(.shutDown, queue: "q")
+        #expect(model.countdown != nil)
+        // It says so in a notification too.
+        #expect(notifier.notes.last?.title == tr("countdown.shutDownNote \("q")"))
         model.cancelCountdown()
         #expect(model.countdown == nil)
         // A download starting meanwhile calls it off.
         model.startCountdown(.shutDown, queue: "q")
+        model.store.apply(.stateChanged(id: "b", from: .paused, to: .active, reason: nil))
         try await until("off") { model.countdown == nil }
         #expect(system.done.isEmpty)
         // "Now" acts at once.
-        model.store.apply(.stateChanged(id: "a", from: .active, to: .completed, reason: nil))
+        model.store.apply(.stateChanged(id: "b", from: .active, to: .paused, reason: nil))
         model.startCountdown(.shutDown, queue: "q")
         model.finishCountdown()
         #expect(system.done == ["shutDown"])
         #expect(Countdown.action(for: .hibernate) == .sleep)
         #expect(Countdown.action(for: .nothing) == nil)
         await core.close()
+    }
+
+    /// Two queues ran dry: shutting down wins over sleeping.
+    @Test func shutDownWinsOverSleep() async {
+        let (model, _, system) = model([download("a", .completed)])
+        model.countdownLength = 1000
+        model.startCountdown(.sleep, queue: "one")
+        model.startCountdown(.shutDown, queue: "two")
+        #expect(model.countdown == Countdown(action: .shutDown, queue: "two", secondsLeft: 1000))
+        model.startCountdown(.sleep, queue: "three")
+        #expect(model.countdown?.action == .shutDown)
+        model.finishCountdown()
+        #expect(system.done == ["shutDown"])
+        await core.close()
+    }
+
+    /// A sleep or shutdown that fails is said, not swallowed.
+    @Test func aFailedActionIsSaid() async {
+        let (model, notifier, system) = model([download("a", .completed)])
+        system.fails = true
+        model.countdownLength = 1000
+        model.startCountdown(.sleep, queue: "q")
+        model.finishCountdown()
+        #expect(notifier.notes.last?.title == tr("countdown.sleepFailed"))
+        #expect(model.alert?.message == tr("countdown.sleepFailed"))
+        await core.close()
+    }
+
+    /// A queue emptied by a pause, cancel, removal or move after an earlier
+    /// download finished hasn't ended its run: no countdown.
+    @Test func emptyingAQueueAfterAFinishDoesNotEndIt() async {
+        for empty in ["pause", "cancel", "remove", "move"] {
+            let (model, _, _) = model(
+                [download("a", .active), download("b", .active)], onComplete: .shutdown)
+            let q = queues[0]
+            model.store.apply(.stateChanged(id: "a", from: .active, to: .completed, reason: nil))
+            model.store.apply(
+                .queueChanged(snapshot: queue(q, queued: 0, running: 1, onComplete: .shutdown)))
+            switch empty {
+            case "pause":
+                model.store.apply(.stateChanged(id: "b", from: .active, to: .paused, reason: nil))
+            case "cancel":
+                model.store.apply(
+                    .stateChanged(id: "b", from: .active, to: .cancelled, reason: nil))
+            case "remove":
+                model.store.apply(.removed(id: "b"))
+            default:
+                // Moved to another queue: no event about the download.
+                break
+            }
+            model.store.apply(
+                .queueChanged(snapshot: queue(q, queued: 0, running: 0, onComplete: .shutdown)))
+            #expect(model.countdown == nil, "\(empty)")
+        }
+        await core.close()
+    }
+
+    /// A completion that lands while the list is being read again
+    /// (reconcile) is still noticed, once.
+    @Test func aCompletionDuringAReconcileNotifiesOnce() async {
+        let (model, notifier, _) = model([download("a", .active)])
+        model.store.beginReconcile()
+        model.store.apply(.stateChanged(id: "a", from: .active, to: .completed, reason: nil))
+        var read = download("a", .completed)
+        read.queueId = queues[0].id
+        model.store.reconcile([read])
+        #expect(notifier.notes.map(\.kind) == [.completed])
+        await core.close()
+    }
+
+    @Test func linksInProseLoseTheirPunctuation() {
+        #expect(AddModel.trimmed("(https://x.test/a.iso),") == "https://x.test/a.iso")
+        #expect(AddModel.trimmed("<https://x.test/a>") == "https://x.test/a")
+        #expect(AddModel.trimmed("https://x.test/Foo_(bar)") == "https://x.test/Foo_(bar)")
+        #expect(AddModel.trimmed("https://x.test/a[1].") == "https://x.test/a[1]")
+        #expect(AddModel.trimmed("https://x.test/a]") == "https://x.test/a")
+        #expect(RowMenu.resumeTitle([]) == tr("menu.resume"))
+        #expect(RowMenu.resumeTitle([.failed]) == tr("menu.retry"))
     }
 
     @Test func theDockShowsTheActiveCountAndTheirProgress() async {

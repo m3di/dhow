@@ -32,6 +32,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let notifier = UserNotifier.make() {
             notifier.onOpen = { [model] id, reveal in model.openFromNote(id, reveal: reveal) }
+            notifier.install()
             model.notifier = notifier
         }
         model.countdownPanel = CountdownPanel()

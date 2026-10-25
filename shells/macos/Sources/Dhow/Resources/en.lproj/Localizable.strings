@@ -323,6 +323,13 @@
 /* on_complete: never silent, always cancellable. */
 /* A queue's name. */
 "countdown.because %@" = "Queue “%@” has finished.";
+/* A queue's name. */
+"countdown.sleepNote %@" = "Queue “%@” is done: your Mac will sleep in a minute";
+/* A queue's name. */
+"countdown.shutDownNote %@" = "Queue “%@” is done: your Mac will shut down in a minute";
+"countdown.noteBody" = "Open Dhow to cancel.";
+"countdown.sleepFailed" = "Dhow couldn't put your Mac to sleep. The log has the details.";
+"countdown.shutDownFailed" = "Dhow couldn't shut down your Mac. If macOS asked whether Dhow may control “loginwindow”, allow it in System Settings > Privacy & Security > Automation.";
 "countdown.sleepNow" = "Sleep Now";
 "countdown.shutDownNow" = "Shut Down Now";
 
@@ -377,6 +384,10 @@
 "queue.deleteTitle %@" = "Delete the queue “%@”?";
 "queue.deleteMessage" = "Its downloads move to the Default queue.";
 "queue.newName" = "New Queue";
+/* A queue's name. */
+"queue.unsavedTitle %@" = "Save your changes to “%@”?";
+"queue.discard" = "Don't Save";
+"queue.shutDownBlocked" = "macOS doesn't let Dhow shut down your Mac. Allow Dhow to control “loginwindow” in System Settings > Privacy & Security > Automation.";
 "queue.none" = "Select a queue.";
 "queue.name" = "Name";
 "queue.maxConcurrent" = "Downloads at once";

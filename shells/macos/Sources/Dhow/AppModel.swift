@@ -1,6 +1,7 @@
 import AppKit
 import DhowCore
 import Observation
+import os
 
 /// Hands the core's events, which arrive on its event thread, to the store
 /// on the main queue, in order. Holds the store weakly; nothing here holds
@@ -74,6 +75,9 @@ final class AppModel {
     /// A destructive action waiting for the user's yes (the list, the
     /// pane and the Download menu ask the same way).
     var confirmation: Confirmation?
+    /// A sheet or dialog is up in the main window: the Download menu's
+    /// shortcuts (⌘. is also Cancel) stay out of its way.
+    var isModal: Bool { add != nil || confirmation != nil || alert != nil }
     /// `on_complete`'s countdown while it runs.
     private(set) var countdown: Countdown?
 
@@ -86,6 +90,7 @@ final class AppModel {
     @ObservationIgnored private var countdownTask: Task<Void, Never>?
     /// Opens (or brings back) the main window; set by the window.
     @ObservationIgnored var openMainWindow: (() -> Void)?
+    @ObservationIgnored private var pendingNoteClick: (String, Bool)?
 
     init() {
         Prefs.register()
@@ -112,6 +117,11 @@ final class AppModel {
 
     /// A notification clicked: the file opens (or shows in Finder).
     func openFromNote(_ id: String, reveal: Bool) {
+        // Dhow launched by the click: once the list is read.
+        guard store.loaded else {
+            pendingNoteClick = (id, reveal)
+            return
+        }
         if !reveal, UserDefaults.standard.bool(forKey: Prefs.openFromNotification),
             store.downloads[id]?.state == .completed
         {
@@ -124,9 +134,21 @@ final class AppModel {
     /// `on_complete` never acts silently: a countdown shows, can be
     /// cancelled, and stops if anything starts downloading meanwhile.
     func startCountdown(_ action: Countdown.Action, queue: String) {
-        guard countdown == nil else { return }
+        // Another queue still at work: the Mac isn't done.
+        guard store.activeCount == 0 else { return }
+        if let running = countdown {
+            // Two queues ran dry: shutting down wins over sleeping, with
+            // the full time to cancel it.
+            if action == .shutDown, running.action == .sleep {
+                countdown = Countdown(action: action, queue: queue, secondsLeft: countdownLength)
+                notifier?.post(Self.countdownNote(countdown!))
+            }
+            return
+        }
         countdown = Countdown(action: action, queue: queue, secondsLeft: countdownLength)
         countdownPanel?.show(self)
+        // Said twice: the panel, and a notification in case it's missed.
+        notifier?.post(Self.countdownNote(countdown!))
         let tick = countdownTick
         countdownTask = Task { [weak self] in
             while let self, let left = self.countdown?.secondsLeft, left > 0 {
@@ -153,10 +175,38 @@ final class AppModel {
     func finishCountdown() {
         guard let action = countdown?.action else { return }
         cancelCountdown()
+        let failure: String?
         switch action {
-        case .sleep: system.sleep()
-        case .shutDown: system.shutDown()
+        case .sleep: failure = system.sleep()
+        case .shutDown: failure = system.shutDown()
         }
+        // Never fail silently either: logged, and said.
+        if let failure {
+            Self.log.error("on_complete \(String(describing: action)) failed: \(failure)")
+            let message =
+                action == .sleep ? tr("countdown.sleepFailed") : tr("countdown.shutDownFailed")
+            notifier?.post(
+                Note(kind: .queue, title: message, body: "", downloadId: nil, sound: true))
+            alert = AppAlert(message: message)
+        }
+    }
+
+    static let log = Logger(subsystem: "app.dhow.Dhow", category: "on-complete")
+
+    /// Asked when a queue is set to shut down: macOS may want the user's
+    /// consent (Automation) to let Dhow send the request, better now than
+    /// unattended at the end of a night's downloads.
+    func mayShutDown() async -> Bool {
+        let system = system
+        return await Task.detached { system.mayShutDown(ask: true) }.value
+    }
+
+    static func countdownNote(_ c: Countdown) -> Note {
+        Note(
+            kind: .queue,
+            title: c.action == .sleep
+                ? tr("countdown.sleepNote \(c.queue)") : tr("countdown.shutDownNote \(c.queue)"),
+            body: tr("countdown.noteBody"), downloadId: nil, sound: true)
     }
 
     // MARK: Windows
@@ -235,6 +285,10 @@ final class AppModel {
         store.load(
             downloads: loaded.downloads, queues: loaded.queues, groups: loaded.groups,
             settings: loaded.settings)
+        if let (id, reveal) = pendingNoteClick {
+            pendingNoteClick = nil
+            openFromNote(id, reveal: reveal)
+        }
     }
 
     /// Stops every run cleanly; the next launch continues them. A quit

@@ -31,7 +31,9 @@ struct DhowCommands: Commands {
                 .disabled(model.engine == nil)
         }
         CommandMenu(tr("menu.download")) {
-            DownloadMenu(model: model, ids: selected ?? [])
+            // Nothing while a sheet or dialog is up: ⌘. there means Cancel.
+            DownloadMenu(model: model, ids: model.isModal ? [] : selected ?? [])
+                .disabled(model.isModal)
         }
         CommandGroup(before: .sidebar) {
             Button(inspectorShown ? tr("menu.hideInspector") : tr("menu.showInspector")) {
@@ -92,7 +94,6 @@ private struct DownloadMenu: View {
             .keyboardShortcut(".", modifiers: [.command, .shift])
             .disabled(!states.contains(where: Actions.canCancel))
         Button(tr("menu.remove")) { model.remove(ids, deleteFiles: false) }
-            .keyboardShortcut(.delete)
             .disabled(selected.isEmpty)
         Button(tr("menu.removeAndDeleteEllipsis")) { model.confirmation = .delete(ids) }
             .keyboardShortcut(.delete, modifiers: [.command, .option])

@@ -115,7 +115,9 @@ final class UserNotifier: NSObject, Notifier, UNUserNotificationCenterDelegate {
         }
     }
 
-    private func authorize() async {
+    /// At launch, before anything is posted: clicks on notifications from
+    /// an earlier run reach Dhow. Asks the user nothing.
+    func install() {
         let center = UNUserNotificationCenter.current()
         center.delegate = self
         let show = UNNotificationAction(
@@ -124,6 +126,10 @@ final class UserNotifier: NSObject, Notifier, UNUserNotificationCenterDelegate {
             UNNotificationCategory(
                 identifier: Self.category, actions: [show], intentIdentifiers: [])
         ])
+    }
+
+    private func authorize() async {
+        let center = UNUserNotificationCenter.current()
         let granted = (try? await center.requestAuthorization(options: [.alert, .sound])) ?? false
         authorized = granted
         let notes = waiting
