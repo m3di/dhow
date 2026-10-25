@@ -56,6 +56,7 @@ impl Fx {
             queue: None,
             speed_limit: None,
             target_fs: TargetFs::Posix,
+            blind: false,
         }
     }
 
@@ -1796,6 +1797,36 @@ mod token_tests {
         assert_eq!(*tracker.files.lock().unwrap(), [added.final_path]);
     }
 
+    /// `remove(delete_files)` deletes the download's file, found by its
+    /// token, not another one put at its old path; a file the adapter
+    /// reports gone deletes nothing; an adapter that can't tell removes
+    /// nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remove_deletes_the_file_its_token_finds() {
+        let server = TestServer::start().unwrap();
+        let (fx, tracker) = tracked();
+        let a = fx.completed(&server, "a.bin").await;
+        let moved = fx.downloads.join("moved.bin");
+        tracker.move_file(&a.final_path, &moved);
+        std::fs::write(&a.final_path, b"the user's").unwrap();
+        fx.engine.remove(&a.id, true, &|_| {}).await.unwrap();
+        assert!(!moved.exists(), "the download's file is deleted");
+        assert_eq!(std::fs::read(&a.final_path).unwrap(), b"the user's");
+
+        let b = fx.completed(&server, "b.bin").await;
+        tracker.fail.store(true, Ordering::SeqCst);
+        assert!(fx.engine.remove(&b.id, true, &|_| {}).await.is_err());
+        assert!(b.final_path.exists());
+        assert!(fx.engine.get(&b.id, &|_| {}).is_ok(), "nothing removed");
+        tracker.fail.store(false, Ordering::SeqCst);
+        // Gone for good (in the Trash): only the row goes.
+        tracker.move_file(&b.final_path, &fx.downloads.join("b-elsewhere"));
+        std::fs::remove_file(fx.downloads.join("b-elsewhere")).unwrap();
+        std::fs::write(&b.final_path, b"another").unwrap();
+        fx.engine.remove(&b.id, true, &|_| {}).await.unwrap();
+        assert_eq!(std::fs::read(&b.final_path).unwrap(), b"another");
+    }
+
     /// Linux and Android: no tokens, and a moved file is just missing.
     #[tokio::test(flavor = "multi_thread")]
     async fn without_tokens_a_moved_file_is_missing() {
@@ -2027,4 +2058,419 @@ async fn snapshot_has_validators_and_connections_and_a_run_can_be_failed() {
     assert_eq!(fx.run(&added.id).await.state, State::Completed);
     let done = fx.engine.fail(&added.id, &on_event).unwrap();
     assert_eq!(done.state, State::Completed);
+}
+
+/// What a shell needs besides M1–M3: probe, blind mode, remove, retry,
+/// live connections and the segment map (ARCHITECTURE §3).
+#[allow(clippy::single_range_in_vec_init)]
+mod shell_tests {
+    use super::*;
+    use crate::storage::DEFAULT_QUEUE_ID;
+
+    type Events = Arc<StdMutex<Vec<EngineEvent>>>;
+
+    fn recorder() -> (Events, impl Fn(EngineEvent) + Send + Sync + Clone + 'static) {
+        let events: Events = Arc::default();
+        let sink = events.clone();
+        (events, move |e| sink.lock().unwrap().push(e))
+    }
+
+    fn maps(events: &Events) -> Vec<RangeMap> {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::RangeMap { map, .. } => Some(map.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `done`, the connections' chunks and `pending` cover `[0, total)`
+    /// once each.
+    fn assert_partition(map: &RangeMap, total: u64) {
+        let mut all: Vec<std::ops::Range<u64>> = map
+            .done
+            .iter()
+            .cloned()
+            .chain(map.connections.iter().map(|c| c.start..c.end))
+            .chain(map.pending.iter().cloned())
+            .collect();
+        all.sort_by_key(|r| r.start);
+        let mut at = 0;
+        for r in &all {
+            assert_eq!(r.start, at, "gap or overlap in {map:?}");
+            at = r.end;
+        }
+        assert_eq!(at, total, "{map:?}");
+        for c in &map.connections {
+            assert!(c.start <= c.at && c.at <= c.end, "{c:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_names_and_categorizes_and_records_nothing() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let url = server.url(&format!("/blob/5000?{}", disposition("clip.mkv")));
+        let url = Url::parse(&url).unwrap();
+        let p = fx.engine.probe(&url, &[], TargetFs::Posix).await.unwrap();
+        assert_eq!(p.info.suggested_name, "clip.mkv");
+        assert_eq!(p.info.total_size, Some(5000));
+        assert_eq!(p.info.resumable, Resumable::Yes);
+        assert_eq!(p.category, Category::Video);
+        // The naming toggles apply as at `add` (§3).
+        let patch = settings::SettingsPatch {
+            use_content_disposition: Some(false),
+            ..Default::default()
+        };
+        fx.engine.set_settings(patch, &|_| {}).unwrap();
+        let p = fx.engine.probe(&url, &[], TargetFs::Posix).await.unwrap();
+        assert_eq!(p.info.suggested_name, "5000");
+        assert!(fx.engine.list(&|_| {}).unwrap().is_empty());
+        let nobody = Url::parse("http://127.0.0.1:1/x").unwrap();
+        assert!(matches!(
+            fx.engine.probe(&nobody, &[], TargetFs::Posix).await,
+            Err(EngineError::Probe(ProbeError::Connect))
+        ));
+    }
+
+    /// §2.4: HEAD and the range GET fail (at `add`, and again at the run's
+    /// probe); the plain GET works.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blind_mode_adds_and_runs_what_cannot_be_probed() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let path = "/blob/300000?seed=4&head=403&fail=2&fail_mode=403";
+        let refused = fx.engine.add(fx.request(&server, path), &|_| {}).await;
+        assert!(matches!(
+            refused,
+            Err(EngineError::Probe(ProbeError::Status(403)))
+        ));
+        let mut req = fx.request(&server, path);
+        req.blind = true;
+        let added = fx.engine.add(req, &|_| {}).await.unwrap();
+        assert_eq!(added.state, State::Queued);
+        assert_eq!(added.total_size, None);
+        assert_eq!(added.resumable, Resumable::No);
+        assert_eq!(added.final_path, fx.downloads.join("300000"));
+        let done = fx.run(&added.id).await;
+        assert_eq!(done.state, State::Completed, "{:?}", done.fail_reason);
+        assert_eq!(
+            blake3::hash(&std::fs::read(&done.final_path).unwrap()),
+            blob::digest(4, 300_000)
+        );
+        // Blind is for a server that can't be probed, not for a request
+        // that can't be made.
+        let mut bad = fx.request(&server, "/blob/1");
+        bad.url = Url::parse("ftp://example.com/x").unwrap();
+        bad.blind = true;
+        assert!(matches!(
+            fx.engine.add(bad, &|_| {}).await,
+            Err(EngineError::Probe(ProbeError::UnsupportedScheme(_)))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn add_announces_the_download_before_its_group() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let (events, on_event) = recorder();
+        let mut a = fx.request(&server, "/blob/10");
+        a.filename = Some("Movie.Part1.rar".into());
+        let a = fx.engine.add(a, &on_event).await.unwrap();
+        let mut b = fx.request(&server, "/blob/10");
+        b.filename = Some("Movie.Part2.rar".into());
+        let b = fx.engine.add(b, &on_event).await.unwrap();
+        assert!(b.group.is_some());
+        let es = events.lock().unwrap().clone();
+        assert_eq!(es.len(), 3, "{es:?}");
+        assert!(matches!(&es[0], EngineEvent::DownloadAdded { snapshot } if snapshot.id == a.id));
+        assert!(matches!(&es[1], EngineEvent::DownloadAdded { snapshot } if *snapshot == b));
+        assert!(matches!(&es[2], EngineEvent::GroupChanged { id, group: Some(_) } if *id == a.id));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remove_forgets_and_deletes_only_when_asked() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let add = |name: &str, path: &str| {
+            let mut r = fx.request(&server, path);
+            r.filename = Some(name.into());
+            fx.engine.add(r, &|_| {})
+        };
+        let a = add("Show.Part1.mkv", "/blob/2000?seed=1").await.unwrap();
+        let b = add("Show.Part2.mkv", "/blob/2000?seed=2").await.unwrap();
+        let c = add("partial.bin", "/blob/1000000?throttle=1000000")
+            .await
+            .unwrap();
+        let done = fx.run(&a.id).await;
+        assert_eq!(done.state, State::Completed);
+
+        // A completed one, with its file; its auto group dissolves (§13.2).
+        let (events, on_event) = recorder();
+        fx.engine.remove(&a.id, true, &on_event).await.unwrap();
+        assert!(!done.final_path.exists());
+        assert!(matches!(
+            fx.engine.get(&a.id, &|_| {}),
+            Err(EngineError::NotFound(_))
+        ));
+        let es = events.lock().unwrap().clone();
+        assert!(matches!(
+            &es[0],
+            EngineEvent::Removed { id, queue_id } if *id == a.id && queue_id == DEFAULT_QUEUE_ID
+        ));
+        assert!(matches!(&es[1], EngineEvent::GroupChanged { id, group: None } if *id == b.id));
+        assert!(fx.engine.list_groups().unwrap().is_empty());
+        assert_eq!(fx.engine.speed_history(Some(&a.id)).unwrap(), []);
+
+        // An unfinished one, with its part file and sidecar.
+        let (tx, stop) = watch::channel(false);
+        let stop_on_bytes = move |e: EngineEvent| {
+            if matches!(e, EngineEvent::Progress { downloaded, .. } if downloaded > 0) {
+                tx.send_replace(true);
+            }
+        };
+        let paused = fx.engine.run(&c.id, &stop_on_bytes, &stop).await.unwrap();
+        assert_eq!(paused.state, State::Paused);
+        assert!(paused.part_path.exists());
+        fx.engine.remove(&c.id, true, &|_| {}).await.unwrap();
+        assert!(!paused.part_path.exists() && !paused.sidecar_path().exists());
+        assert!(matches!(
+            fx.engine.remove(&c.id, false, &|_| {}).await,
+            Err(EngineError::NotFound(_))
+        ));
+
+        // Without `delete_files` nothing on disk is touched.
+        let done = fx.run(&b.id).await;
+        fx.engine.remove(&b.id, false, &|_| {}).await.unwrap();
+        assert!(done.final_path.exists());
+        assert!(fx.engine.list(&|_| {}).unwrap().is_empty());
+        assert_eq!(fx.files(), ["Show.Part2.mkv"]);
+    }
+
+    /// Without tokens, a file of another size at the final path isn't the
+    /// download's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remove_without_tokens_deletes_only_a_file_of_its_size() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let add = async |path: &str| {
+            let added = fx
+                .engine
+                .add(fx.request(&server, path), &|_| {})
+                .await
+                .unwrap();
+            fx.run(&added.id).await
+        };
+        let a = add("/blob/1000?seed=1").await;
+        std::fs::write(&a.final_path, b"replaced").unwrap();
+        fx.engine.remove(&a.id, true, &|_| {}).await.unwrap();
+        assert_eq!(std::fs::read(&a.final_path).unwrap(), b"replaced");
+        let b = add("/blob/2000?seed=2").await;
+        fx.engine.remove(&b.id, true, &|_| {}).await.unwrap();
+        assert!(!b.final_path.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retry_requeues_only_a_failed_download() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let path = "/blob/1000?fail=1&fail_mode=403";
+        let f = fx
+            .engine
+            .add(fx.request(&server, path), &|_| {})
+            .await
+            .unwrap();
+        assert_eq!(fx.run(&f.id).await.state, State::Failed);
+        let (events, on_event) = recorder();
+        let q = fx.engine.retry(&f.id, &on_event).unwrap();
+        assert_eq!((q.state, q.fail_reason), (State::Queued, None));
+        assert!(matches!(
+            events.lock().unwrap()[..],
+            [EngineEvent::StateChanged {
+                from: State::Failed,
+                to: State::Queued,
+                ..
+            }]
+        ));
+        // The server serves it now.
+        assert_eq!(fx.run(&f.id).await.state, State::Completed);
+        let again = fx.engine.retry(&f.id, &on_event).unwrap();
+        assert_eq!(again.state, State::Completed);
+        assert_eq!(events.lock().unwrap().len(), 1);
+    }
+
+    fn live_config() -> DownloadConfig {
+        let mut c = fast();
+        c.ramp.window = Duration::from_millis(100);
+        c.ramp.min_chunk = 64 * 1024;
+        c.ramp.min_steal_gain = Duration::from_millis(10);
+        // Never saturated: this is about the override.
+        c.ramp.min_gain = -1.0;
+        c
+    }
+
+    struct Running {
+        /// The connections its `Progress` reports.
+        conns: watch::Receiver<u32>,
+        stop: watch::Sender<bool>,
+        task: tokio::task::JoinHandle<Snapshot>,
+    }
+
+    fn spawn_run(
+        fx: &Arc<Fx>,
+        id: &str,
+        on_event: impl Fn(EngineEvent) + Send + Sync + 'static,
+    ) -> Running {
+        let (conns_tx, conns) = watch::channel(0);
+        let (stop, stop_rx) = watch::channel(false);
+        let (fx, id) = (fx.clone(), id.to_owned());
+        let task = tokio::spawn(async move {
+            let on_event = move |e: EngineEvent| {
+                if let EngineEvent::Progress { connections, .. } = &e {
+                    conns_tx.send_replace(*connections);
+                }
+                on_event(e);
+            };
+            fx.engine.run(&id, &on_event, &stop_rx).await.unwrap()
+        });
+        Running { conns, stop, task }
+    }
+
+    async fn reach(conns: &mut watch::Receiver<u32>, n: u32) {
+        tokio::time::timeout(Duration::from_secs(60), conns.wait_for(|c| *c == n))
+            .await
+            .unwrap_or_else(|_| panic!("never reached {n} connections"))
+            .unwrap();
+    }
+
+    async fn map_where(
+        maps: &mut watch::Receiver<RangeMap>,
+        total: u64,
+        pred: impl Fn(&RangeMap) -> bool,
+    ) -> RangeMap {
+        let found = tokio::time::timeout(Duration::from_secs(60), maps.wait_for(pred))
+            .await
+            .map(|m| m.unwrap().clone());
+        let Ok(m) = found else {
+            panic!("no such map; the last: {:?}", *maps.borrow());
+        };
+        assert_partition(&m, total);
+        m
+    }
+
+    /// Bytes no connection has received yet.
+    fn left(m: &RangeMap) -> u64 {
+        let pending: u64 = m.pending.iter().map(|r| r.end - r.start).sum();
+        pending + m.connections.iter().map(|c| c.end - c.at).sum::<u64>()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_connections_applies_to_a_running_download() {
+        let server = TestServer::start().unwrap();
+        let fx = Arc::new(Fx::with(live_config()));
+        let total = 24_000_000;
+        let mut req = fx.request(&server, "/blob/24000000?seed=5&throttle=1000000");
+        req.connections = Some(1);
+        let added = fx.engine.add(req, &|_| {}).await.unwrap();
+        fx.engine.watch_ranges(&added.id, true, &|_| {}).unwrap();
+        let (map_tx, mut maps) = watch::channel(RangeMap::default());
+        let mut run = spawn_run(&fx, &added.id, move |e: EngineEvent| {
+            if let EngineEvent::RangeMap { map, .. } = e {
+                map_tx.send_replace(map);
+            }
+        });
+        reach(&mut run.conns, 1).await;
+
+        let up = fx.engine.set_connections(&added.id, Some(4)).unwrap();
+        assert_eq!(up.connections, Some(4));
+        reach(&mut run.conns, 4).await;
+        map_where(&mut maps, total, |m| m.connections.len() == 4).await;
+        // Lowered: at once, not as chunks end (they would all have ended,
+        // so with little left).
+        fx.engine.set_connections(&added.id, Some(1)).unwrap();
+        let one = map_where(&mut maps, total, |m| {
+            m.connections.len() == 1 && left(m) > total / 2
+        })
+        .await;
+        assert!(!one.pending.is_empty(), "the rest went back: {one:?}");
+
+        // What the stopped connections had is intact.
+        fx.engine.set_connections(&added.id, None).unwrap();
+        let done = run.task.await.unwrap();
+        assert_eq!(done.state, State::Completed);
+        assert_eq!(fx.engine.running_controls(), 0, "gone with its run");
+        assert_eq!(
+            blake3::hash(&std::fs::read(&done.final_path).unwrap()),
+            blob::digest(5, total)
+        );
+        assert!(matches!(
+            fx.engine.set_connections("nope", Some(2)),
+            Err(EngineError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn watched_ranges_while_running_and_not() {
+        let server = TestServer::start().unwrap();
+        let fx = Arc::new(Fx::with(live_config()));
+        let total = 6_000_000;
+        let mut req = fx.request(&server, "/blob/6000000?seed=6&throttle=400000");
+        req.connections = Some(3);
+        let added = fx.engine.add(req, &|_| {}).await.unwrap();
+
+        // Not running: one map at once, from the sidecar (none yet).
+        let (events, on_event) = recorder();
+        fx.engine.watch_ranges(&added.id, true, &on_event).unwrap();
+        let fresh = RangeMap {
+            total: Some(total),
+            pending: vec![0..total],
+            ..RangeMap::default()
+        };
+        assert_eq!(maps(&events), [fresh]);
+
+        // Running: maps with its connections.
+        let (map_tx, mut map_rx) = watch::channel(RangeMap::default());
+        let sink = on_event.clone();
+        let mut run = spawn_run(&fx, &added.id, move |e: EngineEvent| {
+            if let EngineEvent::RangeMap { map, .. } = &e {
+                map_tx.send_replace(map.clone());
+            }
+            sink(e);
+        });
+        reach(&mut run.conns, 3).await;
+        let wait = map_rx.wait_for(|m| m.connections.len() == 3);
+        let live = tokio::time::timeout(Duration::from_secs(30), wait)
+            .await
+            .expect("a map with three connections")
+            .unwrap()
+            .clone();
+        assert_partition(&live, total);
+        run.stop.send_replace(true);
+        let paused = run.task.await.unwrap();
+        assert_eq!(paused.state, State::Paused);
+
+        // Its last map is the sidecar's: committed, no connections.
+        let last = maps(&events).pop().unwrap();
+        assert!(last.connections.is_empty());
+        assert_partition(&last, total);
+        let committed: u64 = last.done.iter().map(|r| r.end - r.start).sum();
+        assert_eq!(committed, paused.downloaded);
+
+        // Off: a run sends none.
+        fx.engine.watch_ranges(&added.id, false, &on_event).unwrap();
+        let before = maps(&events).len();
+        let done = fx.run(&added.id).await;
+        assert_eq!(done.state, State::Completed);
+        assert_eq!(maps(&events).len(), before);
+        fx.engine.watch_ranges(&added.id, true, &on_event).unwrap();
+        let whole = RangeMap {
+            total: Some(total),
+            done: vec![0..total],
+            ..RangeMap::default()
+        };
+        assert_eq!(maps(&events).pop().unwrap(), whole);
+    }
 }

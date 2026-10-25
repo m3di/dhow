@@ -18,6 +18,16 @@ pub fn emit(v: Value) {
 
 pub fn event(e: &EngineEvent) -> Value {
     match e {
+        EngineEvent::DownloadAdded { snapshot: s } => snapshot("added", s),
+        EngineEvent::Removed { id, queue_id } => json!({
+            "event": "removed", "id": id, "queue": queue_id,
+        }),
+        EngineEvent::RangeMap { id, map } => json!({
+            "event": "range_map", "id": id, "total": map.total,
+            "done": map.done.iter().map(|r| [r.start, r.end]).collect::<Vec<_>>(),
+            "connections": map.connections.iter().map(|c| [c.start, c.at, c.end]).collect::<Vec<_>>(),
+            "pending": map.pending.iter().map(|r| [r.start, r.end]).collect::<Vec<_>>(),
+        }),
         EngineEvent::StateChanged {
             id,
             from,
@@ -156,6 +166,8 @@ pub fn queue(q: &QueueSnapshot) -> Value {
         "speed_limit": q.speed_limit,
         "on_complete": q.on_complete.as_str(),
         "unfinished": q.unfinished,
+        "queued": q.queued,
+        "running": q.running,
         "schedule": q.schedule,
         "run_state": q.run_state.as_str(),
         "run_state_until": q.run_state_until,

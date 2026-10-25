@@ -37,6 +37,25 @@ pub struct ProbeInfo {
     pub suggested_name: String,
 }
 
+impl ProbeInfo {
+    /// Blind mode (§2.4): nothing known but the URL. One connection, no
+    /// preallocation, not resumable.
+    pub fn blind(url: &Url) -> Self {
+        Self {
+            effective_url: url.clone(),
+            status: 0,
+            total_size: None,
+            resumable: Resumable::No,
+            etag: None,
+            last_modified: None,
+            content_type: None,
+            content_disposition: None,
+            digest: None,
+            suggested_name: naming::base_name(None, None, url, url, TargetFs::host()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ProbeError {
     #[error("unsupported URL scheme {0:?}")]
@@ -53,6 +72,14 @@ pub enum ProbeError {
     Connect,
     #[error("network error")]
     Network,
+}
+
+impl ProbeError {
+    /// The server could not be probed, so blind mode may go on (§2.4); a
+    /// request that can't be made at all (scheme, header) can't.
+    pub fn allows_blind(&self) -> bool {
+        !matches!(self, Self::UnsupportedScheme(_) | Self::InvalidHeader(_))
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

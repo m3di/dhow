@@ -83,6 +83,7 @@ fn t_idle_nothing_runs_after_the_last_download() {
                 queue: (seed % 2 == 0).then(|| q.id.clone()),
                 speed_limit: (seed == 3).then_some(2 << 20),
                 target_fs: TargetFs::host(),
+                blind: false,
             };
             ids.push(engine.add(req, &|_| {}).await.unwrap().id);
         }

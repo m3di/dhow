@@ -31,12 +31,12 @@ The core is a library, not a daemon. Each shell instantiates one `Dhow` object i
 |---|---|---|
 | `dhow-core` | Everything that is not UI or FFI | `tokio` (multi-thread runtime, but see §7), `reqwest` (rustls), `rusqlite` (bundled), `serde`, `thiserror`, `tracing` |
 | `dhow-ffi` | Generates Swift/Kotlin bindings via `uniffi`; exposes a flat C ABI for C# via `csbindgen` | `uniffi` |
-| `dhow-cli` | `dhow add <url>`, `dhow ls`, `dhow pause/resume/cancel`, `dhow watch` (TUI-less, prints events as JSON lines). Reference client for conformance tests. No daemon: the process that runs a download is the engine for it (see below). | `clap` |
+| `dhow-cli` | `dhow add <url>`, `dhow ls`, `dhow pause/resume/cancel/rm`, `dhow watch` (TUI-less, prints events as JSON lines). Reference client for conformance tests. No daemon: the process that runs a download is the engine for it (see below). | `clap` |
 | `dhow-testserver` | Local HTTP/1.1 server (HTTP/2 later) with knobs: drop connection after N bytes, lie about `Content-Length`, change ETag mid-download, ignore `Range`, return 200 to `If-Range`, throttle, inject garbage into a range response, slow headers. Knobs are added as the tests needing them land. | `tokio`; HTTP/1.1 hand-rolled so it can break the protocol on purpose; HTTP/2 when a test needs it |
 
 The core must build for: `aarch64/x86_64-apple-darwin`, `aarch64-apple-ios` (+sim), `x86_64/aarch64-unknown-linux-gnu`, `x86_64/aarch64-pc-windows-msvc`, `aarch64/armv7/x86_64-linux-android`. Per-PR CI runs tests on Linux only; other targets are built locally and in the (later) release workflow.
 
-**CLI process model.** `dhow add` probes, records the download in the database and runs it in the foreground; `--queue`/`--paused` only record it. `dhow resume <id>` runs one in the foreground, `dhow watch` runs queued downloads concurrently, as many per queue as its `max_concurrent` allows (re-checked whenever one finishes), and exits when none are left. Downloads `watch` runs share one connection budget (ENGINE-SPEC §10). `dhow queue add|ls|set|rm`, `dhow move` and `dhow reorder` manage queues; `dhow network` prints `NetworkInfo`. A process running a download holds an exclusive lock on `<data>/locks/<id>.lock` (`dhow_core::runlock`) holding its PID, so two processes never run the same download and a `kill -9` never leaves a stale lock; an app running downloads in process (§9) writes no PID, and `dhow pause`/`cancel` refuse its downloads. `dhow pause`/`cancel` on a running download record the request in the database and send the process running it `SIGUSR1` ("re-check"); that process stops just that download (others it runs continue). Runners also register in `<data>/runners/`, and commands that change queues (`queue add|set|rm|start|stop`, `add --queue`, `move`, `reorder`) or limits (`limit`, `settings`, `queue add|set --limit`) poke them the same way, so an idle `watch` reacts at once instead of at its next schedule edge and a running download gets its new speed limit at once (a runner re-reads the stored limits on every wake). Every runner installs the `SIGUSR1` handler before taking any lock. `watch` stays alive while queued work waits for a future schedule edge, and exits otherwise. Ctrl-C/`SIGTERM` stop a runner: `add`/`resume` leave their download Paused, `watch` puts its downloads back in their queues. Everything printed to stdout is one JSON object per line. The CLI uses `dhow_core::engine`, the M1 slice of the `Dhow` object: database-backed state, probe → download → completion gate, no scheduler yet.
+**CLI process model.** `dhow add` probes, records the download in the database and runs it in the foreground; `--queue`/`--paused` only record it. `dhow resume <id>` runs one in the foreground, `dhow watch` runs queued downloads concurrently, as many per queue as its `max_concurrent` allows (re-checked whenever one finishes), and exits when none are left. Downloads `watch` runs share one connection budget (ENGINE-SPEC §10). `dhow queue add|ls|set|rm`, `dhow move` and `dhow reorder` manage queues; `dhow network` prints `NetworkInfo`. A process running a download holds an exclusive lock on `<data>/locks/<id>.lock` (`dhow_core::runlock`) holding its PID, so two processes never run the same download and a `kill -9` never leaves a stale lock; an app running downloads in process (§9) writes no PID, and `dhow pause`/`cancel` refuse its downloads. `dhow pause`/`cancel`/`rm` on a running download record the request in the database and send the process running it `SIGUSR1` ("re-check"); that process stops just that download (others it runs continue). Runners also register in `<data>/runners/`, and commands that change queues (`queue add|set|rm|start|stop`, `add --queue`, `move`, `reorder`) or limits (`limit`, `settings`, `queue add|set --limit`) poke them the same way, so an idle `watch` reacts at once instead of at its next schedule edge and a running download gets its new speed limit at once (a runner re-reads the stored limits on every wake). Every runner installs the `SIGUSR1` handler before taking any lock. `watch` stays alive while queued work waits for a future schedule edge, and exits otherwise. Ctrl-C/`SIGTERM` stop a runner: `add`/`resume` leave their download Paused, `watch` puts its downloads back in their queues. Everything printed to stdout is one JSON object per line. The CLI uses `dhow_core::engine`, the M1 slice of the `Dhow` object: database-backed state, probe → download → completion gate, no scheduler yet.
 
 ## 3. Command / event API
 
@@ -47,14 +47,16 @@ This is the whole surface a shell sees. Keep it small. Everything is a plain dat
 ```rust
 pub enum Command {
     // Lifecycle
-    Probe { url: Url, headers: Vec<Header> },            // → ProbeResult event; does not start anything
+    Probe { url: Url, headers: Vec<Header>, target_fs: Option<TargetFs> }, // async call → ProbeResult (no event); records and starts nothing
     Add   { request: AddRequest },                        // → DownloadAdded; may start immediately per queue rules
     Pause { id: DownloadId },
     Resume { id: DownloadId },
     Cancel { id: DownloadId, delete_partial: bool },
-    Remove { id: DownloadId, delete_file: bool },         // only for Completed/Cancelled/Failed
-    Retry  { id: DownloadId },                            // Failed → Queued, keeps journal
+    Remove { id: DownloadId, delete_files: bool },        // any state; a running one is stopped first → Removed
+    Retry  { id: DownloadId },                            // Failed → Queued, keeps journal; others unchanged
     SetSpeedLimit { id: DownloadId, limit: Option<u64> }, // bytes/s; Some(0) = paused by limit (ENGINE-SPEC §12)
+    SetConnections { id: DownloadId, connections: Option<u8> }, // §4.1 override; a running download follows at once
+    WatchRanges { id: DownloadId, on: bool },             // RangeMap events (§3.3)
 
     // Organisation
     MoveToQueue { id: DownloadId, queue: QueueId },
@@ -97,8 +99,11 @@ pub struct AddRequest {
     pub start: StartMode,                // Now | Queued | Paused
     pub connections: Option<u8>,         // None = auto
     pub speed_limit: Option<u64>,        // bytes/s, None = unlimited (global limit still applies)
+    pub blind: bool,                     // "Download anyway": a failed probe adds it blind (ENGINE-SPEC §2.4); default false
 }
 ```
+
+`Probe` returns what `Add` would learn (ENGINE-SPEC §2.2): `suggested_name` for `target_fs` (as the `Add` will have it; default the host's) following the naming settings, without collisions, `total_size`, `resumable`, the name's `category`, the validators. `Remove` forgets the row, its ranges and speed samples, and tidies its group (§13.2); `delete_files` also deletes the file of a completed download: the one its token resolves to, wherever it is (a file put at `final_path` after the download's moved away is left alone; one the adapter reports gone deletes nothing; an adapter that fails makes `Remove` fail, removing nothing), or with no token (platforms without them, §6) `final_path` only if it has the download's size; or the part file and sidecar of any other download; nothing on disk without the flag. A shell that prefers the Trash removes a completed file itself and calls `Remove` without `delete_files`. `SetConnections` stores the override; a running download raises its limit and resumes ramp-up (§4.4), or stops its newest connections at once, their rest going back to pending work as for a newcomer (§10.3). `WatchRanges` on sends one `RangeMap` at once, from the sidecar, then (while it runs) at most one a second and one from the sidecar when the run ends; off, or with no run, nothing runs for it.
 
 ### 3.2 Events (core → shell)
 
@@ -106,27 +111,33 @@ Delivered on a single ordered channel. Shells subscribe once. The core never blo
 
 ```rust
 pub enum Event {
-    ProbeResult { url: Url, result: Result<ProbeInfo, ProbeError> },
-    DownloadAdded { snapshot: DownloadSnapshot },
+    DownloadAdded { snapshot: DownloadSnapshot },            // by Add, or by another process (seen at list/recheck)
+    Removed { id: DownloadId },                              // by Remove, or by another process (likewise)
     StateChanged { id: DownloadId, from: State, to: State, reason: Option<FailReason> },
-    Progress { id: DownloadId, downloaded: u64, total: Option<u64>, speed_bps: u64, eta_secs: Option<u64>, active_connections: u8 },
-    RangeMap { id: DownloadId, ranges: Vec<RangeStatus> },   // for the segment visualizer; throttled
+    Progress { id: DownloadId, downloaded: u64, total: Option<u64>, connections: u32, speed_bps: u64, eta_secs: Option<u64> },
+    Reset { id: DownloadId, reason: ResetReason },           // started over from zero (I4, §5.4)
+    Retrying { id: DownloadId, failures: u32, delay_ms: u64 }, // "Reconnecting (n)" (§9)
     Renamed { id: DownloadId, path: PathBuf },               // final rename done, or file moved (see §6)
+    Warning { id: Option<DownloadId>, kind: WarningKind },   // NotResumable, SizeUnverified, IdentityWeak, ServerIgnoredRange
     GroupChanged { id: DownloadId, group: Option<GroupSnapshot> },
-    QueueChanged { snapshot: QueueSnapshot },
-    NetworkChanged { info: NetworkInfo },
     SettingsChanged { settings: Settings },
-    Warning { id: Option<DownloadId>, kind: WarningKind },   // e.g. NotResumable, ServerIgnoredRange, ProxyUnreachable
+    RangeMap { id: DownloadId, map: RangeMap },              // segment map, while watched; throttled
+    QueueChanged { snapshot: QueueSnapshot },
+    QueueRemoved { id: QueueId },
+    NetworkChanged { info: NetworkInfo },
 }
 ```
 
-`State`: `Probing | Queued | Waiting(WaitReason) | Active | Paused | Completing | Completed | Failed(FailReason) | Cancelled`.
-`WaitReason`: `Schedule | QueueConcurrency | ConnectionBudget | Retry { attempt: u8, at: Instant }`.
+`State`: `Queued | Waiting | Active | Paused | Completing | Completed | Failed | Cancelled`; `Waiting` is the connection budget only (ENGINE-SPEC §10.3). The other reasons a row's status text names come from data the shell has: a `Queued` download waits for its queue's concurrency (`QueueSnapshot.running` = `max_concurrent`) or its schedule (`active_now`, `next_edge`); "Reconnecting (n)" is the last `Retrying` until the next `Progress`. `RangeMap { total, done, connections: [{ start, at, end }], pending }` covers the file once: `done` is committed (from the sidecar) or, while running, written and committed within the commit interval; each connection has received `[start, at)` of its chunk.
+
+`QueueSnapshot` counts `unfinished` (not completed or cancelled), `queued` and `running` (`Active`, `Waiting`, `Completing`); `queued + running` reaching 0 is the queue running dry, when the shell carries out `on_complete`. `QueueChanged` comes after a queue is created, edited, started, stopped or put back on its schedule, after any event that changes its counts (a download added, removed, moved, or crossing between queued, running, finished and the rest), at a schedule edge the engine woke for (only while work waits, §7; otherwise `next_edge` says when the shell's own snapshot goes stale), and for every queue on `recheck`. An override that has ended reads as `Auto`.
+
+The variant lists are part of the contract: Swift (a non-evolution module) and Kotlin make shells' `switch`/`when` exhaustive, so a new variant breaks every shell and comes only with a deliberate break.
 
 ### 3.3 Event rate
 
 - `Progress` at most every 250 ms per download, and immediately on state change.
-- `RangeMap` at most every 1 s per download, only while a subscriber has opted in (`Command::WatchRanges { id, on: bool }`).
+- `RangeMap` at most every 1 s per download, only while a subscriber has opted in (`Command::WatchRanges { id, on: bool }`); the ticks live in the download's run and die with it.
 - Everything else: as it happens.
 - With no active downloads, **no events are emitted** and no timers exist. (`CLAUDE.md` non-negotiable.)
 
@@ -165,7 +176,7 @@ One database per user. WAL mode, `synchronous=NORMAL`, foreign keys on, `STRICT`
 
 Tables (abridged, the migrations are the truth):
 
-- `downloads` — id (UUIDv7), url, headers (json), final_path, part_path, state, fail_reason, queue_id, position, group_id, group_pinned, category, created_at, started_at, completed_at, total_size, etag, last_modified, digest, resumable, size_unverified, identity_weak, connections, speed_limit, file_token (blob)
+- `downloads` — id (UUIDv7), url, headers (json), final_path, part_path, state, fail_reason, queue_id, position, group_id, group_pinned, category, created_at, started_at, completed_at, total_size, etag, last_modified, digest, resumable, size_unverified, identity_weak, connections, speed_limit, file_token (blob), blind (added in blind mode, ENGINE-SPEC §2.4)
 - `ranges` — download_id, start, end, state (`pending|active|committed`) — **mirror** of the sidecar journal, for queries only; the sidecar is authoritative (§5.2)
 - `queues` — id, name, max_concurrent, schedule (json), speed_limit, on_complete, is_default. The default queue is created by migration 1 with a fixed id and a NULL name (the shell localizes it); a trigger prevents deleting it.
 - `groups` — id, name, auto (bool)
@@ -238,10 +249,11 @@ Core settings: `proxy_mode: System | None | Custom(ProxyConfig)`, default `Syste
 - UniFFI proc-macro style (`#[uniffi::export]`), not UDL. Async methods exposed as async; events via a callback interface (`EventListener`), one listener per `Dhow`.
 - `dhow-ffi` exports one object, `Engine` (the `Dhow` of §1): `Engine.open(data_dir, EngineConfig, listener, adapter?)`. `EngineConfig` holds only the engine knobs of §3.1 (ramp-up window and gain, steal gain, saturation TTL, minimum chunk), each optional; test hooks (`WriterConfig::slow_sync`, retry base) are not exposed. Free functions: `init_logging(dir, filter?)` (§5.3, once per process), `default_data_dir()`, `default_log_dir()`, `core_version()`.
 - Records and enums mirror the core types as plain data: ids, paths and URLs are strings, durations milliseconds, times Unix ms, file tokens bytes. Names SwiftUI also uses are prefixed (`DownloadState`, `DhowSettings`, `ScheduleWindow`, `ScheduleAction`); the core's `ProxyMode::None` and `BackgroundCapability::None` are `Direct` and `SystemOnly`, since `.none` is `Optional`'s in Swift. Errors are one enum (`DhowError`) whose messages are diagnostics, not display text (the Swift bindings omit `LocalizedError`).
-- The engine owns its tokio runtime (min(4, cores) workers, §7). `async` calls (`add`, `pause`, `cancel`, `shutdown`) run on it whatever executor polls them; dropping the call does not stop the command. The other calls are synchronous (§3.1) and run on the caller's thread.
+- The engine owns its tokio runtime (min(4, cores) workers, §7). `async` calls (`probe`, `add`, `pause`, `cancel`, `remove`, `shutdown`) run on it whatever executor polls them; dropping the call does not stop the command (a dropped `add` still records the download and emits `DownloadAdded`). The other calls are synchronous (§3.1) and run on the caller's thread. Of §3.1's commands, `retry`, `set_connections` and `watch_ranges` are synchronous; `remove` stops a running download as `cancel` does, under its run lock. `network_changed()` is for the shell's network monitor (M4.3): it asks the adapter and emits `NetworkChanged`.
+- **Another process's changes.** The CLI doesn't poke the app (below), so a download it adds or removes is announced (`DownloadAdded`, `Removed`, with its queue's `QueueChanged`) the next time the engine reads the list: at `list()` or `recheck()`, which shells call when the app becomes active as well as on wake. The engine keeps the set of ids the shell has heard of, so each is announced once, whichever path sees it first.
 - **In-process runner.** The engine runs downloads itself, applying the core's queue policy (`next_runnable`, `to_stop`, `next_edge`) the way `dhow watch` does: on open (including downloads a dead process left `Active`), after every command that can change what runs, and when a run ends. It is not a task: a pass runs on the thread that changed something; only while a schedule edge can start or stop waiting work does one task sleep until it. `resume` and `add` with `StartMode::Now` start by hand (§11: no schedule applies, the queue's concurrency still counts them); `stop_queue` stops the queue's runs, by-hand ones too; runs the runner stops go back to `Queued`. `pause` and `cancel` stop a running download and return once it has stopped. A `resume` while a stop is under way starts it again once stopped; of several stops, a user's (`pause`) wins over the runner's, so a paused download stays `Paused` through `shutdown`, `stop_queue` or a window's end. A run the engine can't carry out (an engine error, not a transfer failure) is recorded as `Failed(Io)` (ENGINE-SPEC §9 Local), which frees its slot. The sleeper's clock is monotonic and stops while the machine sleeps: shells call `recheck()` on wake and on clock or time-zone changes. `QueueSnapshot` carries `active_now` and `next_edge`, computed by the core's schedule rules, so shells don't redo schedule or DST logic.
 - **With the CLI.** Each run takes the run lock of §2 (`dhow_core::runlock`) without a PID, so the CLI and an app never run one download at once; the CLI refuses to pause or cancel a download an app runs (it can't signal one) and the app returns `RunningElsewhere` for one the CLI runs. The app does not poke CLI runners, nor they it.
-- **Events** go into a queue a dedicated thread (not a runtime task) hands to the listener in order; a `Progress` still queued is replaced by a newer one for the same download (§3.3). The core never waits for the listener; the listener may call the engine.
+- **Events** go into a queue a dedicated thread (not a runtime task) hands to the listener in order; a `Progress` or `RangeMap` still queued is replaced by a newer one of the same kind for the same download, looking back past the other of the two kinds (they alternate while watched) but not past any other event of that download (§3.3). A download the shell hasn't heard of (another process added it) gets its `DownloadAdded` before its first event. The core never waits for the listener; the listener may call the engine.
 - **The adapter** is a foreign trait (`PlatformAdapter`: file tokens, system proxy, network info, keep-awake, background capability; no `watch_network` yet). Its methods may block and are called on engine threads: file tokens on the thread of the query that needs them (§6), proxy lookups on the blocking pool, `keep_awake` with an engine lock held (it must not call the engine).
 - **Shutdown and drop.** `shutdown()` stops every run cleanly (committed, back to `Queued`, so the next engine continues them) and starts nothing more. Dropping the engine without it cancels runs where they are (the journal makes that safe at any instant, ENGINE-SPEC §5) and blocks the dropping thread up to 5 s for file work in flight, so shells call `shutdown` and don't drop it on the main thread; runs left `Active` are resumed by the next engine. The listener and adapter must hold the engine weakly, or the reference cycle keeps it alive.
 - The generated Swift and Kotlin contain UniFFI's runtime code (MPL-2.0, compatible with GPL-3.0); the app's credits (the DMG, M4.5) must list it.

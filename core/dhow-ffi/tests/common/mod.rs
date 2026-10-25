@@ -138,5 +138,6 @@ pub fn request(url: String, dir: &Path, name: &str, start: StartMode) -> AddRequ
         queue: None,
         speed_limit: None,
         target_fs: None,
+        blind: false,
     }
 }

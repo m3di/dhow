@@ -498,6 +498,39 @@ fn cancel_while_running_deletes_partials() {
     assert!(sb.files().is_empty());
 }
 
+/// ARCHITECTURE §3.1 `Remove`: forgets a download in any state; deletes
+/// its file only when asked.
+#[cfg(unix)]
+#[test]
+fn rm_forgets_a_download_and_deletes_files_only_when_asked() {
+    let server = TestServer::start().unwrap();
+    let sb = Sandbox::new();
+    let done = sb
+        .add(&server, &format!("/blob/1000?{}", named("kept.bin")), &[])
+        .assert_success()
+        .id();
+    let out = sb.dhow(["rm", &done]);
+    out.assert_success();
+    assert!(out.has("removed", "id", &done), "{out:?}");
+    assert!(sb.ls().is_empty());
+    assert_eq!(sb.files(), ["kept.bin"]);
+
+    // A running one: its process stops it first.
+    let mut run = sb.spawn_add(&server, &slow("r.bin", ""), &[]);
+    let id = run.wait_for(|e| e["event"] == "added")["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    run.wait_for(|e| e["event"] == "progress" && e["downloaded"].as_u64().unwrap() > 0);
+    sb.dhow(["rm", &id, "--delete-files"]).assert_success();
+    run.wait();
+    assert!(sb.ls().is_empty());
+    assert_eq!(sb.files(), ["kept.bin"]);
+    let again = sb.dhow(["rm", &id]);
+    assert!(!again.status.success());
+    assert!(again.stderr.contains("no download matches"), "{again:?}");
+}
+
 #[test]
 fn one_process_per_download() {
     let server = TestServer::start().unwrap();
@@ -541,7 +574,7 @@ fn the_cli_refuses_a_download_an_app_runs() {
     let Ok(_app) = dhow_core::runlock::acquire(&sb.data_dir(), &id, None) else {
         panic!("lock taken");
     };
-    for cmd in ["pause", "cancel", "resume"] {
+    for cmd in ["pause", "cancel", "resume", "rm"] {
         let out = sb.dhow([cmd, id.as_str()]);
         assert!(!out.status.success(), "{cmd}: {out:#?}");
         assert!(

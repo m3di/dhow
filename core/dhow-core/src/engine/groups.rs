@@ -253,6 +253,26 @@ impl Engine {
         Ok(changed)
     }
 
+    /// Deletes a download's row (its ranges and samples go with it) and
+    /// tidies the group it was in. Returns the downloads that left too.
+    pub(super) fn forget(&self, id: &str) -> Result<Vec<DownloadId>, EngineError> {
+        let db = self.db();
+        let tx = write_tx(db.conn())?;
+        let group: Option<GroupId> = tx
+            .query_row("SELECT group_id FROM downloads WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .ok_or_else(|| EngineError::NotFound(id.to_owned()))?;
+        tx.execute("DELETE FROM downloads WHERE id = ?1", [id])?;
+        let left = match group {
+            Some(g) => tidy(&tx, &g)?,
+            None => Vec::new(),
+        };
+        tx.commit()?;
+        Ok(left)
+    }
+
     /// `GroupChanged` for each of `ids`, with its group as it is now.
     pub(super) fn announce_groups(
         &self,
@@ -328,7 +348,6 @@ fn members(conn: &Connection) -> Result<Vec<Member>, EngineError> {
 
 /// After a member left `group`: deletes it if empty, dissolves it if
 /// automatic with one member left. Returns the downloads that left too.
-/// `Remove` must call it for the removed download's group.
 fn tidy(conn: &Connection, group: &str) -> Result<Vec<DownloadId>, EngineError> {
     let auto: bool = conn.query_row("SELECT auto FROM groups WHERE id = ?1", [group], |r| {
         r.get(0)

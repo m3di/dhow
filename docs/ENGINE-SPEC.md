@@ -60,6 +60,8 @@ Shells MUST surface `No` before the user confirms the download ("This server doe
 
 If both requests fail, `Add` MAY still proceed in **blind mode**: single connection, no preallocation, `total_size = None`, `resumable = No`. The user is warned.
 
+Blind mode is the user's choice, never automatic: `AddRequest.blind` ("Download anyway", after a `Probe` failed). With it, a probe that fails because of the server (an error status, a timeout, no connection, too many redirects) adds the download blind, named from the URL (§3 steps 3–5); a request that can't be made at all (unsupported scheme, invalid header) still fails. The download is recorded as blind, so a failed probe at the start of a later run goes on blind too: a plain `GET` without `Range`. A probe that succeeds on a later run is used as usual.
+
 ---
 
 ## 3. Naming
@@ -104,6 +106,8 @@ n = 1 if resumable == No or total_size == None
 ```
 
 Also capped by a recent **link saturation** (§4.4): if this process saw throughput stop growing at `k` connections in the last `settings.saturation_ttl` (default 60 s), `n <= k`.
+
+The user override can change while the download runs (`SetConnections`): `n` is computed again (1 once downgraded, §2.3, §9 Protocol). A higher `n` than before, above the connections open, resumes ramp-up (afresh if it had ended); otherwise a ramp-up that ended (saturated, nothing to split) stays ended, and a download not ramping claims nothing (§10.3). Below the connections open, the newest stop at once, their unfetched rest going back to pending work as when one is given up for a newcomer, and no connection that ends is replaced while the download is over its `n`; one still verifying its overlap (I5) stops once it has.
 
 ### 4.2 Initial plan
 
@@ -278,6 +282,8 @@ Steps 5–7 are the only non-idempotent moment. If the process dies between 5 an
 
 `429` and `503` honor `Retry-After` if present (cap 5 min).
 
+`Retry` puts a `Failed` download back in its queue (`Queued`, in its old place), its journal kept; the queue starts it when its concurrency and schedule allow (`Resume` starts it at once, by hand, §11). On any other state it does nothing.
+
 ---
 
 ## 10. Politeness scheduler
@@ -375,7 +381,7 @@ Changing a limit takes effect within 200 ms: waiting connections are woken at on
 ### 13.1 Category
 
 Derived at `Add` from the file name's extension first, `Content-Type` second:
-`Video | Audio | Image | Document | Archive | Software | Code | Data | Other`. The mapping table lives in `dhow-core/src/naming/categories.toml`, user-extensible via settings (`extra_extensions: {Category: [ext]}`). `storage_breakdown()` sums `total_size` of `Completed` downloads by category and reports whether the file still exists (via path or token). (`ProbeInfo.category`, §2.2, is the same derivation on `suggested_name` at probe time, once a standalone `Probe` exists.)
+`Video | Audio | Image | Document | Archive | Software | Code | Data | Other`. The mapping table lives in `dhow-core/src/naming/categories.toml`, user-extensible via settings (`extra_extensions: {Category: [ext]}`). `storage_breakdown()` sums `total_size` of `Completed` downloads by category and reports whether the file still exists (via path or token). (`ProbeInfo.category`, §2.2, is the same derivation on `suggested_name`, returned by `Probe`.)
 
 - At `Add` the name is the one chosen by §3 or the user's `filename`, *before* collision handling: ` (n)` goes before what §3 treats as the extension, which can sit inside a longer extension a user added (`model (2).tar.lz`), so the deduplicated name could categorise differently.
 - On `Renamed` (the file was renamed or moved outside Dhow, found via its token, M3.5) the category is derived again from the new name: `x.mkv` renamed to `x.zip` becomes `Archive`. The `Content-Type` isn't kept, so a new name without a known extension keeps the stored category (a `clip` served as `video/mp4` stays `Video` as `clip-old`); a move under the same name keeps it too.

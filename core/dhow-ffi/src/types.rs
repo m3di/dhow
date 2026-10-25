@@ -19,8 +19,8 @@ use dhow_core::engine::settings::{
 };
 use dhow_core::engine::speed::SpeedSample as CoreSample;
 use dhow_core::engine::{
-    self as core, EngineEvent, FailReason as CoreFail, Snapshot, State as CoreState,
-    WarningKind as CoreWarning,
+    self as core, EngineEvent, FailReason as CoreFail, Probed, RangeMap as CoreMap, Snapshot,
+    State as CoreState, WarningKind as CoreWarning,
 };
 use dhow_core::naming::{Category as CoreCategory, TargetFs as CoreFs};
 use dhow_core::platform::{
@@ -125,33 +125,45 @@ pub struct AddRequest {
     /// Naming rules of the target volume; `None`: the host's.
     #[uniffi(default)]
     pub target_fs: Option<TargetFs>,
+    /// "Download anyway" (§2.4): if the probe fails, add it blind (named
+    /// from the URL, size unknown, one connection, not resumable).
+    #[uniffi(default)]
+    pub blind: bool,
 }
 
 impl AddRequest {
     pub(crate) fn into_core(self) -> Result<core::AddRequest, DhowError> {
         Ok(core::AddRequest {
             url: parse_url(&self.url)?,
-            headers: self
-                .headers
-                .into_iter()
-                .map(|h| dhow_core::http::Header {
-                    name: h.name,
-                    value: h.value,
-                })
-                .collect(),
+            headers: core_headers(self.headers),
             directory: PathBuf::from(self.directory),
             filename: self.filename,
             paused: self.start == StartMode::Paused,
             connections: self.connections,
             queue: self.queue,
             speed_limit: self.speed_limit,
-            target_fs: match self.target_fs {
-                Some(TargetFs::Posix) => CoreFs::Posix,
-                Some(TargetFs::Windows) => CoreFs::Windows,
-                None => CoreFs::host(),
-            },
+            target_fs: core_fs(self.target_fs),
+            blind: self.blind,
         })
     }
+}
+
+pub(crate) fn core_fs(fs: Option<TargetFs>) -> CoreFs {
+    match fs {
+        Some(TargetFs::Posix) => CoreFs::Posix,
+        Some(TargetFs::Windows) => CoreFs::Windows,
+        None => CoreFs::host(),
+    }
+}
+
+pub(crate) fn core_headers(headers: Vec<Header>) -> Vec<dhow_core::http::Header> {
+    headers
+        .into_iter()
+        .map(|h| dhow_core::http::Header {
+            name: h.name,
+            value: h.value,
+        })
+        .collect()
 }
 
 pub(crate) fn parse_url(s: &str) -> Result<Url, DhowError> {
@@ -242,6 +254,96 @@ impl From<ProbeError> for ProbeFailure {
             ProbeError::Timeout => Self::Timeout,
             ProbeError::Connect => Self::Connect,
             ProbeError::Network => Self::Network,
+        }
+    }
+}
+
+/// What `probe` learned (§2.2), for the add dialog: nothing is recorded.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ProbeResult {
+    /// After redirects.
+    pub effective_url: String,
+    /// For the host's file system, following the naming settings (§3);
+    /// `add` resolves collisions.
+    pub suggested_name: String,
+    pub total_size: Option<u64>,
+    /// `No`: say so before the user confirms (§2.3).
+    pub resumable: Resumable,
+    /// Of `suggested_name` (§13.1).
+    pub category: Category,
+    pub content_type: Option<String>,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+impl From<Probed> for ProbeResult {
+    fn from(p: Probed) -> Self {
+        Self {
+            effective_url: p.info.effective_url.into(),
+            suggested_name: p.info.suggested_name,
+            total_size: p.info.total_size,
+            resumable: p.info.resumable.into(),
+            category: p.category.into(),
+            content_type: p.info.content_type,
+            etag: p.info.etag,
+            last_modified: p.info.last_modified,
+        }
+    }
+}
+
+/// `[start, end)` of the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ByteRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+/// A connection's chunk: `[start, at)` received, `[at, end)` to go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ConnectionRange {
+    pub start: u64,
+    pub at: u64,
+    pub end: u64,
+}
+
+/// The segment map (UI-GUIDELINES §5.2): together `done`, `connections`
+/// and `pending` cover the file once each.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct RangeMap {
+    /// `None`: blind (§2.4); the last range then ends at `u64::MAX`.
+    pub total: Option<u64>,
+    /// Fetched: committed, or (while running) written and committed within
+    /// the commit interval.
+    pub done: Vec<ByteRange>,
+    /// One per open connection, in file order.
+    pub connections: Vec<ConnectionRange>,
+    /// Nobody fetches these yet.
+    pub pending: Vec<ByteRange>,
+}
+
+impl From<CoreMap> for RangeMap {
+    fn from(m: CoreMap) -> Self {
+        let r = |v: Vec<std::ops::Range<u64>>| {
+            v.into_iter()
+                .map(|r| ByteRange {
+                    start: r.start,
+                    end: r.end,
+                })
+                .collect()
+        };
+        Self {
+            total: m.total,
+            done: r(m.done),
+            connections: m
+                .connections
+                .into_iter()
+                .map(|c| ConnectionRange {
+                    start: c.start,
+                    at: c.at,
+                    end: c.end,
+                })
+                .collect(),
+            pending: r(m.pending),
         }
     }
 }
@@ -647,6 +749,11 @@ pub struct QueueSnapshot {
     pub run_state_until: Option<i64>,
     /// Downloads in it that aren't completed or cancelled.
     pub unfinished: u32,
+    /// Of those, `Queued`: waiting for their turn (§10.4, §11).
+    pub queued: u32,
+    /// And `Active`, `Waiting` or `Completing`. With `queued`, 0 once it
+    /// has run dry: time for `on_complete`.
+    pub running: u32,
     /// May its downloads start now (schedule and override, §11)? As of
     /// the read.
     pub active_now: bool,
@@ -658,9 +765,14 @@ pub struct QueueSnapshot {
 impl From<CoreQueue> for QueueSnapshot {
     fn from(q: CoreQueue) -> Self {
         let now = jiff::Zoned::now();
+        // An override that has ended reads as none.
+        let run_state = q.run_state_at(now.timestamp());
         Self {
             active_now: q.active_at(&now),
             next_edge: q.next_edge_at(&now).map(|t| t.as_millisecond()),
+            run_state_until: q
+                .run_state_until
+                .filter(|_| run_state != CoreRunState::Auto),
             id: q.id,
             name: q.name,
             max_concurrent: q.max_concurrent,
@@ -668,13 +780,14 @@ impl From<CoreQueue> for QueueSnapshot {
             schedule: q.schedule.map(Into::into),
             on_complete: q.on_complete.into(),
             is_default: q.is_default,
-            run_state: match q.run_state {
+            run_state: match run_state {
                 CoreRunState::Auto => RunState::Auto,
                 CoreRunState::Started => RunState::Started,
                 CoreRunState::Stopped => RunState::Stopped,
             },
-            run_state_until: q.run_state_until,
             unfinished: q.unfinished,
+            queued: q.queued,
+            running: q.running,
         }
     }
 }
@@ -1021,10 +1134,23 @@ impl TryFrom<SettingsPatch> for CorePatch {
     }
 }
 
-/// Core → shell, in order, on one listener (ARCHITECTURE §3.2). `Progress`
-/// still queued for the listener is replaced by a newer one (§3.3).
+/// Core → shell, in order, on one listener (ARCHITECTURE §3.2). A
+/// `Progress` or `RangeMap` still queued for the listener is replaced by a
+/// newer one (§3.3).
+///
+/// Adding a variant breaks every shell's exhaustive `switch`/`when`: new
+/// ones come only with a deliberate break (DECISIONS 2026-10-25).
 #[derive(Clone, Debug, PartialEq, uniffi::Enum)]
 pub enum Event {
+    /// Recorded: by this engine's `add` (also one whose call was dropped),
+    /// or by another process, seen at `list` or `recheck`.
+    DownloadAdded {
+        snapshot: DownloadSnapshot,
+    },
+    /// Forgotten: by `remove`, or by another process (seen as above).
+    Removed {
+        id: String,
+    },
     StateChanged {
         id: String,
         from: DownloadState,
@@ -1069,6 +1195,26 @@ pub enum Event {
     SettingsChanged {
         settings: DhowSettings,
     },
+    /// The segment map, while `watch_ranges` is on (ARCHITECTURE §3.3).
+    RangeMap {
+        id: String,
+        map: RangeMap,
+    },
+    /// A queue changed: created or edited, started or stopped, its counts
+    /// (downloads added, removed, moved, started, finished), or a schedule
+    /// edge passed while work waited on it. A queue the shell hasn't seen
+    /// is new.
+    QueueChanged {
+        snapshot: QueueSnapshot,
+    },
+    /// Deleted by `delete_queue`.
+    QueueRemoved {
+        id: String,
+    },
+    /// After `network_changed` (ARCHITECTURE §8).
+    NetworkChanged {
+        info: NetworkInfo,
+    },
 }
 
 impl Event {
@@ -1080,9 +1226,15 @@ impl Event {
             | Self::Reset { id, .. }
             | Self::Retrying { id, .. }
             | Self::Renamed { id, .. }
-            | Self::GroupChanged { id, .. } => Some(id),
+            | Self::GroupChanged { id, .. }
+            | Self::Removed { id }
+            | Self::RangeMap { id, .. } => Some(id),
+            Self::DownloadAdded { snapshot } => Some(&snapshot.id),
             Self::Warning { id, .. } => id.as_deref(),
-            Self::SettingsChanged { .. } => None,
+            Self::SettingsChanged { .. }
+            | Self::QueueChanged { .. }
+            | Self::QueueRemoved { .. }
+            | Self::NetworkChanged { .. } => None,
         }
     }
 }
@@ -1090,6 +1242,14 @@ impl Event {
 impl From<EngineEvent> for Event {
     fn from(e: EngineEvent) -> Self {
         match e {
+            EngineEvent::DownloadAdded { snapshot } => Self::DownloadAdded {
+                snapshot: snapshot.into(),
+            },
+            EngineEvent::Removed { id, .. } => Self::Removed { id },
+            EngineEvent::RangeMap { id, map } => Self::RangeMap {
+                id,
+                map: map.into(),
+            },
             EngineEvent::StateChanged {
                 id,
                 from,

@@ -41,6 +41,8 @@ async fn fetch_and_finalize(server: &TestServer, path: &str) -> Outcome {
         started_at: None,
         limits: vec![],
         hold: None,
+        blind: false,
+        tuning: None,
     };
     let client = http::client().unwrap();
     let done = tokio::time::timeout(

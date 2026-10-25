@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use dhow_core::engine::queues::RunState as RunStateCore;
 use dhow_core::engine::{Engine as CoreEngine, EngineError, EngineEvent, Snapshot, State};
 use dhow_core::platform::NoopAdapter;
 use dhow_core::runlock::{self, Held};
@@ -56,6 +57,9 @@ struct Inner {
     runner: Mutex<Runner>,
     /// Wakes the schedule sleeper to look again.
     wake: Notify,
+    /// The downloads the shell has heard of: each is announced once, also
+    /// one another process added (and its removal).
+    known: Mutex<HashSet<String>>,
 }
 
 #[derive(Default)]
@@ -130,6 +134,7 @@ impl Engine {
             let _rt = rt.enter();
             CoreEngine::open_with(&data_dir, config.download_config(), platform)?
         };
+        let known = core.ids()?.into_iter().collect();
         let inner = Arc::new(Inner {
             core,
             data_dir,
@@ -137,6 +142,7 @@ impl Engine {
             handle: rt.handle().clone(),
             runner: Mutex::default(),
             wake: Notify::new(),
+            known: Mutex::new(known),
         });
         let engine = Arc::new(Self {
             rt: Some(rt),
@@ -146,9 +152,27 @@ impl Engine {
         Ok(engine)
     }
 
+    /// What `add` would learn (ENGINE-SPEC §2), for the add dialog;
+    /// records nothing. `target_fs` as the `add` will have it, so the name
+    /// matches. Fails with `Probe`, after which `add` with `blind` can
+    /// still add it.
+    #[uniffi::method(default(headers = [], target_fs = None))]
+    pub async fn probe(
+        &self,
+        url: String,
+        headers: Vec<Header>,
+        target_fs: Option<TargetFs>,
+    ) -> Result<ProbeResult, DhowError> {
+        let url = parse_url(&url)?;
+        let (headers, fs) = (core_headers(headers), core_fs(target_fs));
+        let inner = self.inner.clone();
+        self.spawn(async move { Ok(inner.core.probe(&url, &headers, fs).await?.into()) })
+            .await
+    }
+
     /// Probes and records a download (ENGINE-SPEC §2, §3), then starts it
-    /// as `start` says. The snapshot is as recorded; `StateChanged` events
-    /// follow once it runs.
+    /// as `start` says. The snapshot is as recorded (and in
+    /// `DownloadAdded`); `StateChanged` events follow once it runs.
     pub async fn add(&self, request: AddRequest) -> Result<DownloadSnapshot, DhowError> {
         let inner = self.inner.clone();
         self.spawn(async move { inner.add(request).await }).await
@@ -160,15 +184,45 @@ impl Engine {
         self.sync(|i| Ok(i.core.get(&id, &i.emit())?.into()))
     }
 
-    /// In queue order.
+    /// In queue order. Downloads another process added or removed since
+    /// this engine last looked are announced (`DownloadAdded`, `Removed`).
     pub fn list(&self) -> Result<Vec<DownloadSnapshot>, DhowError> {
-        self.sync(|i| {
-            Ok(i.core
-                .list(&i.emit())?
-                .into_iter()
-                .map(Into::into)
-                .collect())
-        })
+        self.sync(|i| Ok(i.list()?.into_iter().map(Into::into).collect()))
+    }
+
+    /// Forgets a download, in any state (UI-GUIDELINES §3, §6): stops it
+    /// first if it runs. `delete_files` also deletes its file: the final
+    /// file if completed, else the part file and sidecar. `Removed` once
+    /// done.
+    pub async fn remove(&self, id: String, delete_files: bool) -> Result<(), DhowError> {
+        let inner = self.inner.clone();
+        self.spawn(async move { inner.remove(&id, delete_files).await })
+            .await
+    }
+
+    /// `Failed` → `Queued`, keeping what it has (ENGINE-SPEC §9); its
+    /// queue starts it when it may. Others are left as they are.
+    pub fn retry(&self, id: String) -> Result<DownloadSnapshot, DhowError> {
+        self.sync(|i| i.retry(&id))
+    }
+
+    /// Its connection count (§4.1; `None`: the default). A running download
+    /// follows at once: more through ramp-up (§4.4), fewer by stopping its
+    /// newest connections.
+    pub fn set_connections(
+        &self,
+        id: String,
+        connections: Option<u8>,
+    ) -> Result<DownloadSnapshot, DhowError> {
+        self.sync(|i| Ok(i.core.set_connections(&id, connections)?.into()))
+    }
+
+    /// `RangeMap` events for the detail pane (ARCHITECTURE §3.3): on, one
+    /// at once, then at most one a second while it runs, and one when its
+    /// run ends. Turn it off when the pane hides; nothing runs for it
+    /// otherwise.
+    pub fn watch_ranges(&self, id: String, on: bool) -> Result<(), DhowError> {
+        self.sync(|i| Ok(i.core.watch_ranges(&id, on, &i.emit())?))
     }
 
     /// Stops a running download (everything received is committed first)
@@ -210,7 +264,13 @@ impl Engine {
 
     /// To the end of `queue`.
     pub fn move_to_queue(&self, id: String, queue: String) -> Result<DownloadSnapshot, DhowError> {
-        self.command(|i| Ok(i.core.move_to_queue(&id, &queue)?.into()))
+        self.command(|i| {
+            let from = i.core.queue_of(&id)?;
+            let snap = i.core.move_to_queue(&id, &queue)?;
+            i.queue_changed(&from.id);
+            i.queue_changed(&queue);
+            Ok(snap.into())
+        })
     }
 
     /// Before `before` in the same queue, or last.
@@ -232,22 +292,28 @@ impl Engine {
     }
 
     pub fn create_queue(&self, spec: QueueSpec) -> Result<QueueSnapshot, DhowError> {
-        self.command(|i| Ok(i.core.create_queue(&spec.try_into()?)?.into()))
+        self.command(|i| Ok(i.announce(i.core.create_queue(&spec.try_into()?)?)))
     }
 
     pub fn update_queue(&self, id: String, spec: QueueSpec) -> Result<QueueSnapshot, DhowError> {
-        self.command(|i| Ok(i.core.update_queue(&id, &spec.try_into()?)?.into()))
+        self.command(|i| Ok(i.announce(i.core.update_queue(&id, &spec.try_into()?)?)))
     }
 
     /// Appends its downloads to `move_items_to`; not the default queue.
+    /// `QueueRemoved`.
     pub fn delete_queue(&self, id: String, move_items_to: String) -> Result<(), DhowError> {
-        self.command(|i| Ok(i.core.delete_queue(&id, &move_items_to)?))
+        self.command(|i| {
+            i.core.delete_queue(&id, &move_items_to)?;
+            i.sink.push(Event::QueueRemoved { id });
+            i.queue_changed(&move_items_to);
+            Ok(())
+        })
     }
 
     /// Runs the queue now, overriding its schedule until the next edge
     /// (ENGINE-SPEC §11).
     pub fn start_queue(&self, id: String) -> Result<QueueSnapshot, DhowError> {
-        self.command(|i| Ok(i.core.start_queue(&id)?.into()))
+        self.command(|i| Ok(i.announce(i.core.start_queue(&id)?)))
     }
 
     /// Starts nothing more from it and stops what of it runs, also those
@@ -258,7 +324,7 @@ impl Engine {
 
     /// Ends a `start_queue`/`stop_queue` override.
     pub fn resume_schedule(&self, id: String) -> Result<QueueSnapshot, DhowError> {
-        self.command(|i| Ok(i.core.resume_schedule(&id)?.into()))
+        self.command(|i| Ok(i.announce(i.core.resume_schedule(&id)?)))
     }
 
     /// Oldest first.
@@ -318,18 +384,39 @@ impl Engine {
         })
     }
 
-    /// Applies the queues and schedules again now. The schedule's wake-up
-    /// runs on a monotonic clock, which stops while the machine sleeps:
-    /// shells call this on wake and when the clock or time zone changes
-    /// (ENGINE-SPEC §11).
+    /// Applies the queues and schedules again now, and announces what
+    /// another process changed: downloads added or removed, and every
+    /// queue (`QueueChanged`). The schedule's wake-up runs on a monotonic
+    /// clock, which stops while the machine sleeps: shells call this on
+    /// wake, when the clock or time zone changes (ENGINE-SPEC §11), and
+    /// when the app becomes active. Off the main thread, like a query.
     pub fn recheck(&self) {
         let _rt = self.rt().enter();
+        if let Err(e) = self.inner.list() {
+            tracing::warn!(error = %e, "could not read the downloads");
+        }
+        match self.inner.core.list_queues() {
+            Ok(queues) => queues.into_iter().for_each(|q| {
+                self.inner.announce(q);
+            }),
+            Err(e) => tracing::warn!(error = %e, "could not read the queues"),
+        }
         self.inner.kick();
     }
 
     /// Asks the adapter now (ARCHITECTURE §8).
     pub fn network_info(&self) -> Result<NetworkInfo, DhowError> {
         self.sync(|i| Ok(i.core.network_info()?.into()))
+    }
+
+    /// The shell's network monitor saw a change (M4.3): asks the adapter
+    /// and emits `NetworkChanged`.
+    pub fn network_changed(&self) -> Result<NetworkInfo, DhowError> {
+        self.sync(|i| {
+            let info: NetworkInfo = i.core.network_info()?.into();
+            i.sink.push(Event::NetworkChanged { info: info.clone() });
+            Ok(info)
+        })
     }
 
     /// Stops every run cleanly (committed, back to `Queued` so the next
@@ -407,6 +494,16 @@ impl Drop for Engine {
     }
 }
 
+/// Which of a queue's counts a download in this state is in.
+fn counted(s: State) -> u8 {
+    match s {
+        State::Queued => 0,
+        State::Active | State::Waiting | State::Completing => 1,
+        State::Completed | State::Cancelled => 2,
+        State::Paused | State::Failed => 3,
+    }
+}
+
 fn io(e: std::io::Error) -> DhowError {
     DhowError::Io {
         message: e.to_string(),
@@ -418,8 +515,121 @@ impl Inner {
         self.runner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn known(&self) -> MutexGuard<'_, HashSet<String>> {
+        self.known.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn emit(&self) -> impl Fn(EngineEvent) + Send + Sync + '_ {
-        move |e| self.sink.push(e.into())
+        move |e| self.publish(e)
+    }
+
+    /// To the shell, with the `QueueChanged` an event implies: a download
+    /// added, removed, or moved between queued, running, finished and the
+    /// rest. A download already announced isn't again (see `list`); one
+    /// the shell hasn't heard of (another process added it) is announced
+    /// before its first event.
+    fn publish(&self, e: EngineEvent) {
+        let queue = {
+            // Held while pushing: announcements keep their order.
+            let mut known = self.known();
+            let queue = match &e {
+                EngineEvent::DownloadAdded { snapshot } => {
+                    if !known.insert(snapshot.id.clone()) {
+                        return;
+                    }
+                    Some(self.core.queue(&snapshot.queue_id))
+                }
+                EngineEvent::Removed { id, queue_id } => {
+                    if !known.remove(id) {
+                        return;
+                    }
+                    Some(self.core.queue(queue_id))
+                }
+                EngineEvent::StateChanged { id, from, to, .. } => {
+                    (counted(*from) != counted(*to)).then(|| self.core.queue_of(id))
+                }
+                _ => None,
+            };
+            let event: Event = e.into();
+            if let Some(id) = event.download()
+                && !known.contains(id)
+                && let Ok(snap) = self.core.row(id)
+            {
+                known.insert(snap.id.clone());
+                self.sink.push(Event::DownloadAdded {
+                    snapshot: snap.into(),
+                });
+            }
+            self.sink.push(event);
+            queue
+        };
+        match queue {
+            Some(Ok(q)) => {
+                self.announce(q);
+            }
+            Some(Err(e)) => tracing::warn!(error = %e, "could not read a queue"),
+            None => {}
+        }
+    }
+
+    /// `QueueChanged`, and the snapshot for the caller.
+    fn announce(&self, q: dhow_core::engine::queues::QueueSnapshot) -> QueueSnapshot {
+        let snapshot: QueueSnapshot = q.into();
+        self.sink.push(Event::QueueChanged {
+            snapshot: snapshot.clone(),
+        });
+        snapshot
+    }
+
+    fn queue_changed(&self, id: &str) {
+        match self.core.queue(id) {
+            Ok(q) => {
+                self.announce(q);
+            }
+            Err(e) => tracing::warn!(error = %e, "could not read a queue"),
+        }
+    }
+
+    /// Every download, announcing those another process added or removed
+    /// since the last look (their queues' counts changed too).
+    fn list(&self) -> Result<Vec<dhow_core::engine::Snapshot>, DhowError> {
+        let rows = {
+            // Held throughout, so an `add` or `remove` here announces
+            // either through its event or through this, not both, and
+            // what is announced here comes before any later event of it.
+            let mut known = self.known();
+            // What listing emits (`Renamed`, `GroupChanged`) goes straight
+            // out: `publish` would wait for `known`.
+            let rows = self.core.list(&|e| self.sink.push(e.into()))?;
+            let ids: HashSet<&str> = rows.iter().map(|s| s.id.as_str()).collect();
+            let removed: Vec<String> = known
+                .iter()
+                .filter(|k| !ids.contains(k.as_str()))
+                .cloned()
+                .collect();
+            for id in &removed {
+                known.remove(id);
+            }
+            let added: Vec<Snapshot> = rows
+                .iter()
+                .filter(|s| known.insert(s.id.clone()))
+                .cloned()
+                .collect();
+            if added.is_empty() && removed.is_empty() {
+                return Ok(rows);
+            }
+            for s in added {
+                self.sink.push(Event::DownloadAdded { snapshot: s.into() });
+            }
+            for id in removed {
+                self.sink.push(Event::Removed { id });
+            }
+            rows
+        };
+        for q in self.core.list_queues()? {
+            self.announce(q);
+        }
+        Ok(rows)
     }
 
     fn held_elsewhere(&self, id: &str) -> bool {
@@ -481,6 +691,31 @@ impl Inner {
         id: &str,
         delete_partial: bool,
     ) -> Result<DownloadSnapshot, DhowError> {
+        self.stopped(id, async {
+            Ok(self
+                .core
+                .cancel(id, delete_partial, &self.emit())
+                .await?
+                .into())
+        })
+        .await
+    }
+
+    async fn remove(self: &Arc<Self>, id: &str, delete_files: bool) -> Result<(), DhowError> {
+        self.stopped(id, async {
+            Ok(self.core.remove(id, delete_files, &self.emit()).await?)
+        })
+        .await
+    }
+
+    /// Stops `id` if it runs and keeps it from starting, then does `f`
+    /// holding its run lock: like a run, no other process may touch its
+    /// files meanwhile.
+    async fn stopped<T>(
+        self: &Arc<Self>,
+        id: &str,
+        f: impl Future<Output = Result<T, DhowError>>,
+    ) -> Result<T, DhowError> {
         self.core.get(id, &self.emit())?;
         let running = {
             let mut r = self.runner();
@@ -491,18 +726,25 @@ impl Inner {
             ended(done).await;
         }
         let result = async {
-            // Like a run: no other process may touch its files meanwhile.
             let _lock = runlock::acquire(&self.data_dir, id, None).map_err(|e| match e {
                 Held::By(_) => DhowError::RunningElsewhere { id: id.to_owned() },
                 Held::Io(e) => io(e),
             })?;
-            Ok(self.core.cancel(id, delete_partial, &self.emit()).await?)
+            f.await
         }
         .await;
         let mut r = self.runner();
         r.cancelling.remove(id);
         r.failed.remove(id);
-        result.map(Into::into)
+        result
+    }
+
+    fn retry(self: &Arc<Self>, id: &str) -> Result<DownloadSnapshot, DhowError> {
+        let snap = self.core.retry(id, &self.emit())?;
+        let mut r = self.runner();
+        r.failed.remove(id);
+        self.pass(&mut r);
+        Ok(snap.into())
     }
 
     fn stop_queue(self: &Arc<Self>, id: &str) -> Result<QueueSnapshot, DhowError> {
@@ -523,7 +765,7 @@ impl Inner {
             }
         }
         self.pass(&mut r);
-        Ok(q.into())
+        Ok(self.announce(q))
     }
 
     async fn shutdown(self: &Arc<Self>) {
@@ -681,6 +923,21 @@ impl Inner {
         self.core.has_waiting_work().ok()?.then_some(edge)
     }
 
+    /// `QueueChanged` for the queues an edge can have changed: those with
+    /// a schedule or an override.
+    fn edge_passed(&self) {
+        match self.core.list_queues() {
+            Ok(queues) => {
+                for q in queues {
+                    if q.schedule.is_some() || q.run_state != RunStateCore::Auto {
+                        self.announce(q);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "could not read the queues"),
+        }
+    }
+
     /// The single `sleep_until(next_edge)` of ARCHITECTURE §7; gone once no
     /// edge can matter.
     async fn sleep(self: Arc<Self>) {
@@ -704,6 +961,7 @@ impl Inner {
                 _ = tokio::time::sleep(wait) => {
                     let mut r = self.runner();
                     self.pass_once(&mut r);
+                    self.edge_passed();
                 }
                 _ = &mut notified => {}
             }

@@ -10,10 +10,11 @@ pub mod ramp;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -36,6 +37,9 @@ use budget::{Budget, BudgetConfig, Ticket};
 use hold::PartHold;
 use ramp::{LinkState, Ramp, RampConfig, Sample, Step};
 
+/// Range maps at most this often (ARCHITECTURE §3.3).
+const MAP_EVERY: Duration = Duration::from_secs(1);
+
 pub struct Request {
     pub url: Url,
     pub headers: Vec<Header>,
@@ -52,6 +56,46 @@ pub struct Request {
     /// [`download`] too (recovery, finalize). `None`: `download` takes one,
     /// so a caller already holding `part` that passes `None` deadlocks.
     pub hold: Option<PartHold>,
+    /// Added in blind mode (§2.4): a probe that fails doesn't fail it, it
+    /// goes on blind.
+    pub blind: bool,
+    /// What the caller may change while it runs; its `connections` wins
+    /// over the field above.
+    pub tuning: Option<Tuning>,
+}
+
+/// What a caller changes on a running download (ARCHITECTURE §3.1).
+#[derive(Clone, Debug)]
+pub struct Tuning {
+    /// Its connection override (§4.1). A higher `n` resumes ramp-up
+    /// (§4.4); a lower one stops the newest connections at once, their rest
+    /// going back to pending work as for a newcomer (§10.3).
+    pub connections: watch::Receiver<Option<u8>>,
+    /// While `true`: a [`DownloadEvent::Ranges`] at once, then at most one
+    /// a second.
+    pub ranges: watch::Receiver<bool>,
+}
+
+/// Where a download's bytes are: the segment map (ARCHITECTURE §3.2).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RangeMap {
+    /// `None`: blind (§2.4); the last range then ends at `u64::MAX`.
+    pub total: Option<u64>,
+    /// Fetched. Not running: committed (the sidecar). Running: written, and
+    /// committed within the commit interval.
+    pub done: Vec<Range<u64>>,
+    /// One per open connection, by `start`.
+    pub connections: Vec<ConnectionRange>,
+    /// Nobody fetches these yet.
+    pub pending: Vec<Range<u64>>,
+}
+
+/// A connection's chunk: `[start, at)` received, `[at, end)` to go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectionRange {
+    pub start: u64,
+    pub at: u64,
+    pub end: u64,
 }
 
 /// What all downloads in a process share: the connection budget (§10.1–
@@ -148,6 +192,8 @@ pub enum DownloadEvent {
     /// download continues on one connection.
     Downgraded,
     Connection(ConnEvent),
+    /// While [`Tuning::ranges`] is on.
+    Ranges(RangeMap),
 }
 
 #[derive(Debug)]
@@ -220,10 +266,18 @@ pub async fn download(
     loop {
         // Re-probe every start: redirects re-resolve, and the identity to
         // resume against is checked against the server's current one.
-        let info = tokio::select! {
+        let probed = tokio::select! {
             biased;
             _ = stopped(stop.clone()) => return Err(DownloadError::Stopped),
-            info = probe::probe(client, &req.url, &req.headers, config.probe) => info?,
+            info = probe::probe(client, &req.url, &req.headers, config.probe) => info,
+        };
+        let info = match probed {
+            Ok(info) => info,
+            Err(e) if req.blind && e.allows_blind() => {
+                tracing::info!(error = %e, "download: probe failed, going on blind");
+                ProbeInfo::blind(&req.url)
+            }
+            Err(e) => return Err(e.into()),
         };
         on_event(DownloadEvent::Probed(Box::new(info.clone())));
         let ticket = ticket.get_or_insert_with(|| {
@@ -236,10 +290,14 @@ pub async fn download(
         // take a while, and younger downloads must not ramp into this
         // one's share meanwhile (§10.3).
         let can_range = info.resumable != Resumable::No && info.total_size.is_some();
+        let requested = req
+            .tuning
+            .as_ref()
+            .map_or(req.connections, |t| *t.connections.borrow());
         let limit = ramp::connection_limit(
             info.total_size,
             can_range,
-            req.connections,
+            requested,
             &config.ramp,
             &shared.link,
         );
@@ -412,7 +470,7 @@ async fn fetch(
     config: &DownloadConfig,
     shared: &Shared,
     ticket: &Ticket,
-    limit: u32,
+    mut limit: u32,
     info: &ProbeInfo,
     file: File,
     journal: Journal,
@@ -421,6 +479,7 @@ async fn fetch(
     stop: &watch::Receiver<bool>,
 ) -> Result<Downloaded, Stop> {
     let total = info.total_size;
+    let can_range = info.resumable != Resumable::No && total.is_some();
     let committed = journal.committed().clone();
     let gaps = match total {
         Some(t) => committed.gaps(t),
@@ -468,7 +527,9 @@ async fn fetch(
     // Shared with every connection's events.
     let received = AtomicU64::new(0);
     let backoff_until = Mutex::new(None::<Instant>);
-    let single = AtomicBool::new(limit <= 1);
+    // One connection for good: the server can do no more. (A limit of 1
+    // can be raised, `Tuning`.)
+    let single = AtomicBool::new(!can_range);
     let conn_event = |e: ConnEvent| {
         match &e {
             ConnEvent::Received(n) => {
@@ -499,6 +560,11 @@ async fn fetch(
     let mut learner = shared.global.learner();
     let mut connections = 0;
     let mut content_length_seen = true;
+    let mut tuning = req.tuning.clone();
+    let mut watched = tuning
+        .as_mut()
+        .is_some_and(|t| *t.ranges.borrow_and_update());
+    let mut next_map = Instant::now();
     let outcome: Result<(), Option<TransferError>> = 'run: loop {
         let open = running.len() as u32;
         if open != connections {
@@ -549,6 +615,16 @@ async fn fetch(
                 Err(WriterGone) => break 'run Err(None),
             }
         }
+        // Above a lowered limit (`Tuning`): the newest stop where they are,
+        // their rest is pending. One still verifying its overlap goes on a
+        // later pass, once it has.
+        while running.len() > plan.shedding.len() + limit as usize {
+            match plan.shed(&handle).await {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(WriterGone) => break 'run Err(None),
+            }
+        }
         let single_now = single.load(Ordering::Relaxed);
         let can_ramp = !ramp.done && !single_now && open < limit;
         learner.set(can_ramp && ramp.probing());
@@ -571,8 +647,9 @@ async fn fetch(
                         content_length_seen = finished.content_length_seen;
                         // Refill the slot: pending ranges first, then steal
                         // from the slowest (§4.3). One connection at a time
-                        // once downgraded.
-                        let refill = !single.load(Ordering::Relaxed) || running.is_empty();
+                        // once downgraded; none above a lowered limit.
+                        let refill = (!single.load(Ordering::Relaxed) || running.is_empty())
+                            && running.len() - plan.shedding.len() < limit as usize;
                         let work = if refill {
                             match plan.next_work(&handle, cursor.rate(), rc).await {
                                 Ok(w) => w,
@@ -651,6 +728,36 @@ async fn fetch(
                     }
                 }
             }
+            _ = tokio::time::sleep_until(next_map.into()), if watched => {
+                on_event(DownloadEvent::Ranges(plan.map(total)));
+                next_map = Instant::now() + MAP_EVERY;
+            }
+            tuned = tuned(&mut tuning) => match tuned {
+                Tuned::Ranges(on) => {
+                    watched = on;
+                    next_map = Instant::now();
+                }
+                Tuned::Connections(n) => {
+                    let before = limit;
+                    // Downgraded (§2.3, §9 Protocol): one, whatever is asked.
+                    limit = match single_now {
+                        true => 1,
+                        false => ramp::connection_limit(total, can_range, n, rc, link),
+                    };
+                    ticket.set_limit(limit);
+                    // Ramp-up resumes only for a higher limit; saturation or
+                    // nothing left to split stand otherwise.
+                    if ramp.done && limit > before && open < limit {
+                        ramp = Ramp::new(Instant::now(), rc);
+                    }
+                    if ramp.done || open >= limit {
+                        // Not ramping: no claim ahead of younger downloads
+                        // (§10.3).
+                        ticket.stop_wanting();
+                    }
+                    // Fewer: the pass sheds the newest.
+                }
+            },
             // A newcomer may need one of ours.
             _ = &mut changed => {}
         }
@@ -694,6 +801,33 @@ async fn fetch(
         size_unverified: total.is_none() && !content_length_seen,
         identity_weak: validator.is_none(),
     })
+}
+
+enum Tuned {
+    Connections(Option<u8>),
+    Ranges(bool),
+}
+
+/// The caller's next change, or never (no tuning, or the caller gone).
+async fn tuned(tuning: &mut Option<Tuning>) -> Tuned {
+    let Some(t) = tuning else {
+        return std::future::pending().await;
+    };
+    // Connections first: a later change of both is seen in that order.
+    let changed = tokio::select! {
+        biased;
+        r = t.connections.changed() => {
+            r.map(|()| Tuned::Connections(*t.connections.borrow_and_update()))
+        }
+        r = t.ranges.changed() => r.map(|()| Tuned::Ranges(*t.ranges.borrow_and_update())),
+    };
+    match changed {
+        Ok(t) => t,
+        Err(_) => {
+            *tuning = None;
+            std::future::pending().await
+        }
+    }
 }
 
 /// `host:port`, the per-host budget key (§10.2).
@@ -871,6 +1005,40 @@ impl Plan {
         }
     }
 
+    /// The segment map now: what no connection or pending work covers is
+    /// done.
+    fn map(&self, total: Option<u64>) -> RangeMap {
+        let end = total.unwrap_or(u64::MAX);
+        let mut connections: Vec<ConnectionRange> = self
+            .live
+            .values()
+            .map(|l| ConnectionRange {
+                start: l.cursor.start(),
+                at: l.cursor.pos(),
+                end: l.cursor.end().min(end),
+            })
+            .collect();
+        connections.sort_by_key(|c| c.start);
+        let pending: Vec<Range<u64>> = self
+            .pending
+            .iter()
+            .map(|p| p.range.start..p.range.end.min(end))
+            .collect();
+        let mut busy = RangeSet::new();
+        for r in connections.iter().map(|c| c.start..c.end) {
+            busy.insert(r);
+        }
+        for r in &pending {
+            busy.insert(r.clone());
+        }
+        RangeMap {
+            total,
+            done: busy.gaps(end),
+            connections,
+            pending,
+        }
+    }
+
     /// Typical speed of the open connections: the guess for a new one.
     fn average_rate(&self) -> Option<f64> {
         let rates: Vec<f64> = self.live.values().filter_map(|l| l.cursor.rate()).collect();
@@ -966,6 +1134,8 @@ mod tests {
             started_at: Some(1),
             limits: vec![],
             hold: None,
+            blind: false,
+            tuning: None,
         };
         let armed = park::arm("prepare", &req.part);
         let p = armed.park();
@@ -1040,5 +1210,79 @@ mod tests {
         assert!(fx.elder.await.unwrap_err().is_cancelled());
         assert!(fx.young.try_grow() && fx.young.try_grow() && fx.young.try_grow());
         drop(fx.armed);
+    }
+
+    /// Asked for more connections once downgraded to one (§2.3: `Unknown`
+    /// turned out not to range), a download stays at one and claims
+    /// nothing ahead of younger downloads (§10.3).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_downgraded_download_asked_for_more_claims_nothing() {
+        let shared = Arc::new(Shared::new(BudgetConfig {
+            global: 4,
+            per_host: 4,
+            min_for_new: 1,
+        }));
+        let server = TestServer::start().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (connections, connections_rx) = watch::channel(Some(4));
+        let (ranges, ranges_rx) = watch::channel(false);
+        let req = Request {
+            // No `Accept-Ranges`, and `Range` ignored.
+            url: Url::parse(&server.url("/blob/3000000?ranges=ignore&throttle=300000")).unwrap(),
+            headers: vec![],
+            part: dir.path().join("d.part"),
+            sidecar: dir.path().join("d.dhow"),
+            connections: Some(4),
+            started_at: Some(1),
+            limits: vec![],
+            hold: None,
+            blind: false,
+            tuning: Some(Tuning {
+                connections: connections_rx,
+                ranges: ranges_rx,
+            }),
+        };
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let (stop_tx, stop) = watch::channel(false);
+        let s = shared.clone();
+        let elder = tokio::spawn(async move {
+            let mut config = DownloadConfig::default();
+            config.probe.range_get = false;
+            config.ramp.min_chunk = 128 * 1024;
+            let on_event = move |e: DownloadEvent| {
+                let _ = tx.send(e);
+            };
+            let client = crate::http::client().unwrap();
+            download(&req, &client, &config, &s, &on_event, &stop).await
+        });
+        let mut until = async |what: &str, pred: &dyn Fn(&DownloadEvent) -> bool| {
+            let wait = async {
+                while let Some(e) = events.recv().await {
+                    if pred(&e) {
+                        return;
+                    }
+                }
+                panic!("events ended before {what}");
+            };
+            tokio::time::timeout(Duration::from_secs(30), wait)
+                .await
+                .unwrap_or_else(|_| panic!("no {what}"));
+        };
+        until("downgrade", &|e| {
+            matches!(e, DownloadEvent::Connection(ConnEvent::NotResumable))
+        })
+        .await;
+        let young = shared.budget.register(2, "young:80".into());
+        young.set_limit(4);
+        assert!(young.try_first());
+
+        connections.send_replace(Some(4));
+        // Seen after the connections (`tuned` is biased): a fence.
+        ranges.send_replace(true);
+        until("a map", &|e| matches!(e, DownloadEvent::Ranges(_))).await;
+        assert!(young.try_grow(), "the downgraded elder still claims");
+
+        stop_tx.send_replace(true);
+        assert!(matches!(elder.await.unwrap(), Err(DownloadError::Stopped)));
     }
 }

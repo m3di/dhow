@@ -121,6 +121,14 @@ enum Command {
         #[arg(long)]
         delete_partial: bool,
     },
+    /// Remove a download from the list (stops the process running it)
+    Rm {
+        id: String,
+        /// Also delete its file: the final file if completed, else the
+        /// .part and .dhow files
+        #[arg(long)]
+        delete_files: bool,
+    },
     /// List downloads, one JSON object per line
     Ls,
     /// Run queued downloads here, as many at once as their queues allow,
@@ -384,16 +392,10 @@ async fn run(
                 queue: target_queue,
                 speed_limit: limit.as_deref().map(parse_rate).transpose()?.flatten(),
                 target_fs: TargetFs::host(),
+                blind: false,
             };
-            // `added` first, then what adding it changed for others.
-            let changed = std::sync::Mutex::new(Vec::new());
-            let added = engine
-                .add(req, &|e| changed.lock().unwrap().push(e))
-                .await?;
-            output::emit(output::snapshot("added", &added));
-            for e in changed.into_inner().unwrap() {
-                print(&e);
-            }
+            // `added`, then what adding it changed for others.
+            let added = engine.add(req, &on_event).await?;
             if queue || added.state != State::Queued {
                 lock::poke_runners(&data_dir);
                 return Ok(exit_for(added.state));
@@ -433,6 +435,24 @@ async fn run(
             };
             let snap = engine.cancel(&id, delete_partial, &on_event).await?;
             output::emit(output::snapshot("download", &snap));
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Rm { id, delete_files } => {
+            let id = engine.resolve(&id)?;
+            let holder = lock::holder(&data_dir, &id)?;
+            in_app(holder)?;
+            if let Some(pid) = holder {
+                engine.pause(&id, &on_event)?;
+                lock::stop_runner(&data_dir, &id, pid)?;
+            }
+            let _lock = match lock::acquire(&data_dir, &id) {
+                Ok(l) => l,
+                Err(lock::Held::By(pid)) => {
+                    return Err(running_in(pid).into());
+                }
+                Err(lock::Held::Io(e)) => return Err(e.into()),
+            };
+            engine.remove(&id, delete_files, &on_event).await?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Network => {
