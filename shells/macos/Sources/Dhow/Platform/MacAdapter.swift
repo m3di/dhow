@@ -94,25 +94,54 @@ enum Bookmarks {
                 resolvingBookmarkData: token, options: [.withoutUI, .withoutMounting],
                 relativeTo: nil, bookmarkDataIsStale: &stale)
         } catch let error as CocoaError where error.code == .fileNoSuchFile {
-            return .gone
+            // Not found: deleted, or on a volume that isn't mounted, which
+            // can't tell now (ARCHITECTURE §6), so the token must be kept.
+            let stored = URL.resourceValues(forKeys: [.pathKey], fromBookmarkData: token)?.path
+            return missing(stored, mounted: { FileManager.default.fileExists(atPath: $0) })
         } catch {
             return .unknown("bookmark: \((error as NSError).code)")
         }
         let path = url.path(percentEncoded: false)
+        // Resolved, yet not there now (it went meanwhile): ask again later.
         guard FileManager.default.fileExists(atPath: path) else {
-            return .gone
+            return .unknown("resolved to a missing path")
         }
         // A file moved to the Trash is gone for good (ARCHITECTURE §6).
-        if inTrash(path) {
+        let volume = (try? url.resourceValues(forKeys: [.volumeURLKey]))?.volume?
+            .path(percentEncoded: false)
+        if inTrash(path, home: NSHomeDirectory(), volume: volume) {
             return .gone
         }
         let refreshed = stale ? try? create(path) : nil
         return .found(path: path, refreshed: refreshed)
     }
 
-    /// In the user's Trash (`~/.Trash`) or a volume's (`.Trashes`).
-    static func inTrash(_ path: String) -> Bool {
-        URL(fileURLWithPath: path).pathComponents.contains { $0 == ".Trash" || $0 == ".Trashes" }
+    /// A bookmark that found nothing: gone, unless the file was on a volume
+    /// whose mount point isn't there (an unplugged disk).
+    static func missing(_ storedPath: String?, mounted: (String) -> Bool) -> Resolution {
+        guard let storedPath, let root = volumeRoot(storedPath) else { return .gone }
+        return mounted(root) ? .gone : .unknown("volume \(root) not mounted")
+    }
+
+    /// `/Volumes/Name` for a path on a volume mounted there; `nil` for the
+    /// startup volume.
+    static func volumeRoot(_ path: String) -> String? {
+        let parts = URL(fileURLWithPath: path).pathComponents
+        guard parts.count >= 3, parts[0] == "/", parts[1] == "Volumes" else { return nil }
+        return "/Volumes/" + parts[2]
+    }
+
+    /// In the user's Trash (`~/.Trash/`) or the Trash of the volume it's on
+    /// (`<volume>/.Trashes/`); a folder that's merely named so isn't.
+    static func inTrash(_ path: String, home: String, volume: String?) -> Bool {
+        func under(_ dir: String) -> Bool {
+            path.hasPrefix(dir.hasSuffix("/") ? dir : dir + "/")
+        }
+        if under((home as NSString).appendingPathComponent(".Trash")) {
+            return true
+        }
+        guard let volume, volume != "/" else { return false }
+        return under((volume as NSString).appendingPathComponent(".Trashes"))
     }
 }
 
@@ -124,23 +153,17 @@ enum SystemProxy {
         CFNetworkCopySystemProxySettings()?.takeRetainedValue() as? [String: Any]
     }
 
+    /// A field that can't make a URL (a scheme in the host, an IPv6 zone,
+    /// a port out of range) is left out, not the whole answer.
     static func config(_ s: [String: Any]) -> ProxyConfig {
         func proxy(_ enable: String, _ host: String, _ port: String, scheme: String) -> String? {
             guard (s[enable] as? NSNumber)?.boolValue == true,
-                let name = (s[host] as? String)?.trimmingCharacters(in: .whitespaces),
-                !name.isEmpty
+                let name = (s[host] as? String)?.trimmingCharacters(in: .whitespaces)
             else { return nil }
-            let h = name.contains(":") && !name.hasPrefix("[") ? "[\(name)]" : name
-            if let p = (s[port] as? NSNumber)?.intValue, p > 0 {
-                return "\(scheme)://\(h):\(p)"
-            }
-            return "\(scheme)://\(h)"
+            return url(scheme: scheme, host: name, port: (s[port] as? NSNumber)?.intValue)
         }
-        var noProxy = (s[kCFNetworkProxiesExceptionsList as String] as? [String]) ?? []
-        // "Exclude simple hostnames": names without a dot go direct.
-        if (s[kCFNetworkProxiesExcludeSimpleHostnames as String] as? NSNumber)?.boolValue == true {
-            noProxy.append("localhost")
-        }
+        let noProxy = ((s[kCFNetworkProxiesExceptionsList as String] as? [String]) ?? []).map(
+            fullCIDR)
         let pac =
             (s[kCFNetworkProxiesProxyAutoConfigEnable as String] as? NSNumber)?.boolValue == true
             ? s[kCFNetworkProxiesProxyAutoConfigURLString as String] as? String : nil
@@ -152,9 +175,43 @@ enum SystemProxy {
             https: proxy(
                 kCFNetworkProxiesHTTPSEnable as String, kCFNetworkProxiesHTTPSProxy as String,
                 kCFNetworkProxiesHTTPSPort as String, scheme: "http"),
+            // `socks5h`: names resolve at the proxy, as CFNetwork does.
             all: proxy(
                 kCFNetworkProxiesSOCKSEnable as String, kCFNetworkProxiesSOCKSProxy as String,
-                kCFNetworkProxiesSOCKSPort as String, scheme: "socks5"),
-            noProxy: noProxy, pac: pac?.isEmpty == false ? pac : nil)
+                kCFNetworkProxiesSOCKSPort as String, scheme: "socks5h"),
+            noProxy: noProxy, pac: pac?.isEmpty == false ? pac : nil,
+            // "Exclude simple hostnames": names without a dot go direct.
+            excludeSimpleHosts: (s[kCFNetworkProxiesExcludeSimpleHostnames as String] as? NSNumber)?
+                .boolValue
+                == true)
+    }
+
+    /// macOS's short IPv4 networks ("169.254/16") written in full
+    /// ("169.254.0.0/16"), as the core's `no_proxy` reads them; anything
+    /// else as is.
+    static func fullCIDR(_ entry: String) -> String {
+        let parts = entry.split(separator: "/", omittingEmptySubsequences: false)
+        guard parts.count == 2, Int(parts[1]) != nil else { return entry }
+        let octets = parts[0].split(separator: ".", omittingEmptySubsequences: false)
+        guard (1...4).contains(octets.count),
+            octets.allSatisfy({ UInt8($0) != nil })
+        else { return entry }
+        let full = octets.map(String.init) + Array(repeating: "0", count: 4 - octets.count)
+        return full.joined(separator: ".") + "/" + parts[1]
+    }
+
+    /// `scheme://host[:port]`, or `nil` when the parts can't make one.
+    static func url(scheme: String, host: String, port: Int?) -> String? {
+        guard !host.isEmpty, !host.contains("://"), !host.contains("%"),
+            !host.contains("/"), !host.contains("@"), !host.contains(" ")
+        else { return nil }
+        let bracketed = host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host
+        var text = "\(scheme)://\(bracketed)"
+        if let port {
+            guard (1...65535).contains(port) else { return nil }
+            text += ":\(port)"
+        }
+        guard let parsed = URL(string: text), parsed.host != nil else { return nil }
+        return text
     }
 }

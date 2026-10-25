@@ -849,6 +849,9 @@ pub struct ProxyConfig {
     /// Reported, not evaluated.
     #[uniffi(default)]
     pub pac: Option<String>,
+    /// Hosts without a dot go direct (macOS "Exclude simple hostnames").
+    #[uniffi(default)]
+    pub exclude_simple_hosts: bool,
 }
 
 impl From<CoreProxy> for ProxyConfig {
@@ -860,6 +863,7 @@ impl From<CoreProxy> for ProxyConfig {
             all: s(p.all),
             no_proxy: p.no_proxy,
             pac: s(p.pac),
+            exclude_simple_hosts: p.exclude_simple_hosts,
         }
     }
 }
@@ -875,6 +879,7 @@ impl TryFrom<ProxyConfig> for CoreProxy {
             all: u(p.all)?,
             no_proxy: p.no_proxy,
             pac: u(p.pac)?,
+            exclude_simple_hosts: p.exclude_simple_hosts,
         })
     }
 }

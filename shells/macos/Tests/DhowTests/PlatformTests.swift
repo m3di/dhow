@@ -107,15 +107,37 @@ final class BlobServer: @unchecked Sendable {
         #expect(c.http == "http://proxy.lan:3128")
         #expect(c.https == "http://[fd00::1]:8443")
         #expect(c.all == nil)
-        #expect(c.noProxy == ["*.local", "169.254/16", "localhost"])
+        #expect(c.noProxy == ["*.local", "169.254.0.0/16"])
+        #expect(SystemProxy.fullCIDR("10/8") == "10.0.0.0/8")
+        #expect(SystemProxy.fullCIDR("192.168.1.0/24") == "192.168.1.0/24")
+        #expect(SystemProxy.fullCIDR("*.local") == "*.local")
+        #expect(SystemProxy.fullCIDR("fd00::/8") == "fd00::/8")
+        #expect(c.excludeSimpleHosts)
         #expect(c.pac == "http://wpad.lan/proxy.pac")
         let socks = SystemProxy.config([
             kCFNetworkProxiesSOCKSEnable as String: 1,
             kCFNetworkProxiesSOCKSProxy as String: "socks.lan",
             kCFNetworkProxiesSOCKSPort as String: 1080,
         ])
-        #expect(socks.all == "socks5://socks.lan:1080")
-        #expect(!socks.isDirect)
+        // Names resolve at the proxy, as CFNetwork does.
+        #expect(socks.all == "socks5h://socks.lan:1080")
+        #expect(!socks.isDirect && !socks.excludeSimpleHosts)
+        // A field that can't make a URL is skipped, the rest kept.
+        let odd = SystemProxy.config([
+            kCFNetworkProxiesHTTPEnable as String: 1,
+            kCFNetworkProxiesHTTPProxy as String: "http://proxy.lan",
+            kCFNetworkProxiesHTTPSEnable as String: 1,
+            kCFNetworkProxiesHTTPSProxy as String: "fe80::1%en0",
+            kCFNetworkProxiesSOCKSEnable as String: 1,
+            kCFNetworkProxiesSOCKSProxy as String: "socks.lan",
+            kCFNetworkProxiesSOCKSPort as String: 70000,
+            kCFNetworkProxiesExceptionsList as String: ["intranet"],
+        ])
+        #expect(odd.http == nil && odd.https == nil && odd.all == nil)
+        #expect(odd.noProxy == ["intranet"])
+        #expect(SystemProxy.url(scheme: "http", host: "p.lan", port: nil) == "http://p.lan")
+        #expect(SystemProxy.url(scheme: "http", host: "", port: 80) == nil)
+        #expect(SystemProxy.url(scheme: "http", host: "p.lan", port: 0) == nil)
     }
 
     @Test func pathsMapToNetworkInfo() {
@@ -142,10 +164,64 @@ final class BlobServer: @unchecked Sendable {
         #expect(metered.expensive && metered.constrained)
     }
 
-    /// A bookmark follows its file when it moves, and calls a file in a
-    /// Trash or deleted gone (ARCHITECTURE §6). The Trash here is a
-    /// folder named like one, not the user's.
-    @Test func bookmarksFollowMovesAndTreatTheTrashAsGone() throws {
+    /// Only the user's Trash and the volume's own count, not a folder
+    /// that's merely named so; the paths are made up.
+    @Test func theTrashIsTheUsersOrTheVolumes() {
+        let home = "/Users/ann"
+        #expect(Bookmarks.inTrash("/Users/ann/.Trash/a.iso", home: home, volume: "/"))
+        #expect(Bookmarks.inTrash("/Users/ann/.Trash/sub/a.iso", home: home, volume: "/"))
+        #expect(
+            Bookmarks.inTrash(
+                "/Volumes/Disk/.Trashes/501/a.iso", home: home, volume: "/Volumes/Disk"))
+        #expect(!Bookmarks.inTrash("/Users/ann/Projects/.Trash/a.iso", home: home, volume: "/"))
+        #expect(!Bookmarks.inTrash("/Users/ann/.Trashcan/a.iso", home: home, volume: "/"))
+        #expect(!Bookmarks.inTrash("/.Trashes/a.iso", home: home, volume: "/"))
+        #expect(
+            !Bookmarks.inTrash(
+                "/Volumes/Disk/stuff/.Trashes/a.iso", home: home, volume: "/Volumes/Disk"))
+        #expect(!Bookmarks.inTrash("/Users/ann/Downloads/a.iso", home: home, volume: "/"))
+    }
+
+    /// Not found on a volume that isn't mounted: can't tell, so the token
+    /// stays (ARCHITECTURE §6); not found elsewhere: gone.
+    @Test func aFileOnAnUnpluggedDiskIsNotGone() {
+        let mounted: (String) -> Bool = { $0 == "/Volumes/Here" }
+        #expect(Bookmarks.missing("/Volumes/Away/movies/a.mkv", mounted: mounted) != .gone)
+        #expect(Bookmarks.missing("/Volumes/Here/movies/a.mkv", mounted: mounted) == .gone)
+        #expect(Bookmarks.missing("/Users/ann/a.mkv", mounted: mounted) == .gone)
+        #expect(Bookmarks.missing(nil, mounted: mounted) == .gone)
+        #expect(Bookmarks.volumeRoot("/Volumes/Disk/a/b") == "/Volumes/Disk")
+        #expect(Bookmarks.volumeRoot("/Users/ann/a") == nil)
+    }
+
+    @Test func onlyAChangedPathIsToldToTheEngine() {
+        typealias I = NetworkFacts.Interface
+        let wifi = [I(kind: .wifi, name: "en0")]
+        let first = NetworkFacts.next(
+            after: nil, satisfied: true, interfaces: wifi, expensive: false, constrained: false)
+        #expect(first.changed && first.facts.kind == .wifi)
+        let same = NetworkFacts.next(
+            after: first.facts, satisfied: true, interfaces: wifi, expensive: false,
+            constrained: false)
+        #expect(!same.changed)
+        let metered = NetworkFacts.next(
+            after: first.facts, satisfied: true, interfaces: wifi, expensive: true,
+            constrained: false)
+        #expect(metered.changed && metered.facts.expensive)
+        // No usable path: unknown, whatever interfaces linger.
+        let down = NetworkFacts.next(
+            after: first.facts, satisfied: false, interfaces: wifi, expensive: true,
+            constrained: true)
+        #expect(down.changed)
+        #expect(
+            down.facts
+                == NetworkFacts(kind: .unknown, vpn: false, expensive: false, constrained: false))
+    }
+
+    /// A bookmark follows its file when it moves (a fresh token when it
+    /// went stale), stays found in a folder merely named `.Trash`, and
+    /// calls a deleted file gone (ARCHITECTURE §6).
+    @Test func bookmarksFollowMovesAndCallADeletedFileGone() throws {
         defer { cleanUp() }
         let fm = FileManager.default
         let file = dir.appendingPathComponent("movie.mkv")
@@ -161,17 +237,18 @@ final class BlobServer: @unchecked Sendable {
         #expect(
             URL(fileURLWithPath: found.path).resolvingSymlinksInPath()
                 == moved.resolvingSymlinksInPath())
+        // The move left the bookmark stale: a fresh one comes back.
+        let fresh = try #require(found.token)
+        #expect(try adapter.fileTokenResolve(token: fresh)?.path == found.path)
 
-        let trash = dir.appendingPathComponent(".Trash/renamed.mkv")
+        let stray = dir.appendingPathComponent(".Trash/renamed.mkv")
         try fm.createDirectory(
-            at: trash.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try fm.moveItem(at: moved, to: trash)
-        #expect(try adapter.fileTokenResolve(token: token) == nil)
+            at: stray.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try fm.moveItem(at: moved, to: stray)
+        #expect(try adapter.fileTokenResolve(token: token) != nil)
 
-        try fm.removeItem(at: trash)
+        try fm.removeItem(at: stray)
         #expect(try adapter.fileTokenResolve(token: token) == nil)
-        #expect(Bookmarks.inTrash("/Volumes/Disk/.Trashes/501/a.iso"))
-        #expect(!Bookmarks.inTrash("/Users/x/Downloads/a.iso"))
     }
 
     @Test func keepAwakeHoldsOneAssertionWhileAnyTransferRuns() {
@@ -195,7 +272,7 @@ final class BlobServer: @unchecked Sendable {
     }
 
     /// End to end: a completed download's file moves, and `get` finds it
-    /// where it went; moved to a Trash, it's missing.
+    /// where it went; deleted, it's missing.
     @Test func aMovedDownloadIsFoundWhereItWent() async throws {
         defer { cleanUp() }
         let server = try BlobServer(size: 4096)
@@ -225,10 +302,8 @@ final class BlobServer: @unchecked Sendable {
             URL(fileURLWithPath: found.finalPath).resolvingSymlinksInPath()
                 == elsewhere.resolvingSymlinksInPath())
 
-        let trash = dir.appendingPathComponent(".Trash/paper.pdf")
-        try FileManager.default.createDirectory(
-            at: trash.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try FileManager.default.moveItem(at: elsewhere, to: trash)
+        // Deleted: missing, and the row stays until forgotten.
+        try FileManager.default.removeItem(at: elsewhere)
         let usage = try engine.storageBreakdown()
         #expect(usage.flatMap(\.missing) == [added.id])
         await engine.shutdown()

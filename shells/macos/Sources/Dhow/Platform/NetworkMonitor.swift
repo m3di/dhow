@@ -19,6 +19,19 @@ struct NetworkFacts: Equatable, Sendable {
         var name: String
     }
 
+    /// A path update after `previous`: the facts, and whether they differ
+    /// (the engine is told only then). No usable path is an unknown one.
+    static func next(
+        after previous: NetworkFacts?, satisfied: Bool, interfaces: [Interface], expensive: Bool,
+        constrained: Bool
+    ) -> (facts: NetworkFacts, changed: Bool) {
+        let now =
+            satisfied
+            ? from(interfaces: interfaces, expensive: expensive, constrained: constrained)
+            : NetworkFacts(kind: .unknown, vpn: false, expensive: false, constrained: false)
+        return (now, now != previous)
+    }
+
     /// The default route's interface decides the kind; a tunnel (`utun`,
     /// `ipsec`, `ppp`, `tun`, `tap`) among the path's interfaces is a VPN.
     static func from(interfaces: [Interface], expensive: Bool, constrained: Bool) -> NetworkFacts {
@@ -74,15 +87,12 @@ final class NetworkMonitor: @unchecked Sendable {
         let interfaces = path.availableInterfaces.map { i in
             NetworkFacts.Interface(kind: Self.kind(i.type), name: i.name)
         }
-        let now =
-            path.status == .satisfied
-            ? NetworkFacts.from(
-                interfaces: interfaces, expensive: path.isExpensive,
-                constrained: path.isConstrained)
-            : NetworkFacts(kind: .unknown, vpn: false, expensive: false, constrained: false)
-        let changed = lock.withLock {
-            defer { facts = now }
-            return facts != now
+        let (now, changed) = lock.withLock {
+            let next = NetworkFacts.next(
+                after: facts, satisfied: path.status == .satisfied, interfaces: interfaces,
+                expensive: path.isExpensive, constrained: path.isConstrained)
+            facts = next.facts
+            return next
         }
         guard changed else { return }
         _ = try? engine?.networkChanged()

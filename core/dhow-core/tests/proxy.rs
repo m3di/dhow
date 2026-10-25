@@ -226,6 +226,47 @@ async fn system_uses_the_adapters_proxy_and_its_bypass_list() {
     assert_eq!(engine.network_info().unwrap().proxy_in_use, ProxyMode::None);
 }
 
+/// macOS's "Exclude simple hostnames": a dotless name goes direct, the
+/// rest through the proxy, `no_proxy` still applying.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn simple_hostnames_go_direct_when_excluded() {
+    let origin = TestServer::start().unwrap();
+    let proxy = TestServer::start().unwrap();
+    let port = origin.addr().port();
+    let config = |no_proxy: Vec<String>| ProxyConfig {
+        http: Url::parse(&format!("http://{}", proxy.addr())).ok(),
+        no_proxy,
+        exclude_simple_hosts: true,
+        ..ProxyConfig::default()
+    };
+    let get = |client: reqwest::Client, url: String| async move {
+        let r = client.get(url).send().await.unwrap();
+        assert!(r.status().is_success());
+    };
+
+    let client = dhow_core::http::client_via(&config(vec![])).unwrap();
+    get(client.clone(), format!("http://localhost:{port}/blob/10")).await;
+    assert_eq!(
+        (origin.requests().len(), proxied(&proxy)),
+        (1, 0),
+        "simple: direct"
+    );
+    get(client, format!("http://127.0.0.1:{port}/blob/10")).await;
+    assert_eq!(
+        (origin.requests().len(), proxied(&proxy)),
+        (1, 1),
+        "an IP: proxied"
+    );
+
+    let client = dhow_core::http::client_via(&config(vec!["127.0.0.1".into()])).unwrap();
+    get(client, format!("http://127.0.0.1:{port}/blob/10")).await;
+    assert_eq!(
+        (origin.requests().len(), proxied(&proxy)),
+        (2, 1),
+        "no_proxy: direct"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn socks5_proxies_relay_with_and_without_auth() {
     let origin = TestServer::start().unwrap();

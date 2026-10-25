@@ -1,5 +1,6 @@
 import Foundation
 import IOKit.pwr_mgt
+import os
 
 /// The power API keep-awake needs, so tests count without asserting.
 protocol PowerAssertions: Sendable {
@@ -14,7 +15,12 @@ struct IOKitPower: PowerAssertions {
         let result = IOPMAssertionCreateWithName(
             kIOPMAssertPreventUserIdleSystemSleep as CFString,
             IOPMAssertionLevel(kIOPMAssertionLevelOn), reason as CFString, &id)
-        return result == kIOReturnSuccess ? id : nil
+        guard result == kIOReturnSuccess else {
+            Logger(subsystem: "app.dhow.Dhow", category: "power")
+                .error("IOPMAssertionCreateWithName failed: \(result)")
+            return nil
+        }
+        return id
     }
 
     func release(_ id: UInt32) {
