@@ -704,6 +704,8 @@ async fn fetch(
                 }
                 match step {
                     Step::Wait => {}
+                    // Downgraded earlier in this pass: `can_ramp` is stale.
+                    Step::Open if single.load(Ordering::Relaxed) => {}
                     // The budget decides whether ramp-up may have it.
                     Step::Open if !ticket.try_grow() => ramp.blocked(now, rc),
                     Step::Open => {
@@ -740,7 +742,9 @@ async fn fetch(
                 Tuned::Connections(n) => {
                     let before = limit;
                     // Downgraded (§2.3, §9 Protocol): one, whatever is asked.
-                    limit = match single_now {
+                    // Read afresh: a connection may have downgraded it
+                    // earlier in this pass, after `single_now` was taken.
+                    limit = match single.load(Ordering::Relaxed) {
                         true => 1,
                         false => ramp::connection_limit(total, can_range, n, rc, link),
                     };
@@ -1217,6 +1221,20 @@ mod tests {
     /// nothing ahead of younger downloads (§10.3).
     #[tokio::test(flavor = "multi_thread")]
     async fn a_downgraded_download_asked_for_more_claims_nothing() {
+        downgraded_then_asked_for_more(false).await;
+    }
+
+    /// The same when the request lands in the very pass of the fetch loop
+    /// that saw the downgrade: it used to go by `single` as read before
+    /// that pass, set the limit back to 4 and claim 3 for good.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_downgrade_and_a_request_in_one_pass_claim_nothing() {
+        downgraded_then_asked_for_more(true).await;
+    }
+
+    /// `in_pass`: asked from the downgrade's own event, so before the
+    /// fetch loop polls its next branch.
+    async fn downgraded_then_asked_for_more(in_pass: bool) {
         let shared = Arc::new(Shared::new(BudgetConfig {
             global: 4,
             per_host: 4,
@@ -1225,6 +1243,7 @@ mod tests {
         let server = TestServer::start().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let (connections, connections_rx) = watch::channel(Some(4));
+        let connections = Arc::new(connections);
         let (ranges, ranges_rx) = watch::channel(false);
         let req = Request {
             // No `Accept-Ranges`, and `Range` ignored.
@@ -1245,16 +1264,22 @@ mod tests {
         let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
         let (stop_tx, stop) = watch::channel(false);
         let s = shared.clone();
-        let elder = tokio::spawn(async move {
+        let ask = connections.clone();
+        // No coop budget: once the connection spent it, the pass's watch
+        // receivers would yield and leave the request to the next pass.
+        let elder = tokio::spawn(tokio::task::unconstrained(async move {
             let mut config = DownloadConfig::default();
             config.probe.range_get = false;
             config.ramp.min_chunk = 128 * 1024;
             let on_event = move |e: DownloadEvent| {
+                if in_pass && matches!(e, DownloadEvent::Connection(ConnEvent::NotResumable)) {
+                    ask.send_replace(Some(4));
+                }
                 let _ = tx.send(e);
             };
             let client = crate::http::client().unwrap();
             download(&req, &client, &config, &s, &on_event, &stop).await
-        });
+        }));
         let mut until = async |what: &str, pred: &dyn Fn(&DownloadEvent) -> bool| {
             let wait = async {
                 while let Some(e) = events.recv().await {
@@ -1276,11 +1301,15 @@ mod tests {
         young.set_limit(4);
         assert!(young.try_first());
 
-        connections.send_replace(Some(4));
+        if !in_pass {
+            connections.send_replace(Some(4));
+        }
         // Seen after the connections (`tuned` is biased): a fence.
         ranges.send_replace(true);
         until("a map", &|e| matches!(e, DownloadEvent::Ranges(_))).await;
         assert!(young.try_grow(), "the downgraded elder still claims");
+        // The elder's one connection and the young's two.
+        assert_eq!(shared.budget.usage("").0, 3);
 
         stop_tx.send_replace(true);
         assert!(matches!(elder.await.unwrap(), Err(DownloadError::Stopped)));
