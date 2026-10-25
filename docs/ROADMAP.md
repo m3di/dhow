@@ -51,11 +51,11 @@ Exit: T-13 passes; CLI shows network info on Linux via the env/gsettings adapter
 
 ## M4 — FFI & macOS shell (first native app)
 
-- M4.1 UniFFI bindings, Swift package `DhowCore`, built as an XCFramework for macOS + iOS targets.
-- M4.2 macOS shell: main window, list, add dialog, detail pane, settings, notifications, Dock integration (`UI-GUIDELINES §3–8`).
+- M4.1 UniFFI bindings, Swift package `DhowCore`, built as a macOS XCFramework with Command Line Tools only (iOS slices via `xcodebuild` are scripted but deferred until Xcode is installed).
+- M4.2 macOS shell: main window, list, add dialog, detail pane, settings, notifications, Dock integration (`UI-GUIDELINES §3–8`). A SwiftPM package (opens in Xcode later unchanged); all UI text goes through localization keys, English only.
 - M4.3 macOS adapter: bookmarks, `NWPathMonitor`, system proxy, keep-awake.
-- M4.4 Persian localization + RTL.
-- M4.5 Signed, notarized DMG via CI.
+- ~~M4.4 Persian localization + RTL.~~ Deferred: v1 ships English only; translations come later as language packs over the M4.2 keys.
+- M4.5 DMG built by a local script on the maintainer's Mac, ad-hoc signed; Developer ID signing and notarization plug in later.
 
 Exit: a tester can use Dhow on macOS daily for a week without opening the CLI.
 
