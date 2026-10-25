@@ -7,8 +7,8 @@
 #   build-swift.sh          release, macOS arm64 + x86_64 (one universal
 #                           archive). Command Line Tools are enough: the
 #                           XCFramework (macOS slice only) is laid out by hand.
-#   build-swift.sh --debug  this Mac's architecture, dev profile (reuses what
-#                           `cargo test` built): quick, for iterating.
+#   build-swift.sh --debug  this Mac's architecture, dev profile: quicker
+#                           after its first run, for iterating.
 #   build-swift.sh --ios    also iOS and the iOS simulator (arm64); the
 #                           XCFramework then comes from
 #                           `xcodebuild -create-xcframework`, so needs Xcode.
@@ -24,6 +24,7 @@ root="$(dirname "$core")"
 pkg="$root/shells/apple/DhowCore"
 build="$core/target/swift"
 xcf="$pkg/DhowCoreFFI.xcframework"
+debug_target="$core/target/swift-debug"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 # UI-GUIDELINES §1: macOS 14, iOS 17 (for the C code: SQLite, aws-lc).
 export MACOSX_DEPLOYMENT_TARGET=14.0 IPHONEOS_DEPLOYMENT_TARGET=17.0
@@ -40,7 +41,11 @@ esac
 # links one.
 staticlib() { # <target> | ""  (host, dev profile)
     if [ -z "$1" ]; then
-        (cd "$core" && cargo rustc -p dhow-ffi --lib --crate-type staticlib)
+        # Its own target dir: C objects `cargo test` built without the
+        # deployment target would be linked as they are (cc doesn't rebuild
+        # for it).
+        (cd "$core" && CARGO_TARGET_DIR="$debug_target" \
+            cargo rustc -p dhow-ffi --lib --crate-type staticlib)
     else
         (cd "$core" && cargo rustc -p dhow-ffi --lib --crate-type staticlib --target "$1" --release)
     fi
@@ -101,8 +106,8 @@ EOF
 case "$mode" in
     debug)
         staticlib ""
-        generate "$core/target/debug/libdhow_ffi.a"
-        macos_xcframework "$core/target/debug/libdhow_ffi.a" "$(uname -m)"
+        generate "$debug_target/debug/libdhow_ffi.a"
+        macos_xcframework "$debug_target/debug/libdhow_ffi.a" "$(uname -m)"
         ;;
     release | ios)
         staticlib aarch64-apple-darwin

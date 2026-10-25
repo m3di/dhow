@@ -370,6 +370,10 @@ pub struct DownloadSnapshot {
     pub speed_limit: Option<u64>,
     pub category: Category,
     pub group: Option<String>,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    /// Asked for at `add`; `None`: the default.
+    pub connections: Option<u8>,
 }
 
 impl From<Snapshot> for DownloadSnapshot {
@@ -392,6 +396,9 @@ impl From<Snapshot> for DownloadSnapshot {
             speed_limit: s.speed_limit,
             category: s.category.into(),
             group: s.group,
+            etag: s.etag,
+            last_modified: s.last_modified,
+            connections: s.connections,
         }
     }
 }
@@ -640,11 +647,20 @@ pub struct QueueSnapshot {
     pub run_state_until: Option<i64>,
     /// Downloads in it that aren't completed or cancelled.
     pub unfinished: u32,
+    /// May its downloads start now (schedule and override, §11)? As of
+    /// the read.
+    pub active_now: bool,
+    /// Unix ms its state can next change (a window edge or the override's
+    /// end), in local time with DST; `None`: not by itself.
+    pub next_edge: Option<i64>,
 }
 
 impl From<CoreQueue> for QueueSnapshot {
     fn from(q: CoreQueue) -> Self {
+        let now = jiff::Zoned::now();
         Self {
+            active_now: q.active_at(&now),
+            next_edge: q.next_edge_at(&now).map(|t| t.as_millisecond()),
             id: q.id,
             name: q.name,
             max_concurrent: q.max_concurrent,
@@ -1041,8 +1057,9 @@ pub enum Event {
         id: String,
         path: String,
     },
+    /// `id`: `None` for one about no download (ARCHITECTURE §3.2).
     Warning {
-        id: String,
+        id: Option<String>,
         kind: WarningKind,
     },
     GroupChanged {
@@ -1051,12 +1068,6 @@ pub enum Event {
     },
     SettingsChanged {
         settings: DhowSettings,
-    },
-    /// The engine could not run a download (its database or files failed
-    /// it); the runner leaves it alone until it is resumed.
-    RunFailed {
-        id: String,
-        error: DhowError,
     },
 }
 
@@ -1069,9 +1080,8 @@ impl Event {
             | Self::Reset { id, .. }
             | Self::Retrying { id, .. }
             | Self::Renamed { id, .. }
-            | Self::Warning { id, .. }
-            | Self::GroupChanged { id, .. }
-            | Self::RunFailed { id, .. } => Some(id),
+            | Self::GroupChanged { id, .. } => Some(id),
+            Self::Warning { id, .. } => id.as_deref(),
             Self::SettingsChanged { .. } => None,
         }
     }
@@ -1121,7 +1131,7 @@ impl From<EngineEvent> for Event {
             },
             EngineEvent::Renamed { id, path: p } => Self::Renamed { id, path: path(p) },
             EngineEvent::Warning { id, kind } => Self::Warning {
-                id,
+                id: Some(id),
                 kind: kind.into(),
             },
             EngineEvent::GroupChanged { id, group } => Self::GroupChanged {

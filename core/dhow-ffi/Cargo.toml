@@ -31,4 +31,5 @@ uniffi.workspace = true
 
 [dev-dependencies]
 dhow-testserver.workspace = true
+rusqlite.workspace = true
 tempfile.workspace = true

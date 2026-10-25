@@ -473,3 +473,198 @@ fn a_download_another_process_runs_is_left_alone() {
     engine.resume(id.clone()).unwrap();
     events.wait_state(&id, DownloadState::Completed);
 }
+
+fn queue(engine: &Engine, max_concurrent: u32, schedule: Option<Schedule>) -> QueueSnapshot {
+    engine
+        .create_queue(QueueSpec {
+            name: format!("q{max_concurrent}"),
+            max_concurrent,
+            speed_limit: None,
+            schedule,
+            on_complete: OnComplete::Nothing,
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_resume_while_stopping_starts_it_again() {
+    let s = Setup::new();
+    let events = Arc::new(Recorder::default());
+    let engine = open(&s.data(), events.clone(), None);
+    let q = queue(&engine, 1, None);
+    let mut req = s.req(
+        "/blob/1000000?seed=7&throttle=400000",
+        "g.bin",
+        StartMode::Queued,
+    );
+    req.queue = Some(q.id.clone());
+    let id = block(engine.add(req)).unwrap().id;
+    events.wait_progress(&id);
+
+    // `stop_queue` returns with the stop sent, not done: the resume lands
+    // while it stops, and wins (started by hand, so the queue's stop
+    // doesn't apply).
+    engine.stop_queue(q.id.clone()).unwrap();
+    engine.resume(id.clone()).unwrap();
+    events.wait_state(&id, DownloadState::Completed);
+
+    // A pause and a resume a moment later, whichever lands when.
+    let mut req = s.req(
+        "/blob/1000000?seed=8&throttle=400000",
+        "h.bin",
+        StartMode::Now,
+    );
+    req.queue = Some(q.id);
+    let id = block(engine.add(req)).unwrap().id;
+    events.wait_progress(&id);
+    let pausing = {
+        let (engine, id) = (engine.clone(), id.clone());
+        std::thread::spawn(move || block(engine.pause(id)).unwrap())
+    };
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    engine.resume(id.clone()).unwrap();
+    pausing.join().unwrap();
+    // Paused for good if the resume came first, else running again.
+    let state = engine.get(id.clone()).unwrap().state;
+    if state != DownloadState::Paused {
+        events.wait_state(&id, DownloadState::Completed);
+    }
+}
+
+#[test]
+fn a_users_pause_survives_shutdown() {
+    let s = Setup::new();
+    let events = Arc::new(Recorder::default());
+    let engine = open(&s.data(), events.clone(), None);
+    let path = "/blob/2000000?seed=9&throttle=200000";
+    let id = block(engine.add(s.req(path, "i.bin", StartMode::Now)))
+        .unwrap()
+        .id;
+    events.wait_progress(&id);
+    // Whichever stop lands first, the user's pause wins over the requeue.
+    let pausing = {
+        let (engine, id) = (engine.clone(), id.clone());
+        std::thread::spawn(move || block(engine.pause(id)).unwrap())
+    };
+    block(engine.shutdown());
+    pausing.join().unwrap();
+    assert_eq!(engine.get(id).unwrap().state, DownloadState::Paused);
+}
+
+#[test]
+fn a_window_starts_and_stops_its_queue() {
+    use std::time::Duration;
+    let s = Setup::new();
+    let events = Arc::new(Recorder::default());
+    let engine = open(&s.data(), events.clone(), None);
+    let at = |secs: i64| {
+        let t = jiff::Zoned::now()
+            .round(jiff::Unit::Second)
+            .unwrap()
+            .checked_add(jiff::Span::new().seconds(secs))
+            .unwrap();
+        let time = TimeOfDay {
+            hour: t.hour() as u8,
+            minute: t.minute() as u8,
+            second: t.second() as u8,
+        };
+        (time, t.timestamp())
+    };
+    let ((start, start_at), (end, end_at)) = (at(3), at(7));
+    let week = vec![
+        Weekday::Monday,
+        Weekday::Tuesday,
+        Weekday::Wednesday,
+        Weekday::Thursday,
+        Weekday::Friday,
+        Weekday::Saturday,
+        Weekday::Sunday,
+    ];
+    let schedule = Schedule {
+        windows: vec![ScheduleWindow {
+            days: week,
+            start,
+            end,
+        }],
+        action: ScheduleAction::StartAndStopOutside,
+    };
+    let q = queue(&engine, 1, Some(schedule));
+    assert!(!q.active_now);
+    assert_eq!(q.next_edge, Some(start_at.as_millisecond()));
+
+    let mut req = s.req(
+        "/blob/4000000?seed=11&throttle=300000",
+        "j.bin",
+        StartMode::Queued,
+    );
+    req.queue = Some(q.id.clone());
+    let id = block(engine.add(req)).unwrap().id;
+    events.wait_state(&id, DownloadState::Active);
+    assert!(
+        jiff::Timestamp::now() >= start_at,
+        "started before its window"
+    );
+    assert!(engine.get_queue(q.id.clone()).unwrap().active_now);
+
+    events.wait("requeued at the end", |es| {
+        es.iter()
+            .skip_while(|e| !is_state(e, &id, DownloadState::Active))
+            .any(|e| is_state(e, &id, DownloadState::Queued))
+    });
+    assert!(jiff::Timestamp::now() >= end_at, "stopped before the end");
+    let snap = engine.get(id.clone()).unwrap();
+    assert_eq!(snap.state, DownloadState::Queued);
+    assert!(snap.downloaded > 0 && snap.downloaded < 4_000_000);
+    // Outside the window it stays queued.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(engine.get(id).unwrap().state, DownloadState::Queued);
+}
+
+#[test]
+fn a_run_the_engine_cannot_carry_out_fails_and_frees_its_slot() {
+    let s = Setup::new();
+    let events = Arc::new(Recorder::default());
+    let engine = open(&s.data(), events.clone(), None);
+    let q = queue(&engine, 1, None);
+    engine.stop_queue(q.id.clone()).unwrap();
+    let mut ids = Vec::new();
+    for (seed, name) in [(12, "k.bin"), (13, "l.bin")] {
+        let mut req = s.req(&format!("/blob/1000?seed={seed}"), name, StartMode::Queued);
+        req.queue = Some(q.id.clone());
+        ids.push(block(engine.add(req)).unwrap().id);
+    }
+    // A row the engine can't run: its URL no longer parses.
+    let db = rusqlite::Connection::open(s.data().join("dhow.sqlite")).unwrap();
+    db.execute(
+        "UPDATE downloads SET url = 'not a url' WHERE id = ?1",
+        [&ids[0]],
+    )
+    .unwrap();
+    drop(db);
+
+    engine.resume_schedule(q.id).unwrap();
+    events.wait("failed as io", |es| {
+        es.iter().any(|e| {
+            matches!(e, Event::StateChanged { id, to: DownloadState::Failed,
+                reason: Some(FailReason::Io), .. } if *id == ids[0])
+        })
+    });
+    events.wait_state(&ids[1], DownloadState::Completed);
+    let snap = engine.get(ids[0].clone()).unwrap();
+    assert_eq!(
+        (snap.state, snap.fail_reason),
+        (DownloadState::Failed, Some(FailReason::Io))
+    );
+}
+
+#[test]
+fn snapshots_carry_validators_and_connections() {
+    let s = Setup::new();
+    let engine = open(&s.data(), Arc::new(Recorder::default()), None);
+    let mut req = s.req("/blob/1000?seed=14", "m.bin", StartMode::Paused);
+    req.connections = Some(3);
+    let snap = block(engine.add(req)).unwrap();
+    assert!(snap.etag.is_some() && snap.last_modified.is_some());
+    assert_eq!(snap.connections, Some(3));
+    engine.recheck();
+}

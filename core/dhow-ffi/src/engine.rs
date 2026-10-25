@@ -35,9 +35,13 @@ const DROP_WAIT: Duration = Duration::from_secs(5);
 /// One engine per data directory and process. Commands and queries may be
 /// called from any thread; queries (and the commands that aren't `async`)
 /// block on the database and the adapter, so shells call them off the main
-/// thread. Dropping it stops everything at once: runs left `Active` are
-/// resumed by the next engine (journal recovery, ENGINE-SPEC §5.4);
-/// `shutdown` first stops them cleanly.
+/// thread.
+///
+/// Call `shutdown` before letting go of it. Dropping it without stops
+/// everything at once (runs left `Active` are resumed by the next engine,
+/// ENGINE-SPEC §5.4) and blocks the dropping thread up to 5 s for file work
+/// in flight, so don't drop it on the main thread. The listener and the
+/// adapter must hold it weakly, or it is never dropped.
 #[derive(uniffi::Object)]
 pub struct Engine {
     rt: Option<Runtime>,
@@ -57,8 +61,9 @@ struct Inner {
 #[derive(Default)]
 struct Runner {
     runs: HashMap<String, Run>,
-    /// Their run ended in an engine error: not started again by the queue
-    /// until resumed (or the runner would retry it in a loop).
+    /// Their run ended in an engine error that couldn't even be recorded
+    /// as `Failed`: not started again by the queue until resumed (or the
+    /// runner would retry it in a loop).
     failed: HashSet<String>,
     /// Being cancelled: not to be started meanwhile.
     cancelling: HashSet<String>,
@@ -72,13 +77,22 @@ struct Run {
     done: watch::Receiver<()>,
     /// Started by hand: its queue's schedule doesn't stop it (§11).
     by_hand: bool,
+    /// A stop was sent.
+    stopping: bool,
     /// Stopped by the runner, not the user: back to `Queued` once paused.
     requeue: bool,
+    /// Resumed while stopping: started again, by hand, once it has ended.
+    restart: bool,
 }
 
 impl Run {
+    /// Stops it. It is requeued only if every stop asked for that: a
+    /// user's pause wins over a schedule, `stop_queue` or `shutdown`. A
+    /// stop also overrides an earlier resume.
     fn stop(&mut self, requeue: bool) -> watch::Receiver<()> {
-        self.requeue = requeue;
+        self.requeue = requeue && (self.requeue || !self.stopping);
+        self.stopping = true;
+        self.restart = false;
         let _ = self.stop.send(true);
         self.done.clone()
     }
@@ -304,6 +318,15 @@ impl Engine {
         })
     }
 
+    /// Applies the queues and schedules again now. The schedule's wake-up
+    /// runs on a monotonic clock, which stops while the machine sleeps:
+    /// shells call this on wake and when the clock or time zone changes
+    /// (ENGINE-SPEC §11).
+    pub fn recheck(&self) {
+        let _rt = self.rt().enter();
+        self.inner.kick();
+    }
+
     /// Asks the adapter now (ARCHITECTURE §8).
     pub fn network_info(&self) -> Result<NetworkInfo, DhowError> {
         self.sync(|i| Ok(i.core.network_info()?.into()))
@@ -409,10 +432,13 @@ impl Inner {
         }
         let start = request.start;
         let snap = self.core.add(request.into_core()?, &self.emit()).await?;
+        // Recorded: from here on it is `Ok`, whatever starting it does.
         if snap.state == State::Queued {
             let mut r = self.runner();
-            if start == StartMode::Now {
-                self.start(&mut r, &snap.id, true)?;
+            if start == StartMode::Now
+                && let Err(e) = self.start(&mut r, &snap.id, true)
+            {
+                tracing::warn!(id = snap.id, error = %e, "could not start an added download");
             }
             self.pass(&mut r);
         }
@@ -438,11 +464,14 @@ impl Inner {
     }
 
     fn resume(self: &Arc<Self>, id: &str) -> Result<DownloadSnapshot, DhowError> {
-        let mut r = self.runner();
+        // Not under the runner's lock: `get` may ask the adapter (§6).
         let snap = self.core.get(id, &self.emit())?;
-        if !snap.state.is_final() && !r.cancelling.contains(id) {
-            self.start(&mut r, id, true)?;
-            self.pass(&mut r);
+        if !snap.state.is_final() {
+            let mut r = self.runner();
+            if !r.cancelling.contains(id) {
+                self.start(&mut r, id, true)?;
+                self.pass(&mut r);
+            }
         }
         Ok(snap.into())
     }
@@ -452,9 +481,9 @@ impl Inner {
         id: &str,
         delete_partial: bool,
     ) -> Result<DownloadSnapshot, DhowError> {
+        self.core.get(id, &self.emit())?;
         let running = {
             let mut r = self.runner();
-            self.core.get(id, &self.emit())?;
             r.cancelling.insert(id.to_owned());
             r.runs.get_mut(id).map(|run| run.stop(false))
         };
@@ -478,11 +507,19 @@ impl Inner {
 
     fn stop_queue(self: &Arc<Self>, id: &str) -> Result<QueueSnapshot, DhowError> {
         let q = self.core.stop_queue(id)?;
+        let running: Vec<String> = self.runner().runs.keys().cloned().collect();
+        let in_queue: Vec<String> = running
+            .into_iter()
+            .filter(|i| {
+                self.core
+                    .get(i, &self.emit())
+                    .is_ok_and(|s| s.queue_id == q.id)
+            })
+            .collect();
         let mut r = self.runner();
-        let ids: Vec<String> = r.runs.keys().cloned().collect();
-        for run_id in ids {
-            if self.core.get(&run_id, &self.emit())?.queue_id == q.id {
-                r.runs.get_mut(&run_id).expect("listed").stop(true);
+        for i in in_queue {
+            if let Some(run) = r.runs.get_mut(&i) {
+                run.stop(true);
             }
         }
         self.pass(&mut r);
@@ -501,14 +538,20 @@ impl Inner {
         }
     }
 
-    /// Starts `id` in this process unless it runs already (then it counts
-    /// as started by hand if `by_hand`).
+    /// Starts `id` in this process. One running already counts as started
+    /// by hand if `by_hand`; one stopping is started again once it ends.
     fn start(self: &Arc<Self>, r: &mut Runner, id: &str, by_hand: bool) -> Result<(), DhowError> {
         if r.shut_down {
             return Err(DhowError::ShutDown);
         }
         if let Some(run) = r.runs.get_mut(id) {
-            run.by_hand |= by_hand;
+            if !run.stopping {
+                run.by_hand |= by_hand;
+            } else if by_hand {
+                // By hand from now: the schedule's next pass leaves it be.
+                run.by_hand = true;
+                run.restart = true;
+            }
             return Ok(());
         }
         let lock = runlock::acquire(&self.data_dir, id, None).map_err(|e| match e {
@@ -524,7 +567,9 @@ impl Inner {
                 stop,
                 done,
                 by_hand,
+                stopping: false,
                 requeue: false,
+                restart: false,
             },
         );
         let inner = self.clone();
@@ -540,21 +585,29 @@ impl Inner {
 
     fn finished(self: &Arc<Self>, id: &str, result: Result<Snapshot, EngineError>) {
         let mut r = self.runner();
-        let requeue = r.runs.remove(id).is_some_and(|run| run.requeue);
+        let (requeue, restart) = r
+            .runs
+            .remove(id)
+            .map_or((false, false), |run| (run.requeue, run.restart));
         match result {
+            Ok(snap) if restart && !snap.state.is_final() => {
+                if let Err(e) = self.start(&mut r, id, true) {
+                    tracing::warn!(id, error = %e, "could not restart a resumed download");
+                }
+            }
             Ok(snap) if requeue && snap.state == State::Paused => {
                 if let Err(e) = self.core.requeue(id, &self.emit()) {
                     tracing::warn!(id, error = %e, "could not requeue a stopped download");
                 }
             }
             Ok(_) => {}
+            // ENGINE-SPEC §9 Local: recorded, so it shows and frees its slot.
             Err(e) => {
                 tracing::warn!(id, error = %e, "could not run download");
-                r.failed.insert(id.to_owned());
-                self.sink.push(Event::RunFailed {
-                    id: id.to_owned(),
-                    error: e.into(),
-                });
+                if let Err(e) = self.core.fail(id, &self.emit()) {
+                    tracing::warn!(id, error = %e, "could not record a failed run");
+                    r.failed.insert(id.to_owned());
+                }
             }
         }
         // Its slot is free.

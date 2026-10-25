@@ -65,9 +65,10 @@ pub fn acquire(data_dir: &Path, id: &str, pid: Option<u32>) -> Result<RunLock, H
 }
 
 /// The PID running `id`, if any process is (0: one that takes no signals).
+/// Probes with a shared lock, so probes don't collide with each other.
 pub fn holder(data_dir: &Path, id: &str) -> io::Result<Option<u32>> {
     let mut file = open(data_dir, id)?;
-    match file.try_lock() {
+    match file.try_lock_shared() {
         Ok(()) => Ok(None),
         Err(TryLockError::WouldBlock) => Ok(Some(read_pid(&mut file))),
         Err(TryLockError::Error(e)) => Err(e),
