@@ -11,6 +11,7 @@ use crate::journal::{Header, format};
 const NO_AUTO: WriterConfig = WriterConfig {
     commit_interval: Duration::from_secs(3600),
     commit_bytes: u64::MAX,
+    slow_sync: Duration::ZERO,
 };
 
 struct Fixture {

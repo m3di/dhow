@@ -35,6 +35,7 @@ fn config(max_failures: u32) -> DownloadConfig {
         writer: WriterConfig {
             commit_interval: Duration::from_secs(60),
             commit_bytes: 100_000,
+            ..WriterConfig::default()
         },
         ..DownloadConfig::default()
     }
