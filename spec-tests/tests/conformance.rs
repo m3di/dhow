@@ -527,3 +527,27 @@ fn unknown_id_is_an_error() {
     assert!(!out.status.success());
     assert!(out.stderr.contains("no download matches"), "{out:?}");
 }
+
+/// ARCHITECTURE §2, §9: an app's run lock carries no PID. The CLI won't
+/// signal the app, says so, and records nothing.
+#[test]
+fn the_cli_refuses_a_download_an_app_runs() {
+    let server = TestServer::start().unwrap();
+    let sb = Sandbox::new();
+    let id = sb
+        .add(&server, "/blob/1000", &["--queue"])
+        .assert_success()
+        .id();
+    let Ok(_app) = dhow_core::runlock::acquire(&sb.data_dir(), &id, None) else {
+        panic!("lock taken");
+    };
+    for cmd in ["pause", "cancel", "resume"] {
+        let out = sb.dhow([cmd, id.as_str()]);
+        assert!(!out.status.success(), "{cmd}: {out:#?}");
+        assert!(
+            out.stderr.contains("running in the Dhow app"),
+            "{cmd}: {out:#?}"
+        );
+    }
+    assert_eq!(sb.ls()[0]["state"], "queued");
+}

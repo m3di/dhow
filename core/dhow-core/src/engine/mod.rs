@@ -255,6 +255,11 @@ pub struct Snapshot {
     /// Set at `Add` from the chosen name (§13.1).
     pub category: Category,
     pub group: Option<groups::GroupId>,
+    /// The validators identity checks use (I4).
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    /// Asked for at `Add`; `None`: the default (§4.1).
+    pub connections: Option<u8>,
 }
 
 impl Snapshot {
@@ -562,6 +567,20 @@ impl Engine {
         if !snap.state.is_final() && snap.state != State::Paused && snap.state != State::Completing
         {
             self.transition(id, State::Paused, None, on_event)?;
+        }
+        self.stored(id)
+    }
+
+    /// Marks a download whose run the engine could not carry out (an
+    /// `EngineError` from [`Engine::run`]) as `Failed(Io)` (§9 Local).
+    pub fn fail(
+        &self,
+        id: &str,
+        on_event: &(dyn Fn(EngineEvent) + Send + Sync),
+    ) -> Result<Snapshot, EngineError> {
+        let snap = self.stored(id)?;
+        if !snap.state.is_final() && snap.state != State::Failed {
+            self.transition(id, State::Failed, Some(FailReason::Io), on_event)?;
         }
         self.stored(id)
     }
@@ -1057,7 +1076,7 @@ fn fail_reason(e: &DownloadError) -> FailReason {
 
 const SELECT: &str = "SELECT id, url, final_path, part_path, state, fail_reason, total_size,
     resumable, size_unverified, identity_weak, created_at, queue_id, position, speed_limit,
-    category, group_id FROM downloads";
+    category, group_id, etag, last_modified, connections FROM downloads";
 
 fn snapshot(r: &Row) -> rusqlite::Result<Snapshot> {
     let state: String = r.get(4)?;
@@ -1099,6 +1118,11 @@ fn snapshot(r: &Row) -> rusqlite::Result<Snapshot> {
         speed_limit: r.get::<_, Option<i64>>(13)?.map(|v| v as u64),
         category: Category::parse(&r.get::<_, String>(14)?).unwrap_or(Category::Other),
         group: r.get(15)?,
+        etag: r.get(16)?,
+        last_modified: r.get(17)?,
+        connections: r
+            .get::<_, Option<i64>>(18)?
+            .and_then(|n| u8::try_from(n).ok()),
     })
 }
 

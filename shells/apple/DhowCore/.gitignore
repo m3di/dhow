@@ -1,0 +1,5 @@
+# Built by core/dhow-ffi/build-swift.sh
+/DhowCoreFFI.xcframework/
+/Sources/DhowCore/DhowCore.swift
+/.build/
+/.swiftpm/

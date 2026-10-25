@@ -406,9 +406,11 @@ async fn run(
         }
         Command::Pause { id } => {
             let id = engine.resolve(&id)?;
+            let holder = lock::holder(&data_dir, &id)?;
+            in_app(holder)?;
             // Record it, then make whoever runs it look.
             engine.pause(&id, &on_event)?;
-            if let Some(pid) = lock::holder(&data_dir, &id)? {
+            if let Some(pid) = holder {
                 lock::stop_runner(&data_dir, &id, pid)?;
             }
             output::emit(output::snapshot("download", &engine.get(&id, &on_event)?));
@@ -416,14 +418,16 @@ async fn run(
         }
         Command::Cancel { id, delete_partial } => {
             let id = engine.resolve(&id)?;
-            if let Some(pid) = lock::holder(&data_dir, &id)? {
+            let holder = lock::holder(&data_dir, &id)?;
+            in_app(holder)?;
+            if let Some(pid) = holder {
                 engine.pause(&id, &on_event)?;
                 lock::stop_runner(&data_dir, &id, pid)?;
             }
             let _lock = match lock::acquire(&data_dir, &id) {
                 Ok(l) => l,
                 Err(lock::Held::By(pid)) => {
-                    return Err(format!("download is running in process {pid}").into());
+                    return Err(running_in(pid).into());
                 }
                 Err(lock::Held::Io(e)) => return Err(e.into()),
             };
@@ -817,7 +821,7 @@ async fn runner(
             let lock = match lock::acquire(data_dir, &id) {
                 Ok(l) => l,
                 Err(lock::Held::By(pid)) => {
-                    return Err(format!("download is running in process {pid}").into());
+                    return Err(running_in(pid).into());
                 }
                 Err(lock::Held::Io(e)) => return Err(e.into()),
             };
@@ -909,6 +913,22 @@ fn poke_on_signal() -> Arc<Notify> {
         }
     }
     notify
+}
+
+/// A download an app runs in process (its lock has no PID) can't be
+/// signalled; it is stopped there.
+fn in_app(holder: Option<u32>) -> Res<()> {
+    match holder {
+        Some(0) => Err(running_in(0).into()),
+        _ => Ok(()),
+    }
+}
+
+fn running_in(pid: u32) -> String {
+    match pid {
+        0 => "download is running in the Dhow app; stop it there".into(),
+        pid => format!("download is running in process {pid}"),
+    }
 }
 
 fn exit_for(state: State) -> ExitCode {

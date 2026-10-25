@@ -2003,3 +2003,28 @@ mod hold_tests {
         assert_done(&fx, &snap);
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_has_validators_and_connections_and_a_run_can_be_failed() {
+    let server = TestServer::start().unwrap();
+    let fx = Fx::new();
+    let mut req = fx.request(&server, "/blob/1000?seed=1");
+    req.connections = Some(2);
+    let added = fx.engine.add(req, &|_| {}).await.unwrap();
+    assert!(added.etag.is_some() && added.last_modified.is_some());
+    assert_eq!(added.connections, Some(2));
+
+    // §9 Local: what the engine couldn't run is failed, once.
+    let sink = fx.events.clone();
+    let on_event = move |e: EngineEvent| sink.lock().unwrap().push(e);
+    let failed = fx.engine.fail(&added.id, &on_event).unwrap();
+    assert_eq!(
+        (failed.state, failed.fail_reason),
+        (State::Failed, Some(FailReason::Io))
+    );
+    fx.engine.fail(&added.id, &on_event).unwrap();
+    assert_eq!(fx.states(), [State::Failed]);
+    assert_eq!(fx.run(&added.id).await.state, State::Completed);
+    let done = fx.engine.fail(&added.id, &on_event).unwrap();
+    assert_eq!(done.state, State::Completed);
+}

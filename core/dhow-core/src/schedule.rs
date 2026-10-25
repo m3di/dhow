@@ -35,6 +35,21 @@ impl Weekdays {
         self.0 == 0
     }
 
+    pub fn from_days(days: impl IntoIterator<Item = Weekday>) -> Self {
+        Self(
+            days.into_iter()
+                .fold(0, |bits, d| bits | 1 << d.to_monday_zero_offset()),
+        )
+    }
+
+    /// Monday first.
+    pub fn days(self) -> Vec<Weekday> {
+        (0..7)
+            .map(|i| Weekday::from_monday_zero_offset(i).expect("0..7"))
+            .filter(|&d| self.contains(d))
+            .collect()
+    }
+
     /// `daily`, `weekdays`, `weekends`, or a comma list of `mon`..`sun`
     /// and ranges like `mon-fri`.
     pub fn parse(s: &str) -> Option<Self> {
@@ -93,6 +108,14 @@ impl<'de> Deserialize<'de> for Weekdays {
 pub struct Clock(Time);
 
 impl Clock {
+    pub fn new(hour: i8, minute: i8, second: i8) -> Option<Self> {
+        Time::new(hour, minute, second, 0).ok().map(Self)
+    }
+
+    pub fn time(self) -> Time {
+        self.0
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         let mut parts = s.trim().split(':').map(|p| p.parse::<i8>().ok());
         let (h, m) = (parts.next()??, parts.next()??);
@@ -238,6 +261,9 @@ mod tests {
             Weekdays::parse("fri-mon").unwrap().names(),
             ["mon", "fri", "sat", "sun"]
         );
+        let fri_mon = Weekdays::parse("fri-mon").unwrap();
+        assert_eq!(Weekdays::from_days(fri_mon.days()), fri_mon);
+        assert_eq!(fri_mon.days()[0], Weekday::Monday);
         assert_eq!(Weekdays::parse("someday"), None);
         assert_eq!(Weekdays::parse(""), None);
     }
@@ -248,6 +274,8 @@ mod tests {
         assert!(Clock::parse("06:30:15").is_some());
         assert!(Clock::parse("24:00").is_none());
         assert!(Clock::parse("12").is_none());
+        assert_eq!(Clock::new(6, 30, 15), Clock::parse("06:30:15"));
+        assert!(Clock::new(24, 0, 0).is_none());
         let w = Window::parse("mon-fri 22:00-06:00").unwrap();
         assert_eq!(w.days, Weekdays::parse("weekdays").unwrap());
         assert!(Window::parse("22:00-06:00").is_none());
