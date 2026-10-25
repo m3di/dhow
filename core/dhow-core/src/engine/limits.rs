@@ -17,7 +17,27 @@ use crate::limit::Bucket;
 #[derive(Debug, Default)]
 pub(super) struct Buckets {
     queues: HashMap<QueueId, Arc<Bucket>>,
-    downloads: HashMap<DownloadId, Arc<Bucket>>,
+    pub(super) downloads: HashMap<DownloadId, Arc<Bucket>>,
+}
+
+/// See [`Engine::take_buckets`].
+pub(super) struct OwnBucket<'a> {
+    engine: &'a Engine,
+    id: &'a str,
+    bucket: Arc<Bucket>,
+}
+
+impl Drop for OwnBucket<'_> {
+    fn drop(&mut self) {
+        let mut b = self.engine.buckets();
+        // Only its own: a later run of the same id may have replaced it.
+        if b.downloads
+            .get(self.id)
+            .is_some_and(|o| Arc::ptr_eq(o, &self.bucket))
+        {
+            b.downloads.remove(self.id);
+        }
+    }
 }
 
 impl Engine {
@@ -65,12 +85,14 @@ impl Engine {
         Ok(())
     }
 
-    /// The queue's and the download's buckets for a run of `id`.
-    pub(super) fn take_buckets(
-        &self,
-        id: &str,
+    /// The queue's and the download's buckets for a run of `id`. The
+    /// download's stays registered until the guard drops, also when the
+    /// `run` future is dropped.
+    pub(super) fn take_buckets<'a>(
+        &'a self,
+        id: &'a str,
         queue_id: &str,
-    ) -> Result<Vec<Arc<Bucket>>, EngineError> {
+    ) -> Result<(Vec<Arc<Bucket>>, OwnBucket<'a>), EngineError> {
         let queue_rate = self.queue(queue_id)?.speed_limit;
         let own = self.shared.bucket(self.download_limit(id)?);
         let mut b = self.buckets();
@@ -81,11 +103,12 @@ impl Engine {
             .clone();
         queue.set_rate(queue_rate);
         b.downloads.insert(id.to_owned(), own.clone());
-        Ok(vec![queue, own])
-    }
-
-    pub(super) fn drop_buckets(&self, id: &str) {
-        self.buckets().downloads.remove(id);
+        let guard = OwnBucket {
+            engine: self,
+            id,
+            bucket: own.clone(),
+        };
+        Ok((vec![queue, own], guard))
     }
 
     fn download_limit(&self, id: &str) -> Result<Option<u64>, EngineError> {

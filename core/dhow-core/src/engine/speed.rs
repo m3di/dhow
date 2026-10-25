@@ -23,7 +23,7 @@ pub struct SpeedSample {
 #[derive(Debug, Default)]
 pub(super) struct SpeedBook {
     /// Downloads sampling now.
-    running: u32,
+    pub(super) running: u32,
     /// Sum of the samples taken in each wall-clock second (unix ms), until
     /// that second can't get more.
     pending: BTreeMap<i64, u64>,
