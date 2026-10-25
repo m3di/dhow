@@ -23,7 +23,7 @@ pub struct SpeedSample {
 #[derive(Debug, Default)]
 pub(super) struct SpeedBook {
     /// Downloads sampling now.
-    pub(super) running: u32,
+    running: u32,
     /// Sum of the samples taken in each wall-clock second (unix ms), until
     /// that second can't get more.
     pending: BTreeMap<i64, u64>,
@@ -60,6 +60,11 @@ impl Engine {
             self.platform.keep_awake(true);
         }
         Sampling(self)
+    }
+
+    #[cfg(test)]
+    pub(super) fn sampling_count(&self) -> u32 {
+        self.speed().running
     }
 
     /// Records one download's sample taken at `now_ms`.

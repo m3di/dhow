@@ -17,7 +17,7 @@ use crate::limit::Bucket;
 #[derive(Debug, Default)]
 pub(super) struct Buckets {
     queues: HashMap<QueueId, Arc<Bucket>>,
-    pub(super) downloads: HashMap<DownloadId, Arc<Bucket>>,
+    downloads: HashMap<DownloadId, Arc<Bucket>>,
 }
 
 /// See [`Engine::take_buckets`].
@@ -109,6 +109,11 @@ impl Engine {
             bucket: own.clone(),
         };
         Ok((vec![queue, own], guard))
+    }
+
+    #[cfg(test)]
+    pub(super) fn own_buckets(&self) -> usize {
+        self.buckets().downloads.len()
     }
 
     fn download_limit(&self, id: &str) -> Result<Option<u64>, EngineError> {

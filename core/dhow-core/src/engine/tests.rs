@@ -967,8 +967,8 @@ mod limit_tests {
             _ = fx.engine.run(&id, &on_event, &stop) => panic!("finished before the drop"),
             _ = flowing.wait_for(|f| *f) => {}
         }
-        assert!(fx.engine.buckets().downloads.is_empty());
-        assert_eq!(fx.engine.speed().running, 0);
+        assert_eq!(fx.engine.own_buckets(), 0);
+        assert_eq!(fx.engine.sampling_count(), 0);
         assert_eq!(fx.engine.shared.budget.usage("").0, 0);
     }
 }
