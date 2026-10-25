@@ -90,7 +90,10 @@ fn add_now_runs_to_completion() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert_eq!(*adapter.awake.lock().unwrap(), [true, false]);
-    assert_eq!(*adapter.tokens.lock().unwrap(), std::slice::from_ref(&done.final_path));
+    assert_eq!(
+        *adapter.tokens.lock().unwrap(),
+        std::slice::from_ref(&done.final_path)
+    );
     let net = engine.network_info().unwrap();
     assert_eq!(net.interface_kind, InterfaceKind::Wifi);
     assert_eq!(net.proxy_in_use, ProxyMode::Direct);
