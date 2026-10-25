@@ -58,6 +58,7 @@ impl Env {
             connections: None,
             started_at: None,
             limits: vec![],
+            hold: None,
         };
         Self { _dir: dir, req }
     }
@@ -422,37 +423,6 @@ async fn stop_commits_and_resume_continues() {
     result.unwrap();
     assert_eq!(resumed(&events), Some(saved));
     assert_eq!(env.part_hash(), blob::digest(0, SIZE));
-}
-
-/// Dropped while its files are being prepared (off the async workers),
-/// then run again at once: the preparation finishes on its own, and the
-/// next run gets a consistent pair of files either way.
-#[tokio::test(flavor = "multi_thread")]
-async fn dropped_while_preparing_then_rerun_completes() {
-    let server = TestServer::start().unwrap();
-    // Slow enough that a preparation interleaving with the rerun's would
-    // pull its files from under it.
-    let env = Env::new(&server, "/blob/1000000?seed=1&throttle=2000000");
-    let (probed_tx, mut probed) = watch::channel(false);
-    let on_event = move |e: DownloadEvent| {
-        if matches!(e, DownloadEvent::Probed(_)) {
-            probed_tx.send_replace(true);
-        }
-    };
-    let (client, shared, config) = (http::client().unwrap(), Shared::default(), config(10));
-    let (_keep, stop) = watch::channel(false);
-    // Polled first: the probe answers, `prepare` is handed to the blocking
-    // pool, and this future is dropped while it waits for it.
-    tokio::select! {
-        biased;
-        r = download(&env.req, &client, &config, &shared, &on_event, &stop) => {
-            panic!("finished before the drop: {r:?}")
-        }
-        _ = probed.wait_for(|p| *p) => {}
-    }
-    let (result, _) = env.run(&config).await;
-    result.unwrap();
-    assert_eq!(env.part_hash(), blob::digest(1, SIZE));
 }
 
 #[tokio::test(flavor = "multi_thread")]

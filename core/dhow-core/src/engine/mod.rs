@@ -29,6 +29,7 @@ use rusqlite::{OptionalExtension, Row, params};
 use tokio::sync::watch;
 
 use crate::complete::{self, CompleteError, Target};
+use crate::download::hold::PartHold;
 use crate::download::{
     self, DownloadConfig, DownloadError, DownloadEvent, Request, ResetReason, Shared,
 };
@@ -610,6 +611,14 @@ impl Engine {
         if snap.state.is_final() {
             return Ok(snap);
         }
+        // Before anything touches the files: a dropped run of this download
+        // may still be preparing, committing or finalizing them. Read again
+        // after, its finalize records the final name.
+        let hold = PartHold::acquire(&snap.part_path).await;
+        let snap = self.stored(id)?;
+        if snap.state.is_final() {
+            return Ok(snap);
+        }
         let (part, sidecar) = (snap.part_path.clone(), snap.sidecar_path());
         // §8: died between rename and sidecar removal. The rename was the
         // commit point; finish the bookkeeping.
@@ -650,6 +659,7 @@ impl Engine {
             connections: self.connections(id)?,
             started_at: self.started_at(id)?,
             limits,
+            hold: Some(hold.clone()),
         };
         let progress = Mutex::new(Progress::new(snap.total_size));
         let dl_event = |e: DownloadEvent| self.on_download_event(id, e, &progress, on_event);
@@ -720,7 +730,12 @@ impl Engine {
         let digest = done.info.digest.clone();
         let owned_id = id.to_owned();
         let platform = self.platform.clone();
+        // Dropped while this runs (a digest check can take seconds), it
+        // still finishes, and a rerun waits for it.
         let finalized = tokio::task::spawn_blocking(move || {
+            let _hold = hold;
+            #[cfg(test)]
+            crate::download::hold::park::at("finalize", &part);
             let target = Target {
                 part: &part,
                 sidecar: &sidecar,

@@ -1810,3 +1810,95 @@ mod token_tests {
         assert!(fx.taken().is_empty());
     }
 }
+
+/// A run dropped while its file work is half done: a rerun waits for that
+/// work instead of interleaving with it (download::hold).
+mod hold_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+    use crate::download::hold::park::{self, Park};
+
+    /// Runs `id` until its blocking work parks at `point`, then drops the
+    /// run, leaving that work parked.
+    async fn orphan_at(fx: &Fx, id: &str, point: &'static str) -> Arc<Park> {
+        let part = fx.engine.stored(id).unwrap().part_path;
+        let park = park::arm(point, &part);
+        let reached = {
+            let p = park.clone();
+            tokio::task::spawn_blocking(move || p.wait_reached())
+        };
+        let (_keep, stop) = watch::channel(false);
+        tokio::select! {
+            r = fx.engine.run(id, &|_| {}, &stop) => panic!("finished before parking: {r:?}"),
+            r = reached => r.unwrap(),
+        }
+        park
+    }
+
+    /// Runs `id` again while the orphan is parked, then releases it. The
+    /// rerun must not change a thing before that.
+    async fn rerun(fx: &Fx, id: &str, park: &Park) -> Snapshot {
+        let started = AtomicBool::new(false);
+        let on_event = |e: EngineEvent| {
+            if matches!(e, EngineEvent::StateChanged { .. }) {
+                started.store(true, Ordering::SeqCst);
+            }
+        };
+        let (_keep, stop) = watch::channel(false);
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let early = started.load(Ordering::SeqCst);
+            park.release();
+            early
+        };
+        let (snap, early) = tokio::join!(fx.engine.run(id, &on_event, &stop), release);
+        assert!(
+            !early,
+            "the rerun went ahead while the orphan held the files"
+        );
+        snap.unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rerun_waits_for_a_dropped_runs_prepare() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let id = fx
+            .engine
+            .add(fx.request(&server, "/blob/1000000"), &|_| {})
+            .await
+            .unwrap()
+            .id;
+        let park = orphan_at(&fx, &id, "prepare").await;
+        let done = rerun(&fx, &id, &park).await;
+        assert_eq!(done.state, State::Completed);
+        assert_eq!(
+            blake3::hash(&std::fs::read(&done.final_path).unwrap()),
+            blob::digest(0, 1_000_000)
+        );
+    }
+
+    /// The orphan was finalizing (digest check, rename): the rerun finds
+    /// its rename done and only records it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rerun_waits_for_a_dropped_runs_finalize() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let id = fx
+            .engine
+            .add(fx.request(&server, "/blob/1000000"), &|_| {})
+            .await
+            .unwrap()
+            .id;
+        let park = orphan_at(&fx, &id, "finalize").await;
+        assert_eq!(fx.engine.stored(&id).unwrap().state, State::Completing);
+        let done = rerun(&fx, &id, &park).await;
+        assert_eq!(done.state, State::Completed);
+        assert_eq!(
+            blake3::hash(&std::fs::read(&done.final_path).unwrap()),
+            blob::digest(0, 1_000_000)
+        );
+        assert!(!done.part_path.exists() && !done.sidecar_path().exists());
+    }
+}

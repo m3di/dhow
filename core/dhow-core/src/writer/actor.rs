@@ -145,11 +145,23 @@ pub fn spawn(
     WriterHandle,
     oneshot::Receiver<Result<Outcome, WriterError>>,
 )> {
+    spawn_holding(writer, ())
+}
+
+/// [`spawn`], keeping `hold` until the thread has made its last commit.
+pub fn spawn_holding<H: Send + 'static>(
+    writer: Writer,
+    hold: H,
+) -> io::Result<(
+    WriterHandle,
+    oneshot::Receiver<Result<Outcome, WriterError>>,
+)> {
     let (tx, rx) = flume::bounded(QUEUE);
     let (done_tx, done) = oneshot::channel();
     thread::Builder::new()
         .name("dhow-writer".into())
         .spawn(move || {
+            let _hold = hold;
             let result = run(writer, rx);
             if let Err(e) = &result {
                 tracing::error!(error = %e, "writer stopped");

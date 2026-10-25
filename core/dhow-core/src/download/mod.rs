@@ -4,6 +4,7 @@
 //! the completion gate's (§8).
 
 pub mod budget;
+pub mod hold;
 pub mod ramp;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -11,7 +12,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -32,6 +33,7 @@ use crate::transfer::{
 use crate::writer::actor::{self, Outcome, WriterGone, WriterHandle};
 use crate::writer::{self, ChunkId, Writer, WriterConfig, WriterError};
 use budget::{Budget, BudgetConfig, Ticket};
+use hold::PartHold;
 use ramp::{LinkState, Ramp, RampConfig, Sample, Step};
 
 pub struct Request {
@@ -46,6 +48,9 @@ pub struct Request {
     pub started_at: Option<i64>,
     /// Speed limits besides the global one: its queue's and its own (§12).
     pub limits: Vec<Arc<Bucket>>,
+    /// The caller's hold on `part`, when its run touches the files outside
+    /// [`download`] too (recovery, finalize). `None`: `download` takes one.
+    pub hold: Option<PartHold>,
 }
 
 /// What all downloads in a process share: the connection budget (§10.1–
@@ -200,6 +205,10 @@ pub async fn download(
     on_event: &(dyn Fn(DownloadEvent) + Send + Sync),
     stop: &watch::Receiver<bool>,
 ) -> Result<Downloaded, DownloadError> {
+    let hold = match &req.hold {
+        Some(h) => h.clone(),
+        None => PartHold::acquire(&req.part).await,
+    };
     let mut resets = 0;
     let mut force = None;
     let mut ticket = None;
@@ -218,9 +227,9 @@ pub async fn download(
                 .budget
                 .register(started_at, host_key(&info.effective_url))
         });
-        let (file, journal) = prepare(req, &info, force.take(), on_event).await?;
+        let (file, journal) = prepare(req, &hold, &info, force.take(), on_event).await?;
         let fetched = fetch(
-            req, client, config, shared, ticket, &info, file, journal, on_event, stop,
+            req, client, config, shared, ticket, &info, file, journal, &hold, on_event, stop,
         )
         .await;
         ticket.release_all();
@@ -248,11 +257,12 @@ struct Files {
 /// Opens the journal and part file to resume, or discards both and starts
 /// fresh, emitting `Resumed` or `Reset` accordingly. The file work (opens,
 /// replay, preallocation, fsyncs) runs off the async workers, in the same
-/// order. If this future is dropped, that work still finishes: it leaves
-/// what a crash at the same point would (§5.4), and the next run's waits
-/// for it ([`Preparing`]).
+/// order. If this future is dropped, that work still finishes, holding
+/// `hold` until it has: it leaves what a crash at the same point would
+/// (§5.4), and a rerun on the same files waits for it.
 async fn prepare(
     req: &Request,
+    hold: &PartHold,
     info: &ProbeInfo,
     force: Option<ResetReason>,
     on_event: &(dyn Fn(DownloadEvent) + Send + Sync),
@@ -262,11 +272,13 @@ async fn prepare(
         part: req.part.clone(),
         sidecar: req.sidecar.clone(),
     };
-    let info = info.clone();
-    let (file, journal, prepared) =
-        tokio::task::spawn_blocking(move || prepare_files(&files, &info, force))
-            .await
-            .map_err(io::Error::other)??;
+    let (info, hold) = (info.clone(), hold.clone());
+    let (file, journal, prepared) = tokio::task::spawn_blocking(move || {
+        let _hold = hold;
+        prepare_files(&files, &info, force)
+    })
+    .await
+    .map_err(io::Error::other)??;
     match prepared {
         Prepared::Resumed => on_event(DownloadEvent::Resumed {
             committed: journal.committed().len(),
@@ -286,43 +298,12 @@ enum Prepared {
     Fresh(Option<ResetReason>),
 }
 
-/// Part files a [`prepare`] is working on in this process.
-static PREPARING: (Mutex<Vec<PathBuf>>, Condvar) = (Mutex::new(Vec::new()), Condvar::new());
-
-/// Holds a part file for one [`prepare_files`]. A dropped `prepare`'s
-/// thread keeps going; the next run's waits for it instead of removing or
-/// creating files in between its steps.
-struct Preparing<'a>(&'a Path);
-
-impl<'a> Preparing<'a> {
-    fn hold(part: &'a Path) -> Self {
-        let (busy, freed) = &PREPARING;
-        let mut b = busy.lock().unwrap_or_else(|e| e.into_inner());
-        while b.iter().any(|p| p == part) {
-            b = freed.wait(b).unwrap_or_else(|e| e.into_inner());
-        }
-        b.push(part.to_owned());
-        Self(part)
-    }
-}
-
-impl Drop for Preparing<'_> {
-    fn drop(&mut self) {
-        let (busy, freed) = &PREPARING;
-        busy.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|p| p != self.0);
-        freed.notify_all();
-    }
-}
-
 /// [`prepare`]'s blocking part.
 fn prepare_files(
     f: &Files,
     info: &ProbeInfo,
     force: Option<ResetReason>,
 ) -> Result<(File, Journal, Prepared), DownloadError> {
-    let _held = Preparing::hold(&f.part);
     let reason = match force {
         Some(reason) => Some(reason),
         None => match resumable_state(f, info)? {
@@ -330,6 +311,8 @@ fn prepare_files(
             Err(reason) => reason,
         },
     };
+    #[cfg(test)]
+    hold::park::at("prepare", &f.part);
     // Sidecar first: a crash in between leaves a part without a sidecar,
     // which is discarded on the next start (§5.4), never trusted.
     remove_if_exists(&f.sidecar)?;
@@ -414,6 +397,7 @@ async fn fetch(
     info: &ProbeInfo,
     file: File,
     journal: Journal,
+    hold: &PartHold,
     on_event: &(dyn Fn(DownloadEvent) + Send + Sync),
     stop: &watch::Receiver<bool>,
 ) -> Result<Downloaded, Stop> {
@@ -460,7 +444,10 @@ async fn fetch(
     let rc = &config.ramp;
     let limit = ramp::connection_limit(total, can_range, req.connections, rc, link);
     ticket.set_limit(limit);
-    let (handle, done) = actor::spawn(Writer::new(file, journal, config.writer))?;
+    // A dropped run's writer still makes its final commit; until then the
+    // files are its.
+    let writer = Writer::new(file, journal, config.writer);
+    let (handle, done) = actor::spawn_holding(writer, hold.clone())?;
 
     // Shared with every connection's events.
     let received = AtomicU64::new(0);
