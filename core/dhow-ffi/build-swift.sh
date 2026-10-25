@@ -50,7 +50,8 @@ staticlib() { # <target> | ""  (host, dev profile)
         (cd "$core" && cargo rustc -p dhow-ffi --lib --crate-type staticlib --target "$1" --release)
     fi
 }
-rel() { echo "$core/target/$1/release/libdhow_ffi.a"; }
+# `CARGO_TARGET_DIR` (make-dmg.sh gives the release its own) or the default.
+rel() { echo "${CARGO_TARGET_DIR:-$core/target}/$1/release/libdhow_ffi.a"; }
 
 # Swift sources, and the C header and module map in $build/gen/include. In
 # the workspace: the generator reads uniffi.toml through `cargo metadata`.

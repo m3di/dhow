@@ -42,7 +42,23 @@ All shells sit on `dhow-core`, a Rust library that owns downloading, queuing, sc
 
 ## Status
 
-Pre-alpha. The engine and CLI come first; see `docs/ROADMAP.md`. Done so far (M0–M3): bulletproof single and multi-connection downloads (journal, resume, kill -9 safe), the connection budget and ramp-up, queues, schedules, speed limits, speed history; categories and a storage breakdown, auto-grouping of related files, network and proxy awareness (system, direct or custom proxy), moved-file tracking hooks, and persistent settings. No GUI yet.
+Pre-alpha. The engine and CLI come first; see `docs/ROADMAP.md`. Done so far (M0–M3): bulletproof single and multi-connection downloads (journal, resume, kill -9 safe), the connection budget and ramp-up, queues, schedules, speed limits, speed history; categories and a storage breakdown, auto-grouping of related files, network and proxy awareness (system, direct or custom proxy), moved-file tracking hooks, and persistent settings. M4 adds the first native app, for macOS (`shells/macos`); the other shells come later.
+
+### Install on macOS
+
+There's no signed release yet. Build the DMG on a Mac with Command Line Tools (`xcode-select --install`), Rust (`rustup target add aarch64-apple-darwin x86_64-apple-darwin`) and macOS 14 or later:
+
+```sh
+shells/macos/make-dmg.sh          # writes shells/macos/build/Dhow-<version>.dmg
+```
+
+It builds a universal release, signs it ad hoc, and checks the image (signature, `hdiutil verify`, a launch from the mounted volume). Open the DMG and drag Dhow to Applications. Because the app isn't notarized, Gatekeeper won't open it with a double-click the first time: right-click Dhow in Applications, choose Open, then Open again. Or clear the quarantine flag once:
+
+```sh
+xattr -d com.apple.quarantine /Applications/Dhow.app
+```
+
+With a Developer ID, `make-dmg.sh --sign "Developer ID Application: …" --notarize <keychain-profile>` signs with the hardened runtime, notarizes and staples instead (`xcrun notarytool store-credentials` creates the profile). The app and the DMG carry `LICENSE` and `CREDITS.txt` (UniFFI under MPL-2.0, and every Rust crate linked).
 
 ### Try the CLI
 
