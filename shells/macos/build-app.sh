@@ -5,8 +5,14 @@
 # scope": no Developer ID yet). Notifications and the Dock need a real
 # bundle, which `swift run` isn't.
 #
-#   build-app.sh           release build
-#   build-app.sh --debug   debug build, quicker
+#   build-app.sh              release build, this Mac's architecture
+#   build-app.sh --universal  release build for arm64 and x86_64 (the DMG's,
+#                             needs build-swift.sh's universal DhowCore)
+#   build-app.sh --debug      debug build, quicker
+#
+# The license and the third-party credits (CREDITS.txt, from cargo
+# metadata) go in Contents/Resources: the DMG must point to UniFFI's
+# source (ARCHITECTURE §9).
 #
 # Writes shells/macos/build/Dhow.app. Needs the DhowCore package built
 # first: core/dhow-ffi/build-swift.sh (or --debug).
@@ -17,10 +23,12 @@ root="$(cd "$here/../.." && pwd)"
 cd "$here"
 
 config=release
+universal=false
 case "${1:-}" in
     "") ;;
     --debug) config=debug ;;
-    *) echo "usage: $0 [--debug]" >&2; exit 2 ;;
+    --universal) universal=true ;;
+    *) echo "usage: $0 [--debug | --universal]" >&2; exit 2 ;;
 esac
 
 if [ ! -d ../apple/DhowCore/DhowCoreFFI.xcframework ]; then
@@ -28,18 +36,37 @@ if [ ! -d ../apple/DhowCore/DhowCoreFFI.xcframework ]; then
     exit 1
 fi
 
-swift build -c "$config" --product Dhow
-bin="$(swift build -c "$config" --show-bin-path)"
+if $universal; then
+    # One build per architecture (Command Line Tools have no multi-arch
+    # SwiftPM build), then one executable.
+    bins=()
+    for arch in arm64 x86_64; do
+        triple="$arch-apple-macosx14.0"
+        swift build -c release --product Dhow --triple "$triple"
+        bins+=("$(swift build -c release --triple "$triple" --show-bin-path)")
+    done
+    bin="${bins[0]}"
+    mkdir -p "$here/build"
+    lipo -create "${bins[0]}/Dhow" "${bins[1]}/Dhow" -output "$here/build/Dhow-universal"
+    exe="$here/build/Dhow-universal"
+else
+    swift build -c "$config" --product Dhow
+    bin="$(swift build -c "$config" --show-bin-path)"
+    exe="$bin/Dhow"
+fi
+# The version's one source: the workspace's Cargo.toml.
 version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/core/Cargo.toml" | head -1)"
 
 out="$here/build"
 app="$out/Dhow.app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "$bin/Dhow" "$app/Contents/MacOS/Dhow"
+cp "$exe" "$app/Contents/MacOS/Dhow"
 cp -R "$bin/Dhow_Dhow.bundle" "$app/Contents/Resources/"
 # What macOS reads from the app's own bundle: the Services menu's title.
 cp -R Bundle/*.lproj "$app/Contents/Resources/"
+cp "$root/LICENSE" "$app/Contents/Resources/LICENSE"
+python3 "$here/credits.py" "$root/core" > "$app/Contents/Resources/CREDITS.txt"
 
 # The icon, redrawn only when its script changes.
 icns="$out/Dhow.icns"

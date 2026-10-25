@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Used by make-dmg.sh -sign (Developer ID, hardened runtime). The
+     hardened runtime blocks Apple events unless asked for: a queue's
+     "When the queue is done: Shut down" sends one to loginwindow. -->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.automation.apple-events</key>
+	<true/>
+</dict>
+</plist>
