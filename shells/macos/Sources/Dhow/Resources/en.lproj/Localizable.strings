@@ -1,0 +1,143 @@
+/* Dhow for macOS: English. Every user-visible string is here (or, for
+   plurals, in Localizable.stringsdict); translations come as packs over
+   the same keys. Copy and tone: UI-GUIDELINES §9. */
+
+"app.name" = "Dhow";
+
+/* Toolbar */
+"toolbar.add" = "Add";
+"toolbar.addHelp" = "Add a download";
+"toolbar.resumeAll" = "Resume All";
+"toolbar.pauseAll" = "Pause All";
+"toolbar.speed %@" = "Total speed: %@";
+"search.prompt" = "Search downloads";
+
+/* Sidebar */
+"filter.all" = "All";
+"filter.active" = "Active";
+"filter.queued" = "Queued";
+"filter.done" = "Done";
+"filter.failed" = "Failed";
+"sidebar.queues" = "Queues";
+"sidebar.categories" = "Categories";
+"queue.default" = "Default";
+"category.video" = "Video";
+"category.audio" = "Audio";
+"category.image" = "Images";
+"category.document" = "Documents";
+"category.archive" = "Archives";
+"category.software" = "Software";
+"category.code" = "Code";
+"category.data" = "Data";
+"category.other" = "Other";
+
+/* List */
+"column.name" = "Name";
+"column.status" = "Status";
+"column.progress" = "Progress";
+"column.size" = "Size";
+"column.speed" = "Speed";
+"column.added" = "Added";
+"size.unknown" = "—";
+/* A byte count, e.g. "4.1 MB". */
+"format.speed %@" = "%@/s";
+/* A group row: its name, then members done of members. */
+"group.name %@ %lld %lld" = "%1$@ (%2$lld of %3$lld)";
+"empty.none" = "No downloads yet.";
+"empty.filter" = "Nothing here.";
+"empty.search" = "No downloads match.";
+"button.addDownload" = "Add Download";
+
+/* Row status: one short phrase. */
+"status.downloading" = "Downloading";
+/* A duration, e.g. "3 min". */
+"status.left %@" = "%@ left";
+"status.reconnecting %lld" = "Reconnecting (attempt %lld)";
+"status.limitedToZero" = "Held by its speed limit";
+"status.finishing" = "Finishing";
+"status.waitingConnection" = "Waiting for a free connection";
+"status.queued" = "Queued";
+/* A time, e.g. "02:00" or "Tue 02:00". */
+"status.scheduled %@" = "Scheduled for %@";
+"status.notScheduled" = "Not scheduled";
+"status.queueStopped" = "Queue stopped";
+"status.stoppedUntil %@" = "Queue stopped until %@";
+"status.paused" = "Paused";
+"status.cancelled" = "Cancelled";
+"status.done" = "Done";
+
+/* Why a download failed, in a few words. */
+"fail.transient" = "Lost the connection";
+"fail.http %lld" = "Server error %lld";
+"fail.tooManyRedirects" = "Too many redirects";
+"fail.invalidRequest" = "The server refused the request";
+"fail.noSpace" = "The disk is full";
+"fail.digestMismatch" = "The file didn't match its checksum";
+"fail.serverSentExtraData" = "The server sent more than the file";
+"fail.serverKeptChanging" = "The file kept changing on the server";
+"fail.io" = "Couldn't write the file";
+
+/* Context menu */
+"menu.pause" = "Pause";
+"menu.resume" = "Resume";
+"menu.retry" = "Retry";
+"menu.startNow" = "Start Now";
+"menu.open" = "Open";
+"menu.showInFinder" = "Show in Finder";
+"menu.copyLink" = "Copy Link";
+"menu.copyLinks" = "Copy Links";
+"menu.moveToQueue" = "Move to Queue";
+"menu.speedLimit" = "Speed Limit";
+"menu.noLimit" = "No Limit";
+"menu.cancel" = "Cancel Download";
+"menu.remove" = "Remove";
+"menu.removeAndDelete" = "Remove and Delete File";
+"confirm.deleteTitle" = "Remove the download and delete its file?";
+"confirm.deleteMessage" = "The file is deleted, not moved to the Trash.";
+
+/* Add dialog */
+"add.url" = "URL";
+"add.filename" = "Name";
+"add.files" = "Files";
+"add.size" = "Size";
+"add.notResumable" = "This server doesn't support pausing. If the download is interrupted it will start over.";
+"add.blindNote" = "You can still download it; Dhow learns the details once it starts.";
+"add.destination" = "Save to";
+"add.choose" = "Choose…";
+"add.queue" = "Queue";
+"add.more" = "More";
+"add.connections %lld" = "Connections: %lld";
+"add.speedLimit" = "Speed limit (KB/s)";
+"add.noLimit" = "None";
+"add.start" = "Start";
+"add.startNow" = "Now";
+"add.startQueued" = "Add to Queue";
+"add.startPaused" = "Paused";
+"add.headers" = "Headers (one “Name: value” per line)";
+"add.headersInvalid" = "Each line needs a name, a colon, then the value.";
+"add.download" = "Download";
+"add.downloadAnyway" = "Download Anyway";
+"button.cancel" = "Cancel";
+"button.ok" = "OK";
+
+/* Why the probe failed: the cause, then the next step. */
+"probe.unsupportedScheme" = "Dhow downloads http and https links only.";
+"probe.invalidHeader" = "One of the headers isn't valid. Check its name and value.";
+"probe.status %lld" = "The server answered with error %lld. Check the link.";
+"probe.tooManyRedirects" = "The link redirects too many times.";
+"probe.timeout" = "The server didn't answer in time.";
+"probe.connect" = "Couldn't reach the server. Check the link and your connection.";
+"probe.network" = "The connection to the server broke off.";
+
+/* Errors */
+"alert.title" = "Dhow couldn't do that";
+"error.unexpected" = "Something unexpected went wrong. The log has the details.";
+"error.notFound" = "That download is gone. It may have been removed from the command line.";
+"error.invalidName" = "That name can't be used for a file. Try another.";
+"error.invalidArgument" = "That link isn't a valid address.";
+"error.invalidQueue" = "That queue can't be changed that way.";
+"error.invalidSetting" = "That setting isn't valid.";
+"error.databaseTooNew" = "The downloads list was saved by a newer version of Dhow. Update Dhow to open it.";
+"error.storage" = "Dhow couldn't read or write its files. Check the disk has space and try again.";
+"error.runningElsewhere" = "This download is running in the dhow command-line tool. Stop it there first.";
+"error.shutDown" = "Dhow is quitting.";

@@ -1,0 +1,4 @@
+# SwiftPM, and build-app.sh's output
+/.build/
+/.swiftpm/
+/build/

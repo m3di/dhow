@@ -160,7 +160,7 @@ Items the core owns are `Settings` fields, changed with one `SetSettings` patch 
 
 Short, calm, specific. "Reconnecting (attempt 3)" not "Something went wrong". Never blame the user. Errors name the cause and the next step: "The file on the server changed. Dhow started the download over to make sure you get a complete file."
 
-Persian (fa-IR) localization ships with v1 alongside English; RTL layouts must work on every platform from the first release. Use platform localization systems (`.xcstrings`, `.resw`, gettext `.po`, Android `strings.xml`).
+v1 ships in English, every string behind a localization key; translations, Persian (fa-IR) and RTL first, come later as language packs over those keys (DECISIONS 2026-10-25). Use platform localization systems (`.xcstrings`, `.resw`, gettext `.po`, Android `strings.xml`); the macOS shell uses `.strings` and `.stringsdict` while it builds without Xcode, which alone compiles `.xcstrings`.
 
 ## 10. What shells must not do
 
