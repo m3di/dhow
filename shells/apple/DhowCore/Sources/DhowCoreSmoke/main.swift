@@ -90,7 +90,7 @@ do {
 }
 do {
     // The add dialog's preview (UI-GUIDELINES §4).
-    _ = try await engine.probe(url: "http://127.0.0.1:1/x", headers: [])
+    _ = try await engine.probe(url: "http://127.0.0.1:1/x")
     check(false, "unreachable server probed")
 } catch DhowError.Probe(let reason) {
     check(reason == .connect, "probe failure \(reason)")

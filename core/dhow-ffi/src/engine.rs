@@ -153,12 +153,20 @@ impl Engine {
     }
 
     /// What `add` would learn (ENGINE-SPEC §2), for the add dialog;
-    /// records nothing. Fails with `Probe`, after which `add` with `blind`
-    /// can still add it.
-    pub async fn probe(&self, url: String, headers: Vec<Header>) -> Result<ProbeResult, DhowError> {
+    /// records nothing. `target_fs` as the `add` will have it, so the name
+    /// matches. Fails with `Probe`, after which `add` with `blind` can
+    /// still add it.
+    #[uniffi::method(default(headers = [], target_fs = None))]
+    pub async fn probe(
+        &self,
+        url: String,
+        headers: Vec<Header>,
+        target_fs: Option<TargetFs>,
+    ) -> Result<ProbeResult, DhowError> {
         let url = parse_url(&url)?;
+        let (headers, fs) = (core_headers(headers), core_fs(target_fs));
         let inner = self.inner.clone();
-        self.spawn(async move { Ok(inner.core.probe(&url, &core_headers(headers)).await?.into()) })
+        self.spawn(async move { Ok(inner.core.probe(&url, &headers, fs).await?.into()) })
             .await
     }
 
@@ -517,27 +525,44 @@ impl Inner {
 
     /// To the shell, with the `QueueChanged` an event implies: a download
     /// added, removed, or moved between queued, running, finished and the
-    /// rest. A download already announced isn't again (see `list`).
+    /// rest. A download already announced isn't again (see `list`); one
+    /// the shell hasn't heard of (another process added it) is announced
+    /// before its first event.
     fn publish(&self, e: EngineEvent) {
-        let queue = match &e {
-            EngineEvent::DownloadAdded { snapshot } => {
-                if !self.known().insert(snapshot.id.clone()) {
-                    return;
+        let queue = {
+            // Held while pushing: announcements keep their order.
+            let mut known = self.known();
+            let queue = match &e {
+                EngineEvent::DownloadAdded { snapshot } => {
+                    if !known.insert(snapshot.id.clone()) {
+                        return;
+                    }
+                    Some(self.core.queue(&snapshot.queue_id))
                 }
-                Some(self.core.queue(&snapshot.queue_id))
-            }
-            EngineEvent::Removed { id, queue_id } => {
-                if !self.known().remove(id) {
-                    return;
+                EngineEvent::Removed { id, queue_id } => {
+                    if !known.remove(id) {
+                        return;
+                    }
+                    Some(self.core.queue(queue_id))
                 }
-                Some(self.core.queue(queue_id))
+                EngineEvent::StateChanged { id, from, to, .. } => {
+                    (counted(*from) != counted(*to)).then(|| self.core.queue_of(id))
+                }
+                _ => None,
+            };
+            let event: Event = e.into();
+            if let Some(id) = event.download()
+                && !known.contains(id)
+                && let Ok(snap) = self.core.row(id)
+            {
+                known.insert(snap.id.clone());
+                self.sink.push(Event::DownloadAdded {
+                    snapshot: snap.into(),
+                });
             }
-            EngineEvent::StateChanged { id, from, to, .. } if counted(*from) != counted(*to) => {
-                Some(self.core.queue_of(id))
-            }
-            _ => None,
+            self.sink.push(event);
+            queue
         };
-        self.sink.push(e.into());
         match queue {
             Some(Ok(q)) => {
                 self.announce(q);
@@ -568,11 +593,14 @@ impl Inner {
     /// Every download, announcing those another process added or removed
     /// since the last look (their queues' counts changed too).
     fn list(&self) -> Result<Vec<dhow_core::engine::Snapshot>, DhowError> {
-        let (rows, added, removed) = {
+        let rows = {
             // Held throughout, so an `add` or `remove` here announces
-            // either through its event or through this, not both.
+            // either through its event or through this, not both, and
+            // what is announced here comes before any later event of it.
             let mut known = self.known();
-            let rows = self.core.list(&self.emit())?;
+            // What listing emits (`Renamed`, `GroupChanged`) goes straight
+            // out: `publish` would wait for `known`.
+            let rows = self.core.list(&|e| self.sink.push(e.into()))?;
             let ids: HashSet<&str> = rows.iter().map(|s| s.id.as_str()).collect();
             let removed: Vec<String> = known
                 .iter()
@@ -587,17 +615,17 @@ impl Inner {
                 .filter(|s| known.insert(s.id.clone()))
                 .cloned()
                 .collect();
-            (rows, added, removed)
+            if added.is_empty() && removed.is_empty() {
+                return Ok(rows);
+            }
+            for s in added {
+                self.sink.push(Event::DownloadAdded { snapshot: s.into() });
+            }
+            for id in removed {
+                self.sink.push(Event::Removed { id });
+            }
+            rows
         };
-        if added.is_empty() && removed.is_empty() {
-            return Ok(rows);
-        }
-        for s in added {
-            self.sink.push(Event::DownloadAdded { snapshot: s.into() });
-        }
-        for id in removed {
-            self.sink.push(Event::Removed { id });
-        }
         for q in self.core.list_queues()? {
             self.announce(q);
         }

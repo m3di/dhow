@@ -1797,6 +1797,36 @@ mod token_tests {
         assert_eq!(*tracker.files.lock().unwrap(), [added.final_path]);
     }
 
+    /// `remove(delete_files)` deletes the download's file, found by its
+    /// token, not another one put at its old path; a file the adapter
+    /// reports gone deletes nothing; an adapter that can't tell removes
+    /// nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remove_deletes_the_file_its_token_finds() {
+        let server = TestServer::start().unwrap();
+        let (fx, tracker) = tracked();
+        let a = fx.completed(&server, "a.bin").await;
+        let moved = fx.downloads.join("moved.bin");
+        tracker.move_file(&a.final_path, &moved);
+        std::fs::write(&a.final_path, b"the user's").unwrap();
+        fx.engine.remove(&a.id, true, &|_| {}).await.unwrap();
+        assert!(!moved.exists(), "the download's file is deleted");
+        assert_eq!(std::fs::read(&a.final_path).unwrap(), b"the user's");
+
+        let b = fx.completed(&server, "b.bin").await;
+        tracker.fail.store(true, Ordering::SeqCst);
+        assert!(fx.engine.remove(&b.id, true, &|_| {}).await.is_err());
+        assert!(b.final_path.exists());
+        assert!(fx.engine.get(&b.id, &|_| {}).is_ok(), "nothing removed");
+        tracker.fail.store(false, Ordering::SeqCst);
+        // Gone for good (in the Trash): only the row goes.
+        tracker.move_file(&b.final_path, &fx.downloads.join("b-elsewhere"));
+        std::fs::remove_file(fx.downloads.join("b-elsewhere")).unwrap();
+        std::fs::write(&b.final_path, b"another").unwrap();
+        fx.engine.remove(&b.id, true, &|_| {}).await.unwrap();
+        assert_eq!(std::fs::read(&b.final_path).unwrap(), b"another");
+    }
+
     /// Linux and Android: no tokens, and a moved file is just missing.
     #[tokio::test(flavor = "multi_thread")]
     async fn without_tokens_a_moved_file_is_missing() {
@@ -2085,7 +2115,7 @@ mod shell_tests {
         let fx = Fx::new();
         let url = server.url(&format!("/blob/5000?{}", disposition("clip.mkv")));
         let url = Url::parse(&url).unwrap();
-        let p = fx.engine.probe(&url, &[]).await.unwrap();
+        let p = fx.engine.probe(&url, &[], TargetFs::Posix).await.unwrap();
         assert_eq!(p.info.suggested_name, "clip.mkv");
         assert_eq!(p.info.total_size, Some(5000));
         assert_eq!(p.info.resumable, Resumable::Yes);
@@ -2096,12 +2126,12 @@ mod shell_tests {
             ..Default::default()
         };
         fx.engine.set_settings(patch, &|_| {}).unwrap();
-        let p = fx.engine.probe(&url, &[]).await.unwrap();
+        let p = fx.engine.probe(&url, &[], TargetFs::Posix).await.unwrap();
         assert_eq!(p.info.suggested_name, "5000");
         assert!(fx.engine.list(&|_| {}).unwrap().is_empty());
         let nobody = Url::parse("http://127.0.0.1:1/x").unwrap();
         assert!(matches!(
-            fx.engine.probe(&nobody, &[]).await,
+            fx.engine.probe(&nobody, &[], TargetFs::Posix).await,
             Err(EngineError::Probe(ProbeError::Connect))
         ));
     }
@@ -2220,6 +2250,29 @@ mod shell_tests {
         assert_eq!(fx.files(), ["Show.Part2.mkv"]);
     }
 
+    /// Without tokens, a file of another size at the final path isn't the
+    /// download's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remove_without_tokens_deletes_only_a_file_of_its_size() {
+        let server = TestServer::start().unwrap();
+        let fx = Fx::new();
+        let add = async |path: &str| {
+            let added = fx
+                .engine
+                .add(fx.request(&server, path), &|_| {})
+                .await
+                .unwrap();
+            fx.run(&added.id).await
+        };
+        let a = add("/blob/1000?seed=1").await;
+        std::fs::write(&a.final_path, b"replaced").unwrap();
+        fx.engine.remove(&a.id, true, &|_| {}).await.unwrap();
+        assert_eq!(std::fs::read(&a.final_path).unwrap(), b"replaced");
+        let b = add("/blob/2000?seed=2").await;
+        fx.engine.remove(&b.id, true, &|_| {}).await.unwrap();
+        assert!(!b.final_path.exists());
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn retry_requeues_only_a_failed_download() {
         let server = TestServer::start().unwrap();
@@ -2293,32 +2346,65 @@ mod shell_tests {
             .unwrap();
     }
 
+    async fn map_where(
+        maps: &mut watch::Receiver<RangeMap>,
+        total: u64,
+        pred: impl Fn(&RangeMap) -> bool,
+    ) -> RangeMap {
+        let found = tokio::time::timeout(Duration::from_secs(60), maps.wait_for(pred))
+            .await
+            .map(|m| m.unwrap().clone());
+        let Ok(m) = found else {
+            panic!("no such map; the last: {:?}", *maps.borrow());
+        };
+        assert_partition(&m, total);
+        m
+    }
+
+    /// Bytes no connection has received yet.
+    fn left(m: &RangeMap) -> u64 {
+        let pending: u64 = m.pending.iter().map(|r| r.end - r.start).sum();
+        pending + m.connections.iter().map(|c| c.end - c.at).sum::<u64>()
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn set_connections_applies_to_a_running_download() {
         let server = TestServer::start().unwrap();
         let fx = Arc::new(Fx::with(live_config()));
-        let mut req = fx.request(&server, "/blob/6000000?seed=5&throttle=500000");
+        let total = 24_000_000;
+        let mut req = fx.request(&server, "/blob/24000000?seed=5&throttle=1000000");
         req.connections = Some(1);
         let added = fx.engine.add(req, &|_| {}).await.unwrap();
-        let mut run = spawn_run(&fx, &added.id, |_| {});
+        fx.engine.watch_ranges(&added.id, true, &|_| {}).unwrap();
+        let (map_tx, mut maps) = watch::channel(RangeMap::default());
+        let mut run = spawn_run(&fx, &added.id, move |e: EngineEvent| {
+            if let EngineEvent::RangeMap { map, .. } = e {
+                map_tx.send_replace(map);
+            }
+        });
         reach(&mut run.conns, 1).await;
 
         let up = fx.engine.set_connections(&added.id, Some(4)).unwrap();
         assert_eq!(up.connections, Some(4));
         reach(&mut run.conns, 4).await;
+        map_where(&mut maps, total, |m| m.connections.len() == 4).await;
+        // Lowered: at once, not as chunks end (they would all have ended,
+        // so with little left).
         fx.engine.set_connections(&added.id, Some(1)).unwrap();
-        reach(&mut run.conns, 1).await;
-        run.stop.send_replace(true);
-        assert_eq!(run.task.await.unwrap().state, State::Paused);
-        assert_eq!(fx.engine.running_controls(), 0, "gone with its run");
+        let one = map_where(&mut maps, total, |m| {
+            m.connections.len() == 1 && left(m) > total / 2
+        })
+        .await;
+        assert!(!one.pending.is_empty(), "the rest went back: {one:?}");
 
         // What the stopped connections had is intact.
         fx.engine.set_connections(&added.id, None).unwrap();
-        let done = fx.run(&added.id).await;
+        let done = run.task.await.unwrap();
         assert_eq!(done.state, State::Completed);
+        assert_eq!(fx.engine.running_controls(), 0, "gone with its run");
         assert_eq!(
             blake3::hash(&std::fs::read(&done.final_path).unwrap()),
-            blob::digest(5, 6_000_000)
+            blob::digest(5, total)
         );
         assert!(matches!(
             fx.engine.set_connections("nope", Some(2)),

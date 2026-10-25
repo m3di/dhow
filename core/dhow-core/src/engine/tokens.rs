@@ -6,7 +6,7 @@
 //! thread, and only for a completed download whose file is missing; no
 //! engine lock is held while it runs.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::params;
 
@@ -35,6 +35,37 @@ impl Engine {
         );
         if let Err(e) = stored {
             tracing::warn!(id, error = %e, "could not store the file token");
+        }
+    }
+
+    /// The file of a completed download, for `remove` to delete: with a
+    /// token, the file it resolves to, wherever that is (a file put at
+    /// `final_path` since isn't the download's); none if the adapter says
+    /// it is gone. Without a token (the platform has none): `final_path`,
+    /// if its length is the download's size. An adapter that can't tell
+    /// is an error, so nothing is removed.
+    pub(super) fn own_file(&self, snap: &Snapshot) -> Result<Option<PathBuf>, EngineError> {
+        let token: Option<Vec<u8>> = self.db().conn().query_row(
+            "SELECT file_token FROM downloads WHERE id = ?1",
+            [&snap.id],
+            |r| r.get(0),
+        )?;
+        let by_size = || {
+            let len = std::fs::metadata(&snap.final_path).ok()?.len();
+            snap.total_size
+                .is_none_or(|t| t == len)
+                .then(|| snap.final_path.clone())
+        };
+        let Some(token) = token else {
+            return Ok(by_size());
+        };
+        match self.platform.file_token_resolve(&FileToken(token)) {
+            Ok(Some(r)) => Ok(r.path.is_file().then_some(r.path)),
+            Ok(None) => Ok(None),
+            Err(AdapterError::Unsupported) => Ok(by_size()),
+            Err(AdapterError::Failed(e)) => Err(EngineError::Io(std::io::Error::other(format!(
+                "can't tell which file is the download's: {e}"
+            )))),
         }
     }
 

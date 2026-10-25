@@ -107,7 +107,7 @@ n = 1 if resumable == No or total_size == None
 
 Also capped by a recent **link saturation** (§4.4): if this process saw throughput stop growing at `k` connections in the last `settings.saturation_ttl` (default 60 s), `n <= k`.
 
-The user override can change while the download runs (`SetConnections`): `n` is computed again. Above the connections open, ramp-up resumes (afresh if it had ended); below, the newest connections stop at once, their unfetched rest going back to pending work as when one is given up for a newcomer (§10.3).
+The user override can change while the download runs (`SetConnections`): `n` is computed again (1 once downgraded, §2.3, §9 Protocol). A higher `n` than before, above the connections open, resumes ramp-up (afresh if it had ended); otherwise a ramp-up that ended (saturated, nothing to split) stays ended, and a download not ramping claims nothing (§10.3). Below the connections open, the newest stop at once, their unfetched rest going back to pending work as when one is given up for a newcomer, and no connection that ends is replaced while the download is over its `n`; one still verifying its overlap (I5) stops once it has.
 
 ### 4.2 Initial plan
 

@@ -615,6 +615,16 @@ async fn fetch(
                 Err(WriterGone) => break 'run Err(None),
             }
         }
+        // Above a lowered limit (`Tuning`): the newest stop where they are,
+        // their rest is pending. One still verifying its overlap goes on a
+        // later pass, once it has.
+        while running.len() > plan.shedding.len() + limit as usize {
+            match plan.shed(&handle).await {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(WriterGone) => break 'run Err(None),
+            }
+        }
         let single_now = single.load(Ordering::Relaxed);
         let can_ramp = !ramp.done && !single_now && open < limit;
         learner.set(can_ramp && ramp.probing());
@@ -637,8 +647,9 @@ async fn fetch(
                         content_length_seen = finished.content_length_seen;
                         // Refill the slot: pending ranges first, then steal
                         // from the slowest (§4.3). One connection at a time
-                        // once downgraded.
-                        let refill = !single.load(Ordering::Relaxed) || running.is_empty();
+                        // once downgraded; none above a lowered limit.
+                        let refill = (!single.load(Ordering::Relaxed) || running.is_empty())
+                            && running.len() - plan.shedding.len() < limit as usize;
                         let work = if refill {
                             match plan.next_work(&handle, cursor.rate(), rc).await {
                                 Ok(w) => w,
@@ -727,19 +738,24 @@ async fn fetch(
                     next_map = Instant::now();
                 }
                 Tuned::Connections(n) => {
-                    limit = ramp::connection_limit(total, can_range, n, rc, link);
+                    let before = limit;
+                    // Downgraded (§2.3, §9 Protocol): one, whatever is asked.
+                    limit = match single_now {
+                        true => 1,
+                        false => ramp::connection_limit(total, can_range, n, rc, link),
+                    };
                     ticket.set_limit(limit);
-                    if ramp.done && open < limit && !single_now {
+                    // Ramp-up resumes only for a higher limit; saturation or
+                    // nothing left to split stand otherwise.
+                    if ramp.done && limit > before && open < limit {
                         ramp = Ramp::new(Instant::now(), rc);
                     }
-                    // Fewer: the newest stop now, their rest is pending.
-                    while running.len() > plan.shedding.len() + limit as usize {
-                        match plan.shed(&handle).await {
-                            Ok(true) => {}
-                            Ok(false) => break,
-                            Err(WriterGone) => break 'run Err(None),
-                        }
+                    if ramp.done || open >= limit {
+                        // Not ramping: no claim ahead of younger downloads
+                        // (§10.3).
+                        ticket.stop_wanting();
                     }
+                    // Fewer: the pass sheds the newest.
                 }
             },
             // A newcomer may need one of ours.
@@ -797,7 +813,9 @@ async fn tuned(tuning: &mut Option<Tuning>) -> Tuned {
     let Some(t) = tuning else {
         return std::future::pending().await;
     };
+    // Connections first: a later change of both is seen in that order.
     let changed = tokio::select! {
+        biased;
         r = t.connections.changed() => {
             r.map(|()| Tuned::Connections(*t.connections.borrow_and_update()))
         }
@@ -1192,5 +1210,79 @@ mod tests {
         assert!(fx.elder.await.unwrap_err().is_cancelled());
         assert!(fx.young.try_grow() && fx.young.try_grow() && fx.young.try_grow());
         drop(fx.armed);
+    }
+
+    /// Asked for more connections once downgraded to one (§2.3: `Unknown`
+    /// turned out not to range), a download stays at one and claims
+    /// nothing ahead of younger downloads (§10.3).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_downgraded_download_asked_for_more_claims_nothing() {
+        let shared = Arc::new(Shared::new(BudgetConfig {
+            global: 4,
+            per_host: 4,
+            min_for_new: 1,
+        }));
+        let server = TestServer::start().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (connections, connections_rx) = watch::channel(Some(4));
+        let (ranges, ranges_rx) = watch::channel(false);
+        let req = Request {
+            // No `Accept-Ranges`, and `Range` ignored.
+            url: Url::parse(&server.url("/blob/3000000?ranges=ignore&throttle=300000")).unwrap(),
+            headers: vec![],
+            part: dir.path().join("d.part"),
+            sidecar: dir.path().join("d.dhow"),
+            connections: Some(4),
+            started_at: Some(1),
+            limits: vec![],
+            hold: None,
+            blind: false,
+            tuning: Some(Tuning {
+                connections: connections_rx,
+                ranges: ranges_rx,
+            }),
+        };
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let (stop_tx, stop) = watch::channel(false);
+        let s = shared.clone();
+        let elder = tokio::spawn(async move {
+            let mut config = DownloadConfig::default();
+            config.probe.range_get = false;
+            config.ramp.min_chunk = 128 * 1024;
+            let on_event = move |e: DownloadEvent| {
+                let _ = tx.send(e);
+            };
+            let client = crate::http::client().unwrap();
+            download(&req, &client, &config, &s, &on_event, &stop).await
+        });
+        let mut until = async |what: &str, pred: &dyn Fn(&DownloadEvent) -> bool| {
+            let wait = async {
+                while let Some(e) = events.recv().await {
+                    if pred(&e) {
+                        return;
+                    }
+                }
+                panic!("events ended before {what}");
+            };
+            tokio::time::timeout(Duration::from_secs(30), wait)
+                .await
+                .unwrap_or_else(|_| panic!("no {what}"));
+        };
+        until("downgrade", &|e| {
+            matches!(e, DownloadEvent::Connection(ConnEvent::NotResumable))
+        })
+        .await;
+        let young = shared.budget.register(2, "young:80".into());
+        young.set_limit(4);
+        assert!(young.try_first());
+
+        connections.send_replace(Some(4));
+        // Seen after the connections (`tuned` is biased): a fence.
+        ranges.send_replace(true);
+        until("a map", &|e| matches!(e, DownloadEvent::Ranges(_))).await;
+        assert!(young.try_grow(), "the downgraded elder still claims");
+
+        stop_tx.send_replace(true);
+        assert!(matches!(elder.await.unwrap(), Err(DownloadError::Stopped)));
     }
 }

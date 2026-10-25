@@ -397,14 +397,20 @@ impl Engine {
         self.controls.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// `Probe` (§2): what `add` would learn, recording nothing.
-    pub async fn probe(&self, url: &Url, headers: &[Header]) -> Result<Probed, EngineError> {
+    /// `Probe` (§2): what `add` would learn, recording nothing; the name
+    /// sanitized for `fs` as `add` would (§3), without collisions.
+    pub async fn probe(
+        &self,
+        url: &Url,
+        headers: &[Header],
+        fs: TargetFs,
+    ) -> Result<Probed, EngineError> {
         let lease = self.lease(url).await?;
         let settings = self.settings()?;
         let options = settings.apply(self.config).probe;
         let mut info = probe::probe(&lease.client, url, headers, options).await?;
         drop(lease);
-        info.suggested_name = suggested_name(&info, url, &settings, TargetFs::host());
+        info.suggested_name = suggested_name(&info, url, &settings, fs);
         let category = naming::categorize(
             &info.suggested_name,
             info.content_type.as_deref(),
@@ -534,9 +540,10 @@ impl Engine {
     }
 
     /// Forgets a download that isn't running (ARCHITECTURE §3.1): its row,
-    /// ranges and speed samples. `delete_files` also deletes its file: the
-    /// final file if completed (found first if it moved, §6), else the part
-    /// file and sidecar; nothing on disk otherwise. Waits for a dropped
+    /// ranges and speed samples. `delete_files` also deletes its file: if
+    /// completed, the one its token resolves to, or without a token
+    /// `final_path` if it has the download's size (§6);
+    /// else the part file and sidecar. Nothing on disk otherwise. Waits for a dropped
     /// run's file work first; one whose rename already happened is
     /// completed (§8). `Removed`, then `GroupChanged` for members that left
     /// its group with it (§13.2).
@@ -554,7 +561,9 @@ impl Engine {
         }
         if delete_files {
             if snap.state == State::Completed {
-                remove_if_exists(&snap.final_path)?;
+                if let Some(file) = self.own_file(&snap)? {
+                    remove_if_exists(&file)?;
+                }
             } else {
                 // Sidecar first, as in prepare (§5.4).
                 remove_if_exists(&snap.sidecar_path())?;
@@ -622,6 +631,11 @@ impl Engine {
         }
         // Regrouping a moved one can change rows already read.
         if moved { self.rows() } else { Ok(rows) }
+    }
+
+    /// The download as stored: no moved file is looked for, no event.
+    pub fn row(&self, id: &str) -> Result<Snapshot, EngineError> {
+        self.stored(id)
     }
 
     /// Every download's id; nothing is looked up on disk.

@@ -66,18 +66,29 @@ fn probe_then_add_blind_when_it_fails() {
     let events = Arc::new(Recorder::default());
     let engine = open(&s.data(), events.clone(), None);
 
-    let ok = block(engine.probe(s.server.url("/blob/4000?seed=1"), vec![])).unwrap();
+    let ok = block(engine.probe(s.server.url("/blob/4000?seed=1"), vec![], None)).unwrap();
     assert_eq!(ok.suggested_name, "4000");
     assert_eq!(ok.total_size, Some(4000));
     assert_eq!(ok.resumable, Resumable::Yes);
     assert_eq!(ok.category, Category::Other);
     assert!(ok.etag.is_some());
+    // Named for the volume `add` will write to (§3).
+    let con = s
+        .server
+        .url("/blob/10?header=Content-Disposition%3A%20attachment%3B%20filename%3Dcon.txt");
+    let on = |fs| {
+        block(engine.probe(con.clone(), vec![], fs))
+            .unwrap()
+            .suggested_name
+    };
+    assert_eq!(on(Some(TargetFs::Posix)), "con.txt");
+    assert_eq!(on(Some(TargetFs::Windows)), "_con.txt");
 
     // Both probe requests refused, twice (here and at the run); the plain
     // GET works: "Download anyway" (ENGINE-SPEC §2.4).
     let path = "/blob/200000?seed=2&head=403&fail=2&fail_mode=403";
     assert_eq!(
-        block(engine.probe(s.server.url(path), vec![])),
+        block(engine.probe(s.server.url(path), vec![], None)),
         Err(DhowError::Probe {
             reason: ProbeFailure::Status { status: 403 }
         })

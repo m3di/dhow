@@ -142,13 +142,17 @@ impl AddRequest {
             connections: self.connections,
             queue: self.queue,
             speed_limit: self.speed_limit,
-            target_fs: match self.target_fs {
-                Some(TargetFs::Posix) => CoreFs::Posix,
-                Some(TargetFs::Windows) => CoreFs::Windows,
-                None => CoreFs::host(),
-            },
+            target_fs: core_fs(self.target_fs),
             blind: self.blind,
         })
+    }
+}
+
+pub(crate) fn core_fs(fs: Option<TargetFs>) -> CoreFs {
+    match fs {
+        Some(TargetFs::Posix) => CoreFs::Posix,
+        Some(TargetFs::Windows) => CoreFs::Windows,
+        None => CoreFs::host(),
     }
 }
 
