@@ -5,7 +5,7 @@ import SwiftUI
 struct RowMenu: View {
     @Environment(AppModel.self) private var model
     var ids: Set<String>
-    @Binding var confirmDelete: Set<String>?
+    @Binding var confirmation: Confirmation?
 
     /// Per-download limits offered here; the detail pane has a slider.
     static let limits: [UInt64] = [256, 512, 1024, 2048, 5120, 10240].map { $0 * 1024 }
@@ -50,10 +50,10 @@ struct RowMenu: View {
             }
             Divider()
             if states.contains(where: Actions.canCancel) {
-                Button(tr("menu.cancel")) { model.cancel(ids) }
+                Button(tr("menu.cancelEllipsis")) { confirmation = .cancel(ids) }
             }
             Button(tr("menu.remove")) { model.remove(ids, deleteFiles: false) }
-            Button(tr("menu.removeAndDelete")) { confirmDelete = ids }
+            Button(tr("menu.removeAndDeleteEllipsis")) { confirmation = .delete(ids) }
         }
     }
 

@@ -41,8 +41,8 @@
 "size.unknown" = "—";
 /* A byte count, e.g. "4.1 MB". */
 "format.speed %@" = "%@/s";
-/* A group row: its name, then members done of members. */
-"group.name %@ %lld %lld" = "%1$@ (%2$lld of %3$lld)";
+/* After a group's name: members done of members. */
+"group.count %lld %lld" = "(%1$lld of %2$lld)";
 "empty.none" = "No downloads yet.";
 "empty.filter" = "Nothing here.";
 "empty.search" = "No downloads match.";
@@ -92,8 +92,12 @@
 "menu.cancel" = "Cancel Download";
 "menu.remove" = "Remove";
 "menu.removeAndDelete" = "Remove and Delete File";
+"menu.cancelEllipsis" = "Cancel Download…";
+"menu.removeAndDeleteEllipsis" = "Remove and Delete File…";
 "confirm.deleteTitle" = "Remove the download and delete its file?";
 "confirm.deleteMessage" = "The file is deleted, not moved to the Trash.";
+"confirm.cancelTitle" = "Cancel the download?";
+"confirm.cancelMessage" = "What it downloaded so far is deleted. A cancelled download can't be resumed.";
 
 /* Add dialog */
 "add.url" = "URL";

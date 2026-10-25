@@ -30,6 +30,52 @@ import Testing
         await core.close()
     }
 
+    /// An add the launch `list()` already saw: its `DownloadAdded` (older)
+    /// replays, then the events after it, and the row isn't doubled.
+    @Test func replayingAnAddTheListAlreadyHasKeepsOneNewestRow() async {
+        let s = DownloadStore()
+        s.apply(.downloadAdded(snapshot: download("a")))
+        s.apply(.stateChanged(id: "a", from: .queued, to: .active, reason: nil))
+        s.load(
+            downloads: [download("x"), download("a", .active)], queues: queues, groups: [],
+            settings: settings)
+        #expect(s.order == ["x", "a"])
+        #expect(s.downloads["a"]?.state == .active)
+        await core.close()
+    }
+
+    /// Re-reading the list (the app became active) takes what the CLI
+    /// changed; events that came while it was read still win.
+    @Test func reconcileTakesTheListThenTheEventsThatCameMeanwhile() async {
+        let s = store([download("a", .active), download("b")], queues: queues, settings: settings)
+        s.beginReconcile()
+        s.apply(.stateChanged(id: "a", from: .active, to: .completed, reason: nil))
+        #expect(s.downloads["a"]?.state == .active)
+        // Read before the completion; `dhow pause` paused b meanwhile.
+        s.reconcile([download("a", .active), download("b", .paused), download("new")])
+        #expect(s.downloads["a"]?.state == .completed)
+        #expect(s.downloads["b"]?.state == .paused)
+        // New ones come as `DownloadAdded` from `recheck`.
+        #expect(s.downloads["new"] == nil)
+        await core.close()
+    }
+
+    @Test func aDownloadInAnUnknownGroupAsksForTheGroups() async {
+        let s = store([], queues: queues, settings: settings)
+        var asked = 0
+        s.unknownGroup = { asked += 1 }
+        s.apply(.downloadAdded(snapshot: download("a", group: "g")))
+        #expect(asked == 1)
+        s.setGroups([
+            GroupSnapshot(
+                id: "g", name: "G", auto: true, members: ["a"], downloaded: 0, total: nil,
+                speedBps: 0, etaSecs: nil)
+        ])
+        s.apply(.downloadAdded(snapshot: download("b", group: "g")))
+        #expect(asked == 1)
+        await core.close()
+    }
+
     @Test func progressAndStateKeepSnapshotsCurrent() async {
         let s = store([download("a", .active)], queues: queues, settings: settings)
         s.apply(

@@ -35,10 +35,12 @@ enum SidebarItem: Hashable {
 /// children (UI-GUIDELINES §3). Sort keys are plain values for `Table`.
 struct ListRow: Identifiable, Hashable {
     var id: String
-    /// The downloads it stands for: itself, or a group's members (all of
-    /// them, also those the filter hides), for actions.
+    /// The downloads its actions apply to: itself, or the group's members
+    /// the list shows (not those the filter or search hides).
     var downloadIds: [String]
     var name: String
+    /// After the name, never truncated: a group's "(n of m)".
+    var detail: String?
     var category: DhowCore.Category
     var status: RowStatus
     /// 0...1; `nil` while the size is unknown.
@@ -82,6 +84,7 @@ extension DownloadStore {
             }
             if let i = groupRow[g] {
                 rows[i].children?.append(row(d, now: now))
+                rows[i].downloadIds.append(d.id)
             } else {
                 groupRow[g] = rows.count
                 rows.append(self.groupRow(g, first: row(d, now: now), now: now))
@@ -93,7 +96,7 @@ extension DownloadStore {
     func row(_ d: DownloadSnapshot, now: Date) -> ListRow {
         let live = live[d.id]
         return ListRow(
-            id: d.id, downloadIds: [d.id], name: d.fileName, category: d.category,
+            id: d.id, downloadIds: [d.id], name: d.fileName, detail: nil, category: d.category,
             status: RowStatus.of(d, live: live, queue: queue(d.queueId), now: now),
             fraction: Self.fraction(d.downloaded, d.totalSize),
             showsProgress: !d.state.isFinished,
@@ -115,8 +118,8 @@ extension DownloadStore {
         let speed = rows.reduce(0) { $0 + $1.speed }
         let name = groups[g]?.name ?? first.name
         return ListRow(
-            id: ListRow.groupId(g), downloadIds: all.map(\.id),
-            name: tr("group.name \(name) \(done) \(members.count)"), category: first.category,
+            id: ListRow.groupId(g), downloadIds: [first.id], name: name,
+            detail: tr("group.count \(done) \(members.count)"), category: first.category,
             status: Self.groupStatus(
                 rows, remaining: total.map { $0 - min($0, downloaded) },
                 speed: speed),

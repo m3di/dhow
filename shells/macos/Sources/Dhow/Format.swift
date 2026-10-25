@@ -19,13 +19,17 @@ enum Format {
                 maximumUnitCount: 1))
     }
 
-    /// The time if today, else the date, numerically.
+    /// "15:48" today, "Oct 24" this year, else "Oct 24, 2025".
     static func added(unixMs: Int64, now: Date) -> String {
         let date = Date(timeIntervalSince1970: TimeInterval(unixMs) / 1000)
-        if Calendar.current.isDate(date, inSameDayAs: now) {
+        let cal = Calendar.current
+        if cal.isDate(date, inSameDayAs: now) {
             return date.formatted(date: .omitted, time: .shortened)
         }
-        return date.formatted(date: .numeric, time: .omitted)
+        if cal.isDate(date, equalTo: now, toGranularity: .year) {
+            return date.formatted(.dateTime.month(.abbreviated).day())
+        }
+        return date.formatted(.dateTime.month(.abbreviated).day().year())
     }
 
     /// "02:00" today, "Tue 02:00" within a week, else the date.

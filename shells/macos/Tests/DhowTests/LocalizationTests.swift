@@ -55,7 +55,7 @@ import Testing
 
     @Test func viewsAreNeverGivenLiterals() throws {
         let literal = try Regex(
-            #"\b(Text|Button|Label|Toggle|Section|TableColumn|Picker|TextField|Menu|Stepper|LabeledContent|DisclosureGroup|Window|help|navigationTitle|alert|confirmationDialog)\("[^"]"#
+            #"\b(Text|Button|Label|Toggle|Section|TableColumn|Picker|TextField|Menu|Stepper|LabeledContent|DisclosureGroup|Window|help|navigationTitle|alert|confirmationDialog|accessibilityLabel|accessibilityValue|badge)\("[^"]"#
         )
         for (file, text) in try Self.swiftFiles() {
             #expect(text.firstMatch(of: literal) == nil, "\(file) shows a literal string")
@@ -66,6 +66,15 @@ import Testing
         #expect(tr("app.name") == "Dhow")
         #expect(tr("status.waitingFor \(1)") == "Waiting for 1 download to finish")
         #expect(tr("status.waitingFor \(2)") == "Waiting for 2 downloads to finish")
-        #expect(tr("group.name \("Movie") \(2) \(3)") == "Movie (2 of 3)")
+        #expect(tr("group.count \(2) \(3)") == "(2 of 3)")
+    }
+
+    /// What `tr` asserts on in debug builds: an argument of the wrong type
+    /// misses its entry and comes back as the key.
+    @Test func aMismatchedArgumentReadsAsAKey() {
+        #expect(looksLikeKey(String(localized: "fail.http \(String(404))", bundle: .dhow)))
+        #expect(!looksLikeKey(tr("fail.http \(404)")))
+        #expect(!looksLikeKey("4.1 MB/s"))
+        #expect(!looksLikeKey("Dhow"))
     }
 }

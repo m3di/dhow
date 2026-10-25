@@ -59,6 +59,29 @@ import Testing
         await core.close()
     }
 
+    /// A probe whose task was cancelled (the text changed, so the view's
+    /// task restarted) leaves its items for the next probe.
+    @Test func aSupersededProbeLeavesItsItemsToTheNext() async throws {
+        let core = try TempEngine()
+        let add = AddModel(
+            text: "http://127.0.0.1:1/file.bin", directory: core.dir, queue: "q")
+        let superseded = Task { await add.probe(with: core.engine) }
+        superseded.cancel()
+        await superseded.value
+        #expect(add.items.first?.isProbing == true)
+        await add.probe(with: core.engine)
+        #expect(add.items.first?.failure != nil)
+        await core.close()
+    }
+
+    @Test func windowsFileSystemsGetWindowsNames() {
+        #expect(AddModel.targetFs(fsType: "msdos") == .windows)
+        #expect(AddModel.targetFs(fsType: "exfat") == .windows)
+        #expect(AddModel.targetFs(fsType: "smbfs") == .windows)
+        #expect(AddModel.targetFs(fsType: "apfs") == nil)
+        #expect(AddModel.targetFs(for: FileManager.default.temporaryDirectory) == nil)
+    }
+
     @Test func aBadSchemeCannotBeAddedBlind() async throws {
         let error = DhowError.Probe(reason: .unsupportedScheme)
         #expect(!ErrorText.blindCanHelp(error))

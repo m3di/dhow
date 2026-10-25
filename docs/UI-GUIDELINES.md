@@ -54,9 +54,10 @@ These hold on every platform; how they look is per-platform.
 
 - **Sidebar** (desktop): smart filters, then queues, then categories. On narrow windows it collapses to a dropdown/segmented control; on mobile it is a tab bar or top filter chips.
 - **Toolbar**: Add, Resume all, Pause all, a compact global speed readout with a tiny sparkline (the only chart on the main view), and search. Per-platform placement rules apply (macOS unified toolbar, Fluent command bar, libadwaita header bar, Material top app bar).
+- **Pause all / Resume all** act on queues, so queue order, concurrency and schedules survive them. Pause all stops every queue (`StopQueue`, which also stops downloads started by hand, back to `Queued`) and remembers how each queue ran and which downloads were running; it marks nothing `Paused`. Resume all puts each queue back as it was (on its schedule, or started) and starts again, by hand, the downloads that were running. Pause all then Resume all gives back the state before; downloads the user paused stay paused throughout. A stop lasts until the queue's next schedule edge (ENGINE-SPEC §11). Without a Pause all to undo (the app relaunched), Resume all puts stopped queues back on their schedules. Idle, the speed readout shows nothing.
 - **List row**: name, status glyph, progress bar, right-aligned speed/ETA or size. Status text is one short phrase: "4.1 MB/s · 3 min left", "Waiting for 2 downloads to finish", "Paused", "Scheduled for 02:00", "Reconnecting (3)". Groups are collapsible rows with aggregate progress.
-- **Selection** opens the detail pane. Multi-select enables batch pause/resume/cancel/move-to-queue.
-- **Context menu / swipe actions**: Pause/Resume, Open, Show in Finder/Explorer/Files, Copy link, Move to queue, Set speed limit, Remove, Remove and delete file.
+- **Selection** opens the detail pane. Multi-select enables batch pause/resume/cancel/move-to-queue. A selected group row stands for the members the list shows, never ones a filter or search hides; its primary action (double-click, Return) expands or collapses it.
+- **Context menu / swipe actions**: Pause/Resume, Open, Show in Finder/Explorer/Files, Copy link, Move to queue, Set speed limit, Cancel, Remove, Remove and delete file. Cancel deletes what was downloaded (a cancelled download can't continue), so it asks first, as Remove and delete file does.
 - **Empty state**: one line and the Add button. No illustration bigger than an icon.
 
 ## 4. Add dialog

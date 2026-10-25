@@ -18,19 +18,19 @@ struct MainToolbar: ToolbarContent {
             .help(tr("toolbar.addHelp"))
             .disabled(model.engine == nil)
             Button {
-                model.resumeAll()
+                Task { await model.resumeAll() }
             } label: {
                 Label(tr("toolbar.resumeAll"), systemImage: "play.fill")
             }
             .help(tr("toolbar.resumeAll"))
-            .disabled(!store.downloads.values.contains { $0.state == .paused })
+            .disabled(!model.canResumeAll)
             Button {
-                model.pauseAll()
+                Task { await model.pauseAll() }
             } label: {
                 Label(tr("toolbar.pauseAll"), systemImage: "pause.fill")
             }
             .help(tr("toolbar.pauseAll"))
-            .disabled(!store.downloads.values.contains { Actions.canPause($0.state) })
+            .disabled(!model.canPauseAll)
         }
         ToolbarItem(placement: .status) {
             SpeedReadout(speed: store.totalSpeed, samples: store.speedSamples)
@@ -46,10 +46,11 @@ struct SpeedReadout: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            Text(Format.speed(speed))
+            // Idle shows nothing (UI-GUIDELINES §2).
+            Text(samples.isEmpty ? "" : Format.speed(speed))
                 .monospacedDigit()
                 .font(.callout)
-                .foregroundStyle(samples.isEmpty ? .tertiary : .secondary)
+                .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .frame(width: 64, alignment: .trailing)
             Sparkline(samples: samples)
@@ -60,6 +61,7 @@ struct SpeedReadout: View {
         .frame(width: 120)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(tr("toolbar.speed \(Format.speed(speed))"))
+        .accessibilityHidden(samples.isEmpty)
     }
 }
 

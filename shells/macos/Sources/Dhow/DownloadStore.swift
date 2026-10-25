@@ -33,9 +33,13 @@ final class DownloadStore {
     private(set) var loaded = false
 
     nonisolated static let sparklineLength = 60
-    /// Events that came before the launch `list()` was in: replayed over
-    /// it, as they may be newer than what it read.
+    /// Asked for when a download names a group the store hasn't seen.
+    @ObservationIgnored var unknownGroup: (() -> Void)?
+    /// Events that came while a `list()` was being read (at launch, or
+    /// reconciling): replayed over it, as they may be newer than it.
     private var early: [Event] = []
+    /// `list()` reads in flight.
+    private var reconciling = 0
     private var lastSample: Date?
     private let now: () -> Date
 
@@ -53,13 +57,40 @@ final class DownloadStore {
         self.groups = Dictionary(groups.map { ($0.id, $0) }, uniquingKeysWith: { _, b in b })
         self.settings = settings
         loaded = true
+        replayEarly()
+    }
+
+    /// Before reading `list()` again: events wait until `reconcile`.
+    func beginReconcile() {
+        reconciling += 1
+    }
+
+    /// The known downloads as `list` read them, then the events that came
+    /// meanwhile. New and removed ones come as events (`recheck`).
+    func reconcile(_ list: [DownloadSnapshot]?) {
+        for snapshot in list ?? [] where downloads[snapshot.id] != nil {
+            downloads[snapshot.id] = snapshot
+        }
+        reconciling -= 1
+        if reconciling == 0 {
+            replayEarly()
+        }
+    }
+
+    func setGroups(_ list: [GroupSnapshot]) {
+        groups = Dictionary(list.map { ($0.id, $0) }, uniquingKeysWith: { _, b in b })
+    }
+
+    private func replayEarly() {
         let replay = early
         early = []
-        replay.forEach(apply)
+        for event in replay {
+            apply(event)
+        }
     }
 
     func apply(_ event: Event) {
-        guard loaded else {
+        guard loaded, reconciling == 0 else {
             early.append(event)
             return
         }
@@ -69,6 +100,9 @@ final class DownloadStore {
                 order.append(snapshot.id)
             }
             downloads[snapshot.id] = snapshot
+            if let g = snapshot.group, groups[g] == nil {
+                unknownGroup?()
+            }
         case .removed(let id):
             downloads[id] = nil
             live[id] = nil

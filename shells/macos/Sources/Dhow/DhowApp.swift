@@ -29,7 +29,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         signal(SIGTERM, SIG_IGN)
         let source = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
         source.setEventHandler {
-            NSApp.perform(#selector(NSApplication.terminate(_:)), with: nil, afterDelay: 0)
+            NSApp.perform(
+                #selector(NSApplication.terminate(_:)), with: nil, afterDelay: 0,
+                inModes: [.common])
         }
         source.resume()
         terminateSignal = source
@@ -41,9 +43,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Runs stop cleanly before the process ends (committed, back to
-    /// `Queued`, so the next launch continues them).
+    /// `Queued`, so the next launch continues them). An engine still
+    /// opening is waited for, then shut down.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard model.engine != nil else { return .terminateNow }
+        guard model.engine != nil || model.opening != nil else { return .terminateNow }
         Task {
             await model.shutdown()
             sender.reply(toApplicationShouldTerminate: true)

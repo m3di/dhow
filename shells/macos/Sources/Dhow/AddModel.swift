@@ -54,7 +54,14 @@ final class AddModel {
         didSet { syncItems() }
     }
     private(set) var items: [Item] = []
-    var directory: URL
+    var directory: URL {
+        // Names differ by file system (§3): ask again for the new one.
+        didSet {
+            if Self.targetFs(for: oldValue) != targetFs {
+                reprobe()
+            }
+        }
+    }
     var queue: String
     var start = Start.queued
     /// `nil`: the settings' default (§4.1).
@@ -110,19 +117,37 @@ final class AddModel {
         items = Self.links(in: text).map { old[$0] ?? Item(url: $0) }
     }
 
-    /// The key the view re-probes on: the links and the headers.
-    var probeKey: [String] { items.map(\.url) + [headers] }
+    /// The key the view re-probes on: the links, the headers, the folder.
+    var probeKey: [String] { items.map(\.url) + [headers, directory.path] }
+
+    /// Names as the destination's file system allows them (ENGINE-SPEC §3):
+    /// FAT, exFAT, NTFS and SMB shares take Windows rules.
+    var targetFs: TargetFs? { Self.targetFs(for: directory) }
+
+    nonisolated static func targetFs(for directory: URL) -> TargetFs? {
+        var info = statfs()
+        guard statfs(directory.path, &info) == 0 else { return nil }
+        let type = withUnsafeBytes(of: info.f_fstypename) { raw in
+            String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
+        }
+        return targetFs(fsType: type)
+    }
+
+    nonisolated static func targetFs(fsType: String) -> TargetFs? {
+        ["msdos", "exfat", "ntfs", "smbfs"].contains(fsType.lowercased()) ? .windows : nil
+    }
 
     /// Probes the items not yet probed, all at once.
     func probe(with engine: Engine) async {
         guard let headers = headerList else { return }
         let urls = items.filter(\.isProbing).map(\.url)
+        let fs = targetFs
         await withTaskGroup(of: (String, Item.Probe).self) { group in
             for url in urls {
                 group.addTask {
                     do {
                         let result = try await engine.probe(
-                            url: url, headers: headers, targetFs: nil)
+                            url: url, headers: headers, targetFs: fs)
                         return (url, .done(result))
                     } catch {
                         return (url, .failed(error))
@@ -169,7 +194,7 @@ final class AddModel {
             url: item.url, headers: headerList ?? [], directory: directory.path,
             filename: item.filename.flatMap { $0.isEmpty ? nil : $0 }, start: start.mode,
             connections: connections.map { UInt8(clamping: $0) }, queue: queue,
-            speedLimit: speedLimitKB.map { UInt64($0) * 1024 }, targetFs: nil,
+            speedLimit: speedLimitKB.map { UInt64($0) * 1024 }, targetFs: targetFs,
             blind: item.failure != nil)
     }
 

@@ -101,7 +101,7 @@ import Testing
         let rows = s.rows(for: .filter(.all), search: "", now: .now)
         #expect(rows.map(\.id) == ["group:g", "x"])
         let group = rows[0]
-        #expect(group.name == "Movie.Part (1 of 3)")
+        #expect(group.name == "Movie.Part" && group.detail == "(1 of 3)")
         #expect(group.children?.map(\.id) == ["p1", "p2", "p3"])
         #expect(group.downloadIds == ["p1", "p2", "p3"])
         #expect(group.fraction == 0.5)
@@ -114,7 +114,8 @@ import Testing
         let active = s.rows(for: .filter(.active), search: "", now: .now)
         #expect(active.map(\.id) == ["group:g"])
         #expect(active[0].children?.map(\.id) == ["p2"])
-        #expect(active[0].downloadIds == ["p1", "p2", "p3"])
+        // Its actions reach only those (UI-GUIDELINES §3).
+        #expect(active[0].downloadIds == ["p2"])
         await core.close()
     }
 }
