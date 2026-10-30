@@ -2,7 +2,7 @@
 
 Milestones are sequential. A milestone is done when every item is merged with tests and the exit criterion passes. Items are numbered for PR titles (`M1.3: …`).
 
-Done: M0, M1, M2, M3. Next: M4 (all items merged; its exit criterion, a week of daily use, is pending).
+Done: M0, M1, M2, M3, M4 (released as v0.1.0). Next: M5.
 
 ## M0 — Repo & skeleton
 
@@ -57,7 +57,7 @@ Exit: T-13 passes; CLI shows network info on Linux via the env/gsettings adapter
 - ~~M4.4 Persian localization + RTL.~~ Deferred: v1 ships English only; translations come later as language packs over the M4.2 keys.
 - M4.5 DMG built by a local script on the maintainer's Mac, ad-hoc signed; Developer ID signing and notarization plug in later. Done: `shells/macos/make-dmg.sh` (its `--sign` and `--notarize` are the hooks).
 
-Exit: a tester can use Dhow on macOS daily for a week without opening the CLI.
+Exit: a tester can use Dhow on macOS daily for a week without opening the CLI. Met; shipped as v0.1.0.
 
 ## M5 — Linux shell
 

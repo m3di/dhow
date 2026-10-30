@@ -46,13 +46,13 @@ Pre-alpha. The engine and CLI come first; see `docs/ROADMAP.md`. Done so far (M0
 
 ### Install on macOS
 
-There's no signed release yet. Build the DMG on a Mac with Command Line Tools (`xcode-select --install`), Rust (`rustup target add aarch64-apple-darwin x86_64-apple-darwin`) and macOS 14 or later:
+Download the DMG from [the latest release](https://github.com/m3di/dhow/releases/latest) (macOS 14+, Apple Silicon and Intel), or build it yourself on a Mac with Command Line Tools (`xcode-select --install`), Rust (`rustup target add aarch64-apple-darwin x86_64-apple-darwin`) and macOS 14 or later:
 
 ```sh
 shells/macos/make-dmg.sh          # writes shells/macos/build/Dhow-<version>.dmg
 ```
 
-It builds a universal release, signs it ad hoc, and checks the image (signature, `hdiutil verify`, a launch from the mounted volume). Open the DMG and drag Dhow to Applications. Because the app isn't notarized, Gatekeeper won't open it with a double-click the first time: right-click Dhow in Applications, choose Open, then Open again. Or clear the quarantine flag once:
+It builds a universal release, signs it ad hoc, and checks the image (signature, `hdiutil verify`, a launch from the mounted volume). Either way, open the DMG and drag Dhow to Applications. Because the app isn't notarized, Gatekeeper won't open it with a double-click the first time: right-click Dhow in Applications, choose Open, then Open again. Or clear the quarantine flag once:
 
 ```sh
 xattr -d com.apple.quarantine /Applications/Dhow.app
